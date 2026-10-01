@@ -167,7 +167,10 @@ export class PaymentController {
                 res.status(400).json({ error: error.message.split(':').slice(1).join(':') });
                 return;
             }
-            res.status(400).send(error);
+            // Falha ao persistir a atualização (banco/infra) é transiente — responde 5xx para
+            // que o Asaas tente de novo, em vez de 400 (que sinaliza "não tente novamente").
+            console.error('[Webhook] Erro ao processar notificação:', error);
+            res.status(500).json({ error: 'Erro ao processar webhook.', message: error.message });
         }
     };
 

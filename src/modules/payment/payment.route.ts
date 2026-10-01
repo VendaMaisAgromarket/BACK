@@ -87,7 +87,7 @@ router.use(protectRoute);
  *     description: Cria uma preferência de pagamento no Mercado Pago e registra o pagamento vinculado a uma venda
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -194,7 +194,7 @@ router.post('/pix', controller.createPixPayment as RequestHandler);
  *       que valida automaticamente se a entrada já foi confirmada.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -276,7 +276,7 @@ router.post('/boleto', controller.createBoletoPayment as RequestHandler);
  *       qualquer `amount` enviado para essa fase).
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -358,7 +358,7 @@ router.post('/configure-webhook', requireAdmin as RequestHandler, controller.con
  *       acionado manualmente para forçar sincronização imediata (útil após pagamento de boleto).
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     responses:
  *       200:
  *         description: Sincronização concluída
@@ -400,7 +400,7 @@ router.get('/final-amount/:saleId', controller.getFinalInstallmentAmount as Requ
  *     summary: Busca um pagamento específico por ID
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -463,7 +463,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Busca o status atual do pagamento no Mercado Pago e atualiza no banco de dados. Útil quando o webhook não chega ou para verificação manual.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -542,7 +542,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Retorna informações completas do pagamento tanto no banco quanto no Mercado Pago para debug
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -581,7 +581,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Atualiza dados como status, mp_payment_id, etc.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -645,7 +645,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Retorna todos os métodos de pagamento aceitos pelo Mercado Pago
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     responses:
  *       200:
  *         description: Lista de meios de pagamento retornada com sucesso
@@ -679,7 +679,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Cria um pagamento PIX instantâneo retornando QR Code e Pix Copia e Cola
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -778,7 +778,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *       Se omitido, calcula automaticamente como (total do contrato - entrada paga).
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -812,7 +812,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *       `GET /payment/final-amount/{saleId}` (alias de compatibilidade).
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: saleId
@@ -850,7 +850,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Alias de `/payment/sales/{saleId}/final-amount` para compatibilidade com o frontend.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: saleId
@@ -868,7 +868,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Cancela um pagamento PIX que ainda não foi pago (status pending)
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -918,7 +918,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Registra a URL de webhook no Mercado Pago para receber notificações de pagamentos
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     responses:
  *       200:
  *         description: Webhook configurado com sucesso

@@ -121,7 +121,8 @@ describe('PaymentService', () => {
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_new', status: 'PENDING' } }); // /payments
       mockAsaasGet.mockResolvedValueOnce({ data: { payload: 'copia-e-cola', encodedImage: 'base64img', expirationDate: '2026-01-02' } });
       prisma.user.updateMany.mockResolvedValue({ count: 1 });
-      prisma.payment.create.mockResolvedValue(buildPayment({ status: 'pending', asaas_payment_id: 'pay_new' }));
+      prisma.payment.create.mockResolvedValue(buildPayment({ status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ status: 'pending', asaas_payment_id: 'pay_new' }));
 
       await service.createPixPayment({
         saleId: 'sale-1',
@@ -144,7 +145,8 @@ describe('PaymentService', () => {
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_existing' }), addresses: [] } as any);
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_new', status: 'PENDING' } }); // /payments
       mockAsaasGet.mockResolvedValueOnce({ data: { payload: 'x', encodedImage: 'y', expirationDate: '2026-01-02' } });
-      prisma.payment.create.mockResolvedValue(buildPayment());
+      prisma.payment.create.mockResolvedValue(buildPayment({ status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment());
 
       await service.createPixPayment({
         saleId: 'sale-1',
@@ -167,7 +169,8 @@ describe('PaymentService', () => {
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_new', status: 'PENDING' } }); // /payments
       mockAsaasGet.mockResolvedValueOnce({ data: { payload: 'x', encodedImage: 'y', expirationDate: '2026-01-02' } });
       prisma.user.updateMany.mockResolvedValue({ count: 0 }); // outra requisição já preencheu o campo primeiro
-      prisma.payment.create.mockResolvedValue(buildPayment());
+      prisma.payment.create.mockResolvedValue(buildPayment({ status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment());
 
       await service.createPixPayment({
         saleId: 'sale-1',
@@ -216,7 +219,8 @@ describe('PaymentService', () => {
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_dp', status: 'PENDING' } });
       mockAsaasGet.mockResolvedValueOnce({ data: { payload: 'x', encodedImage: 'y', expirationDate: '2026-01-02' } });
-      prisma.payment.create.mockResolvedValue(buildPayment({ amount: 303 })); // (1000 + 10 transporte) * 30% = 303
+      prisma.payment.create.mockResolvedValue(buildPayment({ amount: 303, status: 'pending', asaas_payment_id: null })); // reserva
+      prisma.payment.update.mockResolvedValue(buildPayment({ amount: 303, phase: 'down_payment' })); // reserva atualizada com dados do Asaas
 
       await service.createPixPayment({
         saleId: 'sale-1',
@@ -261,7 +265,8 @@ describe('PaymentService', () => {
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_final_pix', status: 'PENDING' } });
       mockAsaasGet.mockResolvedValueOnce({ data: { payload: 'x', encodedImage: 'y', expirationDate: '2026-01-02' } });
-      prisma.payment.create.mockResolvedValue(buildPayment({ phase: 'final_payment', amount: 700 }));
+      prisma.payment.create.mockResolvedValue(buildPayment({ phase: 'final_payment', amount: 700, status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ phase: 'final_payment', amount: 700 }));
 
       await service.createPixPayment({
         saleId: 'sale-1',
@@ -315,16 +320,34 @@ describe('PaymentService', () => {
       expect(prisma.saleData.findUnique).not.toHaveBeenCalled();
     });
 
-    it('converte uma violação de constraint única (P2002 — corrida concorrente) num erro claro em vez de 500 genérico', async () => {
+    it('libera a reserva (cancelled) quando a chamada ao Asaas falha após a reserva local, para não bloquear tentativas futuras', async () => {
       prisma.saleData.findUnique.mockResolvedValue(buildSale());
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
-      mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_race', status: 'PENDING' } });
-      mockAsaasGet.mockResolvedValueOnce({ data: { payload: 'x', encodedImage: 'y', expirationDate: '2026-01-02' } });
+      prisma.payment.create.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null }));
+      mockAsaasPost.mockRejectedValueOnce(new Error('timeout na Asaas'));
+
+      await expect(
+        service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' })
+      ).rejects.toThrow();
+
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'reserved-1' },
+        data: expect.objectContaining({ status: 'cancelled' }),
+      });
+    });
+
+    it('converte uma violação de constraint única (P2002 — corrida concorrente) num erro claro, SEM chegar a chamar o Asaas', async () => {
+      // A reserva (prisma.payment.create) agora acontece ANTES de qualquer chamada ao Asaas —
+      // se ela falhar por P2002, a cobrança remota nunca deve ser criada (fecha o risco de
+      // cobrança órfã numa corrida entre duas requisições concorrentes).
+      prisma.saleData.findUnique.mockResolvedValue(buildSale());
       prisma.payment.create.mockRejectedValue({ code: 'P2002' });
 
       await expect(
         service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' })
       ).rejects.toThrow('DUPLICATE_PAYMENT_ATTEMPT:');
+
+      expect(mockAsaasPost).not.toHaveBeenCalled();
     });
   });
 
@@ -335,7 +358,8 @@ describe('PaymentService', () => {
       mockAsaasPost.mockResolvedValueOnce({
         data: { id: 'pay_boleto', status: 'PENDING', bankSlipUrl: 'https://asaas.com/boleto/1', invoiceUrl: 'https://asaas.com/i/1' },
       });
-      prisma.payment.create.mockResolvedValue(buildPayment({ billingType: 'BOLETO' }));
+      prisma.payment.create.mockResolvedValue(buildPayment({ billingType: 'BOLETO', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ billingType: 'BOLETO' }));
 
       const result = await service.createBoletoPayment({
         saleId: 'sale-1',
@@ -353,7 +377,8 @@ describe('PaymentService', () => {
       prisma.saleData.findUnique.mockResolvedValue(buildSale());
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_boleto_hoje', status: 'PENDING' } });
-      prisma.payment.create.mockResolvedValue(buildPayment({ billingType: 'BOLETO' }));
+      prisma.payment.create.mockResolvedValue(buildPayment({ billingType: 'BOLETO', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ billingType: 'BOLETO' }));
 
       await service.createBoletoPayment({
         saleId: 'sale-1',
@@ -405,7 +430,8 @@ describe('PaymentService', () => {
       prisma.saleData.findUnique.mockResolvedValue(buildSale());
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_cc', status: 'CONFIRMED', creditCard: { creditCardBrand: 'VISA', creditCardNumber: '1234' } } });
-      prisma.payment.create.mockResolvedValue(buildPayment({ billingType: 'CREDIT_CARD', status: 'completed' }));
+      prisma.payment.create.mockResolvedValue(buildPayment({ billingType: 'CREDIT_CARD', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ billingType: 'CREDIT_CARD', status: 'completed' }));
 
       await service.createCreditCardPayment({
         saleId: 'sale-1',
@@ -427,7 +453,8 @@ describe('PaymentService', () => {
       prisma.saleData.findUnique.mockResolvedValue(buildSale());
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_cc2', status: 'CONFIRMED' } });
-      prisma.payment.create.mockResolvedValue(buildPayment({ billingType: 'CREDIT_CARD', status: 'completed' }));
+      prisma.payment.create.mockResolvedValue(buildPayment({ billingType: 'CREDIT_CARD', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ billingType: 'CREDIT_CARD', status: 'completed' }));
 
       await service.createCreditCardPayment({
         saleId: 'sale-1',
@@ -471,7 +498,8 @@ describe('PaymentService', () => {
       } as any);
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_final', status: 'CONFIRMED' } });
-      prisma.payment.create.mockResolvedValue(buildPayment({ phase: 'final_payment', status: 'completed', amount: 1000 }));
+      prisma.payment.create.mockResolvedValue(buildPayment({ phase: 'final_payment', status: 'pending', amount: 1000, asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ phase: 'final_payment', status: 'completed', amount: 1000 }));
 
       await service.createCreditCardPayment({
         saleId: 'sale-1',
@@ -493,7 +521,8 @@ describe('PaymentService', () => {
       } as any);
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
       mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_sync', status: 'CONFIRMED' } });
-      prisma.payment.create.mockResolvedValue(buildPayment({ phase: 'down_payment', status: 'completed', asaas_payment_id: 'pay_sync' }));
+      prisma.payment.create.mockResolvedValue(buildPayment({ phase: 'down_payment', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ phase: 'down_payment', status: 'completed', asaas_payment_id: 'pay_sync' }));
 
       await service.createCreditCardPayment({
         saleId: 'sale-1',
@@ -596,6 +625,33 @@ describe('PaymentService', () => {
       expect(prisma.payment.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({ where: { asaas_payment_id: 'pay_desconhecido' } })
       );
+    });
+
+    it('ignora um evento atrasado que regrediria um pagamento completed para pending', async () => {
+      const payment = buildPayment({ phase: 'full', status: 'completed' });
+      prisma.payment.findFirst.mockResolvedValue(payment);
+
+      const result = await service.processWebhook(
+        { event: 'PAYMENT_CREATED', payment: { id: 'pay_1', status: 'PENDING', externalReference: 'sale-1' } },
+        'webhook-secret-token'
+      );
+
+      expect(result).toMatchObject({ success: true, status: 'completed', ignored: true, reason: 'STALE_EVENT' });
+      expect(prisma.payment.update).not.toHaveBeenCalled();
+      expect(prisma.saleData.update).not.toHaveBeenCalled();
+    });
+
+    it('propaga (lança) um erro de banco ao aplicar a atualização, em vez de devolver 200 mascarando a falha', async () => {
+      const payment = buildPayment({ phase: 'full', status: 'pending' });
+      prisma.payment.findFirst.mockResolvedValue(payment);
+      prisma.$transaction.mockRejectedValueOnce(new Error('conexão com o banco perdida'));
+
+      await expect(
+        service.processWebhook(
+          { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_1', status: 'RECEIVED', externalReference: 'sale-1' } },
+          'webhook-secret-token'
+        )
+      ).rejects.toThrow('WEBHOOK_PROCESSING_FAILED:');
     });
 
     it('confirma a entrada (down_payment) e marca downPaymentCompleted quando o evento é PAYMENT_RECEIVED', async () => {
@@ -716,6 +772,21 @@ describe('PaymentService', () => {
   });
 
   describe('createFinalBoleto — bloqueios de negócio', () => {
+    it('um retry cuja resposta anterior se perdeu reaproveita o boleto final já existente, em vez de bloquear com FINAL_BOLETO_BLOCKED (bug de ordem corrigido)', async () => {
+      // Propositalmente NÃO mocko saleData.findUnique: se prepareFinalPayment fosse chamado
+      // antes da busca de idempotência, o teste falharia ao tentar ler a venda.
+      prisma.payment.findFirst.mockResolvedValue(
+        buildPayment({ id: 'existing-final-boleto', asaas_payment_id: 'pay_existing_final_boleto', status: 'pending', billingType: 'BOLETO', phase: 'final_payment' })
+      );
+      mockAsaasGet.mockResolvedValueOnce({ data: { id: 'pay_existing_final_boleto', status: 'PENDING', bankSlipUrl: 'https://asaas.com/b/1', invoiceUrl: 'https://asaas.com/i/1', dueDate: '2026-01-05' } });
+
+      const result = await service.createFinalBoleto({ saleId: 'sale-1', paymentMethodId: 'pm-1' });
+
+      expect(result.paymentId).toBe('existing-final-boleto');
+      expect(prisma.saleData.findUnique).not.toHaveBeenCalled();
+      expect(mockAsaasPost).not.toHaveBeenCalled();
+    });
+
     it('bloqueia quando já existe um boleto final pendente', async () => {
       prisma.saleData.findUnique.mockResolvedValue({
         ...buildSale({ downPaymentCompleted: true, paymentCompleted: false }),
