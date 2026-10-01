@@ -251,6 +251,7 @@ router.post('/pix', controller.createPixPayment as RequestHandler);
  *         description: Erro ao criar boleto
  */
 router.post('/boleto', controller.createBoletoPayment as RequestHandler);
+router.post('/card', controller.createCreditCardPayment as RequestHandler);
 router.post('/final-boleto', controller.createFinalBoleto as RequestHandler);
 router.post('/configure-webhook', requireAdmin as RequestHandler, controller.configureWebhook as RequestHandler);
 

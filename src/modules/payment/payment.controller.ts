@@ -133,7 +133,8 @@ export class PaymentController {
         res: Response
     ): Promise<void> => {
         try {
-            const result = await service.processWebhook(req.body);
+            const receivedToken = req.header('asaas-access-token');
+            const result = await service.processWebhook(req.body, receivedToken);
             res.status(200).send(result);
         } catch (error: any) {
             res.status(400).send(error);
@@ -351,6 +352,61 @@ export class PaymentController {
             console.error('Erro ao criar boleto:', error);
             res.status(500).json({
                 error: 'Erro ao criar boleto.',
+                message: error.message,
+            });
+        }
+    };
+
+    /**
+     * Cria um pagamento com cartão de crédito (captura imediata via API do Asaas).
+     * Cartão de débito não é suportado diretamente pela API — nesse caso, use /payment/preference.
+     */
+    public createCreditCardPayment: RequestHandler = async (
+        req: Request,
+        res: Response
+    ): Promise<void> => {
+        try {
+            const { saleId, paymentMethodId, amount, phase, creditCard, creditCardHolderInfo, installmentCount } = req.body;
+
+            if (!saleId || !paymentMethodId || !amount || !creditCard || !creditCardHolderInfo) {
+                res.status(400).json({
+                    error: 'Dados obrigatórios não fornecidos.',
+                    required: ['saleId', 'paymentMethodId', 'amount', 'creditCard', 'creditCardHolderInfo']
+                });
+                return;
+            }
+
+            if (typeof amount !== 'number' || amount <= 0) {
+                res.status(400).json({ error: 'O valor do pagamento deve ser um número maior que zero.' });
+                return;
+            }
+
+            const cardRole = await getRoleForSale(req, saleId);
+            if (!cardRole) {
+                res.status(403).json({ error: 'Forbidden' });
+                return;
+            }
+            if (cardRole === 'seller') {
+                res.status(403).json({ error: 'Somente o comprador pode iniciar o pagamento.' });
+                return;
+            }
+
+            const result = await service.createCreditCardPayment({
+                saleId,
+                paymentMethodId,
+                amount,
+                phase,
+                creditCard,
+                creditCardHolderInfo,
+                installmentCount,
+                remoteIp: req.ip || req.socket.remoteAddress || '0.0.0.0',
+            });
+
+            res.status(201).json(result);
+        } catch (error: any) {
+            console.error('Erro ao criar pagamento com cartão de crédito:', error);
+            res.status(500).json({
+                error: 'Erro ao criar pagamento com cartão de crédito.',
                 message: error.message,
             });
         }

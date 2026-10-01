@@ -3,8 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
@@ -42,6 +42,8 @@ model User {
   role         String
   img          String?
   valid        Boolean @default(true)
+
+  asaas_customer_id String? @unique
 
   questions         Question[]
   addresses         Address[]
@@ -106,11 +108,11 @@ model Product {
   createdAt        DateTime
   status           Boolean  @default(true)
 
-  seller              User                 @relation(fields: [sellerId], references: [id])
+  seller             User                 @relation(fields: [sellerId], references: [id])
   sellingUnitProduct SellingUnitProduct[]
-  boughtProducts      BoughtProduct[]
-  questions           Question[]
-  CartItem            CartItem[]
+  boughtProducts     BoughtProduct[]
+  questions          Question[]
+  CartItem           CartItem[]
 }
 
 model SellerStats {
@@ -132,17 +134,21 @@ model PaymentMethod {
 }
 
 model Payment {
-  id               String   @id @default(uuid())
-  saleId           String
-  paymentMethodId  String
-  amount           Float
-  status           String
-  phase            String   @default("full") // "down_payment" | "final_payment" | "full"
-  mp_preference_id String?
-  mp_payment_id    String?
-  mp_order_id      String?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  id                String   @id @default(uuid())
+  saleId            String
+  paymentMethodId   String
+  amount            Float
+  status            String
+  phase             String   @default("full") // "down_payment" | "final_payment" | "full"
+  mp_preference_id  String? // legado Mercado Pago — mantido apenas para histórico de vendas anteriores à migração
+  mp_payment_id     String? // legado Mercado Pago — mantido apenas para histórico de vendas anteriores à migração
+  mp_order_id       String? // legado Mercado Pago — mantido apenas para histórico de vendas anteriores à migração
+  billingType       String? // "PIX" | "BOLETO" | "CREDIT_CARD" | "UNDEFINED" (Asaas)
+  asaas_customer_id String?
+  asaas_payment_id  String?  @unique
+  asaas_checkout_id String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
   sale          SaleData      @relation(fields: [saleId], references: [id])
   paymentMethod PaymentMethod @relation(fields: [paymentMethodId], references: [id])
@@ -158,7 +164,7 @@ model TransportTypes {
 
 model SaleData {
   id               String    @id @default(uuid())
-  orderNumber      Int       @default(autoincrement()) @unique @map("order_number")
+  orderNumber      Int       @unique @default(autoincrement()) @map("order_number")
   transportTypeId  String
   createdAt        DateTime? @default(now())
   updatedAt        DateTime  @updatedAt
@@ -185,26 +191,26 @@ model SaleData {
 
   cargoWeightKg Decimal? @map("cargo_weight_kg") @db.Decimal(10, 2)
 
-  sellerProfile       String?   @map("seller_profile")
-  packagingType       String?   @map("packaging_type")
-  paymentType         String?   @map("payment_type")
-  paymentTermDays     Int?      @map("payment_term_days")
-  downPaymentPercent  Int?      @map("down_payment_percent")
-  plannedHarvestDate         DateTime? @map("planned_harvest_date")
-  plannedPickupDate          DateTime? @map("planned_pickup_date")
-  plannedDeliveryDate        DateTime? @map("planned_delivery_date")
-  originalPlannedHarvestDate DateTime? @map("original_planned_harvest_date")
-  originalPlannedPickupDate  DateTime? @map("original_planned_pickup_date")
+  sellerProfile               String?   @map("seller_profile")
+  packagingType               String?   @map("packaging_type")
+  paymentType                 String?   @map("payment_type")
+  paymentTermDays             Int?      @map("payment_term_days")
+  downPaymentPercent          Int?      @map("down_payment_percent")
+  plannedHarvestDate          DateTime? @map("planned_harvest_date")
+  plannedPickupDate           DateTime? @map("planned_pickup_date")
+  plannedDeliveryDate         DateTime? @map("planned_delivery_date")
+  originalPlannedHarvestDate  DateTime? @map("original_planned_harvest_date")
+  originalPlannedPickupDate   DateTime? @map("original_planned_pickup_date")
   originalPlannedDeliveryDate DateTime? @map("original_planned_delivery_date")
-  actualDeliveryDate         DateTime? @map("actual_delivery_date")
-  technicalSpec       String?   @map("technical_spec")
-  certifierRequired   Boolean?  @map("certifier_required")
-  downPaymentCompleted  Boolean  @default(false) @map("down_payment_completed")
-  weightDocumentId      String?  @map("weight_document_id")
-  adjustedContractTotal Float?   @map("adjusted_contract_total")
-  penaltyApplied        Boolean  @default(false) @map("penalty_applied")
-  penaltyAmount         Decimal? @db.Decimal(10, 2) @map("penalty_amount")
-  penaltyReason         String?  @map("penalty_reason")
+  actualDeliveryDate          DateTime? @map("actual_delivery_date")
+  technicalSpec               String?   @map("technical_spec")
+  certifierRequired           Boolean?  @map("certifier_required")
+  downPaymentCompleted        Boolean   @default(false) @map("down_payment_completed")
+  weightDocumentId            String?   @map("weight_document_id")
+  adjustedContractTotal       Float?    @map("adjusted_contract_total")
+  penaltyApplied              Boolean   @default(false) @map("penalty_applied")
+  penaltyAmount               Decimal?  @map("penalty_amount") @db.Decimal(10, 2)
+  penaltyReason               String?   @map("penalty_reason")
 
   conformityCertifier ConformityCertifier?
   operationDocuments  OperationDocument[]

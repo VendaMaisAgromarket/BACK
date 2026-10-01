@@ -188,6 +188,7 @@ export class UserService {
         role: true,
         img: true,
         valid: true,
+        asaas_customer_id: true,
       },
     });
   }
