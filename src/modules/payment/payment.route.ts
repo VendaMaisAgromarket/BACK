@@ -9,9 +9,17 @@ const controller = new PaymentController();
  * @swagger
  * /payment/webhook:
  *   post:
- *     summary: Endpoint para processar webhooks do Mercado Pago
- *     description: Recebe notificações do Mercado Pago sobre mudanças no status dos pagamentos (Payment API e Orders API)
+ *     summary: Endpoint para processar webhooks do Asaas
+ *     description: >
+ *       Recebe notificações do Asaas sobre mudanças no status das cobranças. Requer o header
+ *       `asaas-access-token` (validado contra ASAAS_WEBHOOK_TOKEN) — ausente ou incorreto retorna 401.
+ *       Payload malformado (sem `event`, `payment.id` ou `payment.status`) retorna 400.
  *     tags: [PaymentMethods]
+ *     parameters:
+ *       - in: header
+ *         name: asaas-access-token
+ *         required: true
+ *         schema: { type: string }
  *     requestBody:
  *       required: true
  *       content:
@@ -19,21 +27,20 @@ const controller = new PaymentController();
  *           schema:
  *             type: object
  *             properties:
- *               type:
+ *               event:
  *                 type: string
- *                 example: "payment"
- *               topic:
- *                 type: string
- *                 example: "order"
- *               action:
- *                 type: string
- *                 example: "payment.updated"
- *               data:
+ *                 example: "PAYMENT_RECEIVED"
+ *               payment:
  *                 type: object
  *                 properties:
  *                   id:
  *                     type: string
- *                     example: "ORD01HRYFWNYRE1MR1E60MW3X0T2P"
+ *                     example: "pay_080225913252"
+ *                   status:
+ *                     type: string
+ *                     example: "RECEIVED"
+ *                   externalReference:
+ *                     type: string
  *     responses:
  *       200:
  *         description: Webhook processado com sucesso
@@ -49,6 +56,12 @@ const controller = new PaymentController();
  *                   type: string
  *                 status:
  *                   type: string
+ *       400:
+ *         description: Payload malformado (sem event, payment.id ou payment.status)
+ *       401:
+ *         description: Header asaas-access-token ausente ou incorreto
+ *       404:
+ *         description: Pagamento ainda não encontrado localmente (possível corrida com a criação — o Asaas deve tentar novamente)
  *       500:
  *         description: Erro ao processar webhook
  *         content:
@@ -72,11 +85,15 @@ router.use(protectRoute);
  * @swagger
  * /payment/preference:
  *   post:
- *     summary: Cria uma preferência de pagamento Mercado Pago (Checkout Pro)
- *     description: Cria uma preferência de pagamento no Mercado Pago e registra o pagamento vinculado a uma venda
+ *     summary: Cria uma fatura hospedada no Asaas (comprador escolhe a forma de pagamento)
+ *     description: >
+ *       Cria uma fatura hospedada no Asaas (billingType UNDEFINED) e registra o pagamento
+ *       vinculado a uma venda. O comprador é redirecionado para `init_point`, onde escolhe
+ *       PIX, boleto ou cartão (crédito ou débito) — é o único caminho para oferecer débito,
+ *       já que a API do Asaas não aceita dados de débito diretamente.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -137,14 +154,14 @@ router.use(protectRoute);
  *                   type: string
  *                   description: ID do pagamento criado no sistema
  *                   example: "clx789def012"
- *                 mp_preference_id:
+ *                 asaas_payment_id:
  *                   type: string
- *                   description: ID da preferência no Mercado Pago
- *                   example: "123456789-abc-def"
+ *                   description: ID da cobrança no Asaas
+ *                   example: "pay_080225913252"
  *                 init_point:
  *                   type: string
- *                   description: URL para redirecionar o usuário ao checkout
- *                   example: "https://www.mercadopago.com.br/checkout/v1/redirect?pref_id=123456789"
+ *                   description: URL para redirecionar o comprador à fatura hospedada (invoiceUrl do Asaas)
+ *                   example: "https://www.asaas.com/i/080225913252"
  *       400:
  *         description: Dados obrigatórios não fornecidos
  *         content:
@@ -176,14 +193,15 @@ router.post('/pix', controller.createPixPayment as RequestHandler);
  * @swagger
  * /payment/boleto:
  *   post:
- *     summary: Cria um boleto bancário usando Orders API (Checkout Transparente)
+ *     summary: Cria um boleto bancário via Asaas (billingType BOLETO)
  *     description: >
  *       Cria um boleto bancário vinculado a uma venda. Use `phase` para indicar se é a entrada (30%)
  *       ou a segunda parcela (70%). Para a segunda parcela, prefira `POST /payment/final-boleto`
- *       que valida automaticamente se a entrada já foi confirmada.
+ *       que valida automaticamente se a entrada já foi confirmada. `amount` é ignorado para
+ *       down_payment/final_payment/full — o servidor sempre recalcula o valor correto.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -222,12 +240,15 @@ router.post('/pix', controller.createPixPayment as RequestHandler);
  *                 paymentId:
  *                   type: string
  *                   description: ID do pagamento no banco local
- *                 orderId:
+ *                 asaas_payment_id:
  *                   type: string
- *                   description: ID da Order no Mercado Pago
- *                 orderStatus:
+ *                   description: ID da cobrança no Asaas
+ *                 status:
  *                   type: string
  *                   example: pending
+ *                 phase:
+ *                   type: string
+ *                   example: down_payment
  *                 payment:
  *                   type: object
  *                   properties:
@@ -235,22 +256,105 @@ router.post('/pix', controller.createPixPayment as RequestHandler);
  *                       type: string
  *                     status:
  *                       type: string
- *                       example: pending
- *                     barcode:
+ *                       example: PENDING
+ *                     ticket_url:
  *                       type: string
- *                       description: Código de barras do boleto
- *                     boleto_url:
+ *                       description: URL do boleto (bankSlipUrl do Asaas)
+ *                     invoice_url:
  *                       type: string
- *                       description: URL para visualizar/imprimir o boleto
+ *                       description: URL da fatura (invoiceUrl do Asaas)
  *                     expiration_date:
  *                       type: string
- *                       format: date-time
+ *                       format: date
  *       400:
- *         description: Dados obrigatórios ausentes ou valor inválido
+ *         description: Dados obrigatórios ausentes, valor inválido ou phase inválida
+ *       409:
+ *         description: "Parcela final bloqueada ou cobrança duplicada em andamento (DUPLICATE_PAYMENT_ATTEMPT)"
  *       500:
  *         description: Erro ao criar boleto
  */
 router.post('/boleto', controller.createBoletoPayment as RequestHandler);
+
+/**
+ * @swagger
+ * /payment/card:
+ *   post:
+ *     summary: Cria um pagamento com cartão de crédito (captura imediata via Asaas)
+ *     description: >
+ *       Cartão de débito não é suportado diretamente pela API do Asaas — para débito, use
+ *       `POST /payment/preference`, que gera uma fatura hospedada onde o comprador escolhe a
+ *       forma de pagamento. `phase` segue a mesma regra 30/70 dos demais endpoints: `final_payment`
+ *       exige que a entrada já esteja confirmada e tem o valor recalculado no servidor (ignora
+ *       qualquer `amount` enviado para essa fase).
+ *     tags: [PaymentMethods]
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [saleId, paymentMethodId, amount, creditCard, creditCardHolderInfo]
+ *             properties:
+ *               saleId:
+ *                 type: string
+ *               paymentMethodId:
+ *                 type: string
+ *               amount:
+ *                 type: number
+ *                 description: Ignorado quando phase=final_payment (recalculado no servidor)
+ *               phase:
+ *                 type: string
+ *                 enum: [down_payment, final_payment, full]
+ *                 default: full
+ *               installmentCount:
+ *                 type: integer
+ *                 description: Número de parcelas (opcional, parcela única se omitido)
+ *               creditCard:
+ *                 type: object
+ *                 required: [holderName, number, expiryMonth, expiryYear, ccv]
+ *                 properties:
+ *                   holderName: { type: string }
+ *                   number: { type: string }
+ *                   expiryMonth: { type: string }
+ *                   expiryYear: { type: string }
+ *                   ccv: { type: string }
+ *               creditCardHolderInfo:
+ *                 type: object
+ *                 required: [name, email, cpfCnpj, postalCode, addressNumber, phone]
+ *                 properties:
+ *                   name: { type: string }
+ *                   email: { type: string }
+ *                   cpfCnpj: { type: string }
+ *                   postalCode: { type: string }
+ *                   addressNumber: { type: string }
+ *                   phone: { type: string }
+ *     responses:
+ *       201:
+ *         description: Pagamento criado (ou já capturado, se o Asaas confirmar na hora)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 paymentId: { type: string }
+ *                 asaas_payment_id: { type: string }
+ *                 status: { type: string, example: "completed" }
+ *                 phase: { type: string }
+ *                 payment:
+ *                   type: object
+ *                   properties:
+ *                     id: { type: string }
+ *                     status: { type: string }
+ *                     brand: { type: string, example: "VISA" }
+ *                     lastDigits: { type: string }
+ *       400: { description: Dados obrigatórios ausentes, valor inválido ou phase inválida }
+ *       403: { description: Somente o comprador pode iniciar o pagamento }
+ *       409: { description: "Parcela final bloqueada (entrada não confirmada, já concluída, ou já existe cobrança final pendente)" }
+ *       500: { description: Erro ao processar pagamento com cartão de crédito }
+ */
+router.post('/card', controller.createCreditCardPayment as RequestHandler);
 router.post('/final-boleto', controller.createFinalBoleto as RequestHandler);
 router.post('/configure-webhook', requireAdmin as RequestHandler, controller.configureWebhook as RequestHandler);
 
@@ -266,7 +370,7 @@ router.post('/configure-webhook', requireAdmin as RequestHandler, controller.con
  *       acionado manualmente para forçar sincronização imediata (útil após pagamento de boleto).
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     responses:
  *       200:
  *         description: Sincronização concluída
@@ -308,7 +412,7 @@ router.get('/final-amount/:saleId', controller.getFinalInstallmentAmount as Requ
  *     summary: Busca um pagamento específico por ID
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -367,11 +471,11 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  * @swagger
  * /payment/{id}/sync:
  *   post:
- *     summary: Sincroniza o status de um pagamento com o Mercado Pago
- *     description: Busca o status atual do pagamento no Mercado Pago e atualiza no banco de dados. Útil quando o webhook não chega ou para verificação manual.
+ *     summary: Sincroniza o status de um pagamento com o Asaas
+ *     description: Busca o status atual da cobrança no Asaas e atualiza no banco de dados. Útil quando o webhook não chega ou para verificação manual.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -403,27 +507,27 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *                     status:
  *                       type: string
  *                       example: "completed"
- *                     mp_payment_id:
+ *                     asaas_payment_id:
  *                       type: string
- *                       example: "1234567890"
- *                     mp_status:
- *                       type: string
- *                       example: "approved"
- *                 mercadopago:
+ *                       example: "pay_080225913252"
+ *                 asaas:
  *                   type: object
  *                   properties:
  *                     id:
  *                       type: string
- *                       example: "1234567890"
+ *                       example: "pay_080225913252"
  *                     status:
  *                       type: string
- *                       example: "approved"
- *                     transaction_amount:
+ *                       example: "RECEIVED"
+ *                     value:
  *                       type: number
  *                       example: 100.00
- *                     date_approved:
+ *                     paymentDate:
  *                       type: string
- *                       format: date-time
+ *                       format: date
+ *                     dueDate:
+ *                       type: string
+ *                       format: date
  *       404:
  *         description: Pagamento não encontrado ou não processado ainda
  *         content:
@@ -436,7 +540,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *                   example: false
  *                 message:
  *                   type: string
- *                   example: "Pagamento ainda não foi realizado ou processado pelo Mercado Pago"
+ *                   example: "Pagamento ainda não foi realizado ou processado pelo Asaas"
  *       400:
  *         description: ID inválido
  *       500:
@@ -447,10 +551,10 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  * /payment/{id}/debug:
  *   get:
  *     summary: Debug de um pagamento - informações detalhadas
- *     description: Retorna informações completas do pagamento tanto no banco quanto no Mercado Pago para debug
+ *     description: Retorna informações completas do pagamento tanto no banco quanto no Asaas para debug
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -470,9 +574,9 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *                 paymentRecord:
  *                   type: object
  *                   description: Dados do pagamento no banco
- *                 mpData:
+ *                 asaasData:
  *                   type: object
- *                   description: Dados do pagamento no Mercado Pago
+ *                   description: Dados do pagamento no Asaas
  *                 canSync:
  *                   type: boolean
  *                   description: Se é possível sincronizar o pagamento
@@ -486,10 +590,10 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  * /payment/{id}:
  *   patch:
  *     summary: Atualiza informações de um pagamento
- *     description: Atualiza dados como status, mp_payment_id, etc.
+ *     description: Atualiza dados como status, asaas_payment_id, etc.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -509,9 +613,9 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *                 type: string
  *                 enum: [pending, approved, rejected, cancelled]
  *                 example: "approved"
- *               mp_payment_id:
+ *               asaas_payment_id:
  *                 type: string
- *                 example: "987654321"
+ *                 example: "pay_080225913252"
  *               amount:
  *                 type: number
  *                 example: 250.50
@@ -549,11 +653,14 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  * @swagger
  * /payment/methods:
  *   get:
- *     summary: Lista todos os meios de pagamento disponíveis
- *     description: Retorna todos os métodos de pagamento aceitos pelo Mercado Pago
+ *     summary: Lista os meios de pagamento cadastrados localmente
+ *     description: >
+ *       O Asaas não possui endpoint de listagem de métodos — retorna os métodos cadastrados
+ *       na tabela local PaymentMethod. O `id` retornado é o paymentMethodId real (FK),
+ *       utilizável diretamente nos demais endpoints de criação de pagamento.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     responses:
  *       200:
  *         description: Lista de meios de pagamento retornada com sucesso
@@ -566,16 +673,16 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *                 properties:
  *                   id:
  *                     type: string
- *                     example: "pix"
- *                   name:
+ *                     description: paymentMethodId (FK) a ser usado nos endpoints de criação
+ *                     example: "clx123abc456"
+ *                   method:
  *                     type: string
  *                     example: "PIX"
- *                   payment_type_id:
+ *                   billingType:
  *                     type: string
- *                     example: "bank_transfer"
- *                   status:
- *                     type: string
- *                     example: "active"
+ *                     enum: [PIX, BOLETO, CREDIT_CARD, UNDEFINED]
+ *                     description: "billingType do Asaas correspondente — UNDEFINED é usado para Cartão de Débito (via fatura hospedada)"
+ *                     example: "PIX"
  *       500:
  *         description: Erro ao buscar meios de pagamento
  */
@@ -583,11 +690,14 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  * @swagger
  * /payment/pix:
  *   post:
- *     summary: Cria um pagamento PIX usando Orders API (Checkout Transparente)
- *     description: Cria um pagamento PIX instantâneo retornando QR Code e Pix Copia e Cola
+ *     summary: Cria um pagamento PIX via Asaas (billingType PIX)
+ *     description: >
+ *       Cria uma cobrança PIX instantânea via Asaas, retornando QR Code e Pix Copia e Cola.
+ *       `amount` é ignorado para down_payment/final_payment/full — o servidor sempre recalcula
+ *       o valor correto no servidor.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -639,39 +749,40 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *                   type: string
  *                   description: ID do pagamento no banco local
  *                   example: "pay-uuid-123-456"
- *                 orderId:
+ *                 asaas_payment_id:
  *                   type: string
- *                   description: ID da Order no Mercado Pago
- *                   example: "ORD01HRYFWNYRE1MR1E60MW3X0T2P"
- *                 orderStatus:
+ *                   description: ID da cobrança no Asaas
+ *                   example: "pay_080225913252"
+ *                 status:
  *                   type: string
- *                   example: "action_required"
+ *                   example: "pending"
+ *                 phase:
+ *                   type: string
+ *                   example: "down_payment"
  *                 payment:
  *                   type: object
  *                   properties:
  *                     id:
  *                       type: string
- *                       example: "PAY01HRYFXQ53Q3JPEC48MYWMR0TE"
+ *                       example: "pay_080225913252"
  *                     status:
  *                       type: string
- *                       example: "action_required"
- *                     status_detail:
- *                       type: string
- *                       example: "waiting_transfer"
+ *                       example: "PENDING"
  *                     qr_code:
  *                       type: string
- *                       description: Código PIX Copia e Cola
+ *                       description: Código PIX Copia e Cola (payload do Asaas)
  *                       example: "00020126580014br.gov.bcb.pix..."
  *                     qr_code_base64:
  *                       type: string
- *                       description: Imagem QR Code em Base64
+ *                       description: Imagem QR Code em Base64 (encodedImage do Asaas)
  *                       example: "iVBORw0KGgoAAAANSUhEUgAABWQAAAVk..."
- *                     ticket_url:
+ *                     expiration_date:
  *                       type: string
- *                       description: URL da página de pagamento
- *                       example: "https://www.mercadopago.com.br/sandbox/payments/..."
+ *                       format: date-time
  *       400:
- *         description: Dados obrigatórios não fornecidos ou inválidos
+ *         description: Dados obrigatórios não fornecidos, inválidos ou phase inválida
+ *       409:
+ *         description: "Parcela final bloqueada ou cobrança duplicada em andamento (DUPLICATE_PAYMENT_ATTEMPT)"
  *       500:
  *         description: Erro ao criar pagamento PIX
  */
@@ -686,7 +797,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *       Se omitido, calcula automaticamente como (total do contrato - entrada paga).
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -720,7 +831,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *       `GET /payment/final-amount/{saleId}` (alias de compatibilidade).
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: saleId
@@ -758,7 +869,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Alias de `/payment/sales/{saleId}/final-amount` para compatibilidade com o frontend.
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: saleId
@@ -776,7 +887,7 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *     description: Cancela um pagamento PIX que ainda não foi pago (status pending)
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -822,11 +933,15 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  * @swagger
  * /payment/configure-webhook:
  *   post:
- *     summary: Configura webhook do Mercado Pago
- *     description: Registra a URL de webhook no Mercado Pago para receber notificações de pagamentos
+ *     summary: Configura o webhook no Asaas
+ *     description: >
+ *       Registra a URL de webhook (`/payment/webhook`) no Asaas, usando ASAAS_WEBHOOK_TOKEN
+ *       como authToken e assinando os eventos de cobrança relevantes (PAYMENT_CREATED,
+ *       PAYMENT_CONFIRMED, PAYMENT_RECEIVED, PAYMENT_OVERDUE, PAYMENT_DELETED,
+ *       PAYMENT_REFUNDED, PAYMENT_REFUND_IN_PROGRESS, PAYMENT_CHARGEBACK_REQUESTED).
  *     tags: [PaymentMethods]
  *     security:
- *       - bearerAuth: []
+ *       - BearerAuth: []
  *     responses:
  *       200:
  *         description: Webhook configurado com sucesso
@@ -840,15 +955,18 @@ router.post('/:id/cancel', controller.cancelPixPayment as RequestHandler);
  *                   example: "webhook-id-123"
  *                 url:
  *                   type: string
- *                   example: "https://api.vendamaisagro.com.br/payment-methods/webhook"
+ *                   example: "https://api.vendamaisagro.com.br/payment/webhook"
+ *                 enabled:
+ *                   type: boolean
+ *                   example: true
+ *                 sendType:
+ *                   type: string
+ *                   example: "SEQUENTIALLY"
  *                 events:
  *                   type: array
  *                   items:
- *                     type: object
- *                     properties:
- *                       topic:
- *                         type: string
- *                         example: "payment"
+ *                     type: string
+ *                   example: ["PAYMENT_CREATED", "PAYMENT_RECEIVED"]
  *       500:
  *         description: Erro ao configurar webhook
  */

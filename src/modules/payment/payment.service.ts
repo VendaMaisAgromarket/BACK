@@ -1,15 +1,30 @@
 import { Payment, PrismaClient } from '@prisma/client';
-import { MercadoPagoConfig, Preference, Payment as MPPayment, PaymentMethod, Order } from 'mercadopago';
-import { randomUUID } from 'crypto';
+import axios, { AxiosInstance } from 'axios';
 import 'dotenv/config';
 
-const client = new MercadoPagoConfig({ accessToken: process.env.ACCESS_TOKEN || 'MERCADO_PAGO_ACCESS_TOKEN' });
-const preference = new Preference(client);
-const mpPayment = new MPPayment(client);
-const paymentMethod = new PaymentMethod(client);
-const orderClient = new Order(client);
-
 type PaymentPhase = 'down_payment' | 'final_payment' | 'full';
+
+const asaasClient: AxiosInstance = axios.create({
+    baseURL: process.env.ASAAS_BASE_URL || 'https://api-sandbox.asaas.com/v3',
+    headers: {
+        'Content-Type': 'application/json',
+        access_token: process.env.ASAAS_API_KEY || ''
+    }
+});
+
+/** Extrai a mensagem de erro da resposta da API do Asaas, com fallback para o erro genérico. */
+function extractAsaasErrorMessage(error: any, fallback: string): string {
+    return error?.response?.data?.errors?.[0]?.description || error?.message || fallback;
+}
+
+/** Código de erro do Prisma para violação de constraint única (corrida concorrente detectada no banco). */
+const PRISMA_UNIQUE_VIOLATION = 'P2002';
+
+/** Status que, uma vez alcançados, nunca devem regredir para 'pending' por um evento atrasado/fora de ordem. */
+const TERMINAL_STATUSES = ['completed', 'refunded', 'cancelled'];
+
+/** Status que, ao sair de 'completed', exigem recalcular os sinalizadores de pagamento da venda. */
+const REVERSAL_STATUSES = ['refunded', 'cancelled'];
 
 export class PaymentService {
     private readonly prisma: PrismaClient;
@@ -17,6 +32,252 @@ export class PaymentService {
         this.prisma = prisma || new PrismaClient();
     }
 
+    /**
+     * Garante que o comprador possua um cliente cadastrado no Asaas, criando-o na primeira
+     * cobrança e reaproveitando o id nas cobranças seguintes.
+     */
+    private async ensureAsaasCustomer(buyerId: string): Promise<string> {
+        const buyer = await this.prisma.user.findUnique({
+            where: { id: buyerId },
+            include: { addresses: true }
+        });
+        if (!buyer) throw new Error('Comprador não encontrado');
+        if (buyer.asaas_customer_id) return buyer.asaas_customer_id;
+
+        const cpfCnpj = (buyer.cpf || buyer.cnpj)?.replace(/[.\-/]/g, '');
+        if (!cpfCnpj) throw new Error('Comprador não possui CPF ou CNPJ cadastrado');
+
+        const address = buyer.addresses.find(a => a.default) ?? buyer.addresses[0];
+
+        const { data } = await asaasClient.post('/customers', {
+            name: buyer.name,
+            cpfCnpj,
+            email: buyer.email,
+            mobilePhone: buyer.phone_number,
+            externalReference: buyer.id,
+            // Sem campo de bairro no nosso modelo de Address — "alias" é um rótulo do
+            // próprio usuário (ex. "Casa"), não um bairro/província; não mapear para `province`.
+            // Asaas resolve cidade/UF a partir do CEP automaticamente.
+            ...(address && {
+                postalCode: address.cep,
+                address: address.street,
+                addressNumber: address.number
+            })
+        });
+
+        // Grava o id só se ninguém venceu a corrida antes (evita sobrescrever um
+        // asaas_customer_id já persistido por uma requisição concorrente para o mesmo comprador).
+        const updateResult = await this.prisma.user.updateMany({
+            where: { id: buyer.id, asaas_customer_id: null },
+            data: { asaas_customer_id: data.id }
+        });
+
+        if (updateResult.count === 0) {
+            const current = await this.prisma.user.findUnique({ where: { id: buyer.id } });
+            if (current?.asaas_customer_id) return current.asaas_customer_id;
+        }
+
+        return data.id as string;
+    }
+
+    /** Monta o texto exibido na fatura/cobrança do Asaas para o comprador. */
+    private buildPaymentDescription(orderNumber: number, phase: PaymentPhase): string {
+        const phaseLabel: Record<PaymentPhase, string> = {
+            down_payment: 'primeira parcela (30%)',
+            final_payment: 'parcela final (70%)',
+            full: 'pagamento integral',
+        };
+        return `Pagamento referente à ${phaseLabel[phase]} referente ao pedido ${orderNumber}`;
+    }
+
+    /** Mapeia o status de cobrança do Asaas para o vocabulário interno do sistema. */
+    private mapAsaasStatus(asaasStatus: string): string {
+        const statusMap: Record<string, string> = {
+            'PENDING': 'pending',
+            'AWAITING_RISK_ANALYSIS': 'pending',
+            'AUTHORIZED': 'pending',
+            'CONFIRMED': 'completed',
+            'RECEIVED': 'completed',
+            'RECEIVED_IN_CASH': 'completed',
+            'OVERDUE': 'pending',
+            'REFUNDED': 'refunded',
+            'REFUND_REQUESTED': 'refunded',
+            'REFUND_IN_PROGRESS': 'refunded',
+            'CHARGEBACK_REQUESTED': 'refunded',
+            'CHARGEBACK_DISPUTE': 'refunded',
+            'AWAITING_CHARGEBACK_REVERSAL': 'refunded',
+            'DUNNING_REQUESTED': 'pending',
+            'DUNNING_RECEIVED': 'pending',
+            'DELETED': 'cancelled'
+        };
+        return statusMap[asaasStatus] || 'pending';
+    }
+
+    /**
+     * Idempotência por tentativa: reaproveita uma cobrança pendente/concluída já existente
+     * para a mesma venda+fase, em vez de criar uma nova no Asaas a cada reenvio (ex.: timeout
+     * no cliente após o Asaas já ter aceitado a cobrança anterior). A invariante é "uma
+     * tentativa ativa por venda+fase" — INDEPENDENTE do meio de pagamento: se já existe uma
+     * cobrança pendente via PIX e o cliente chama o endpoint de boleto para a mesma fase, a
+     * cobrança PIX existente é reaproveitada — não criamos uma segunda cobrança ativa
+     * concorrente para a mesma parcela só porque o endpoint/meio de pagamento mudou.
+     * Chamada SEMPRE antes de qualquer validação de fase, para que um retry de final_payment
+     * reaproveite a cobrança pendente em vez de ser bloqueado por "já existe cobrança final".
+     *
+     * Se o registro encontrado ainda não tem `asaas_payment_id` (reserva de uma requisição
+     * concorrente que ainda não terminou de falar com o Asaas), não há nada para reaproveitar
+     * ainda — quem chamar deve tratar isso como "tente novamente", nunca tentar reusar.
+     */
+    private async findExistingAttempt(saleId: string, phase: PaymentPhase) {
+        return this.prisma.payment.findFirst({
+            where: { saleId, phase, status: { in: ['pending', 'completed'] } },
+            orderBy: { createdAt: 'desc' },
+        });
+    }
+
+    /**
+     * Resolve o que fazer com uma tentativa já existente encontrada por `findExistingAttempt`:
+     * reaproveita a resposta se a cobrança já foi de fato criada no Asaas, ou sinaliza para
+     * tentar novamente em breve se for apenas uma reserva em andamento de outra requisição.
+     */
+    private async reuseOrRetrySignal(existing: Payment, phase: PaymentPhase): Promise<any> {
+        if (!existing.asaas_payment_id) {
+            throw new Error('DUPLICATE_PAYMENT_ATTEMPT:Uma cobrança para esta venda/fase já está sendo criada. Tente novamente em alguns segundos.');
+        }
+        return this.buildReuseResponse(existing, phase);
+    }
+
+    /**
+     * Monta a resposta de uma cobrança já existente (reaproveitada), buscando os dados
+     * complementares específicos de cada meio de pagamento. Único ponto que sabe o formato
+     * de resposta de cada billingType — evita duplicar essa lógica em cada método de criação.
+     */
+    private async buildReuseResponse(existing: Payment, phase: PaymentPhase): Promise<any> {
+        if (existing.billingType === 'PIX') {
+            const [paymentRes, qrRes] = await Promise.all([
+                asaasClient.get(`/payments/${existing.asaas_payment_id}`),
+                // Uma cobrança já liquidada pode não ter mais QR Code disponível no Asaas —
+                // não vale a pena pedir (e não deve quebrar a resposta se falhar).
+                existing.status === 'completed'
+                    ? Promise.resolve(null)
+                    : asaasClient.get(`/payments/${existing.asaas_payment_id}/pixQrCode`).catch(() => null)
+            ]);
+            const asaasPayment = paymentRes.data;
+            const qrCode = qrRes?.data ?? null;
+            return {
+                paymentId: existing.id,
+                asaas_payment_id: existing.asaas_payment_id,
+                status: existing.status,
+                phase,
+                payment: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    qr_code: qrCode?.payload ?? null,
+                    qr_code_base64: qrCode?.encodedImage ?? null,
+                    expiration_date: qrCode?.expirationDate ?? null
+                }
+            };
+        }
+
+        if (existing.billingType === 'BOLETO') {
+            const { data: asaasPayment } = await asaasClient.get(`/payments/${existing.asaas_payment_id}`);
+            return {
+                paymentId: existing.id,
+                asaas_payment_id: existing.asaas_payment_id,
+                status: existing.status,
+                phase,
+                payment: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    ticket_url: asaasPayment.bankSlipUrl,
+                    invoice_url: asaasPayment.invoiceUrl,
+                    expiration_date: asaasPayment.dueDate
+                }
+            };
+        }
+
+        if (existing.billingType === 'CREDIT_CARD') {
+            const { data: asaasPayment } = await asaasClient.get(`/payments/${existing.asaas_payment_id}`);
+            return {
+                paymentId: existing.id,
+                asaas_payment_id: existing.asaas_payment_id,
+                status: existing.status,
+                phase,
+                payment: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    brand: asaasPayment.creditCard?.creditCardBrand,
+                    lastDigits: asaasPayment.creditCard?.creditCardNumber
+                }
+            };
+        }
+
+        // UNDEFINED (fatura hospedada / createPreference)
+        const { data: asaasPayment } = await asaasClient.get(`/payments/${existing.asaas_payment_id}`);
+        return {
+            paymentId: existing.id,
+            asaas_payment_id: existing.asaas_payment_id,
+            init_point: asaasPayment.invoiceUrl
+        };
+    }
+
+    /**
+     * Alguns meios de pagamento confirmam de forma síncrona (ex.: cartão de crédito aprovado
+     * na hora da captura). Quando o Payment já nasce 'completed', aplica a mesma transição de
+     * SaleData que o webhook aplicaria — sem isso, a venda fica com downPaymentCompleted/
+     * paymentCompleted falsos mesmo com a cobrança já confirmada, e o webhook subsequente pula
+     * a atualização por já achar o status igual.
+     */
+    private async applyCompletionIfAlreadySettled(payment: Payment): Promise<void> {
+        if (payment.status !== 'completed') return;
+        await this.prisma.$transaction(async (tx) => {
+            await this.applyPaymentCompletion(tx, payment, payment.status);
+        });
+    }
+
+    /**
+     * Reserva localmente a tentativa de pagamento ANTES de chamar o Asaas. O índice único
+     * parcial do banco (saleId+phase+billingType, para status pending/completed) garante que
+     * só uma requisição concorrente consiga reservar a mesma combinação — a perdedora recebe
+     * o erro aqui e NUNCA chega a criar uma cobrança remota, então não existe cenário de
+     * cobrança órfã no Asaas por causa de uma corrida entre duas requisições.
+     */
+    private async reservePaymentAttempt(data: {
+        saleId: string;
+        paymentMethodId: string;
+        amount: number;
+        phase: PaymentPhase;
+        billingType: string;
+    }): Promise<Payment> {
+        try {
+            return await this.prisma.payment.create({
+                data: { ...data, status: 'pending', asaas_customer_id: null, asaas_payment_id: null }
+            });
+        } catch (error: any) {
+            if (error?.code === PRISMA_UNIQUE_VIOLATION) {
+                throw new Error('DUPLICATE_PAYMENT_ATTEMPT:Já existe uma cobrança em andamento para esta venda/fase. Tente novamente em alguns segundos.');
+            }
+            throw error;
+        }
+    }
+
+    /**
+     * Libera uma reserva que não chegou a se tornar uma cobrança real no Asaas (ex.: a chamada
+     * à API falhou após a reserva) — sem isso, a linha reservada ficaria 'pending' para sempre
+     * e bloquearia qualquer nova tentativa para a mesma venda/fase/meio de pagamento.
+     */
+    private async releaseReservation(reservedId: string): Promise<void> {
+        await this.prisma.payment.update({
+            where: { id: reservedId },
+            data: { status: 'cancelled', updatedAt: new Date() }
+        }).catch(() => { /* melhor esforço — não deixa o erro de liberação mascarar o erro original */ });
+    }
+
+    /**
+     * Cria uma fatura hospedada no Asaas (billingType UNDEFINED): o comprador é redirecionado
+     * para a página do Asaas e escolhe PIX, boleto ou cartão. É o único caminho para oferecer
+     * cartão de débito, já que a API do Asaas não aceita dados de débito diretamente.
+     */
     async createPreference(params: {
         saleId: string;
         paymentMethodId: string;
@@ -28,60 +289,77 @@ export class PaymentService {
     }) {
         try {
             const phase = params.phase ?? 'full';
-            console.info(`[createPreference] Criando preferência de pagamento para venda ${params.saleId} (fase: ${phase})`);
+            console.info(`[createPreference] Criando fatura Asaas para venda ${params.saleId} (fase: ${phase})`);
 
-            // Quando é entrada, recalcula o unit_price e amount server-side
-            let unit_price = params.unit_price;
+            const existing = await this.findExistingAttempt(params.saleId, phase);
+            if (existing) {
+                console.info(`[createPreference] Fatura já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outra.`);
+                return await this.reuseOrRetrySignal(existing, phase);
+            }
+
             let amount = params.amount;
             if (phase === 'down_payment') {
                 const calc = await this.calculateDownPaymentAmount(params.saleId);
                 amount = calc.amount;
-                // unit_price para o MP = valor total da entrada (quantity mantida em 1)
-                unit_price = calc.amount;
                 console.info(`[createPreference] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
+            } else if (phase === 'final_payment') {
+                amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            } else {
+                // full — nunca confia no amount do cliente; usa o total do contrato
+                amount = await this.calculateFullPaymentAmount(params.saleId);
             }
 
-            const response = await preference.create({
-                body: {
-                    items: [
-                        {
-                            id: params.saleId,
-                            title: params.title,
-                            quantity: 1,
-                            unit_price: amount // quantity é sempre 1; usar amount garante que MP cobra o mesmo valor armazenado no banco
-                        }
-                    ],
-                    back_urls: {
-                        success: `${process.env.URL_BACKEND}/payment/sucesso`,
-                        failure: `${process.env.URL_BACKEND}/payment/erro`,
-                        pending: `${process.env.URL_BACKEND}/payment/pendente`
-                    },
-                    notification_url: `${process.env.URL_BACKEND}/payment/webhook`,
-                    external_reference: params.saleId
-                }
+            const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
+            if (!sale) throw new Error(`Venda não encontrada: ${params.saleId}`);
+
+            const reserved = await this.reservePaymentAttempt({
+                saleId: params.saleId,
+                paymentMethodId: params.paymentMethodId,
+                amount,
+                phase,
+                billingType: 'UNDEFINED'
             });
 
-            const payment = await this.prisma.payment.create({
-                data: {
-                    saleId: params.saleId,
-                    paymentMethodId: params.paymentMethodId,
-                    amount,
-                    status: 'pending',
-                    phase,
-                    mp_preference_id: response.id,
-                }
-            });
+            try {
+                const customerId = await this.ensureAsaasCustomer(sale.buyerId);
+                const dueDate = new Date().toISOString().split('T')[0];
 
-            console.info(`[createPreference] Preferência criada com sucesso - PaymentId: ${payment.id}, MP PreferenceId: ${response.id}`);
+                const { data: asaasPayment } = await asaasClient.post('/payments', {
+                    customer: customerId,
+                    billingType: 'UNDEFINED',
+                    value: amount,
+                    dueDate,
+                    externalReference: params.saleId,
+                    description: params.title
+                });
 
-            return {
-                paymentId: payment.id,
-                mp_preference_id: response.id,
-                init_point: response.init_point
-            };
+                const payment = await this.prisma.payment.update({
+                    where: { id: reserved.id },
+                    data: {
+                        asaas_customer_id: customerId,
+                        asaas_payment_id: asaasPayment.id,
+                        status: this.mapAsaasStatus(asaasPayment.status)
+                    }
+                });
+
+                await this.applyCompletionIfAlreadySettled(payment);
+
+                console.info(`[createPreference] Fatura criada com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
+
+                return {
+                    paymentId: payment.id,
+                    asaas_payment_id: asaasPayment.id,
+                    init_point: asaasPayment.invoiceUrl
+                };
+            } catch (innerError) {
+                await this.releaseReservation(reserved.id);
+                throw innerError;
+            }
         } catch (error: any) {
-            console.error(`[createPreference] Erro ao criar preferência para venda ${params.saleId}:`, error.message);
-            throw new Error(error.message || 'Erro ao criar preferência do Mercado Pago');
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            const message = extractAsaasErrorMessage(error, 'Erro ao criar fatura do Asaas');
+            console.error(`[createPreference] Erro ao criar fatura para venda ${params.saleId}:`, message);
+            throw new Error(message);
         }
     }
 
@@ -103,6 +381,25 @@ export class PaymentService {
         return { amount, contractTotal, percent };
     }
 
+    /**
+     * Calcula o valor do pagamento integral (phase 'full'): o total do contrato, ajustado pelo
+     * peso real quando disponível. Nunca confia no `amount` enviado pelo cliente — mesma
+     * proteção já aplicada a down_payment e final_payment, para que um comprador não possa
+     * liquidar a venda inteira com um valor simbólico.
+     */
+    private async calculateFullPaymentAmount(saleId: string): Promise<number> {
+        const sale = await this.prisma.saleData.findUnique({
+            where: { id: saleId },
+            include: { boughtProducts: true },
+        });
+        if (!sale) throw new Error(`Venda (id=${saleId}) não encontrada`);
+
+        const originalTotal = sale.boughtProducts.reduce((sum, bp) => sum + bp.value, 0) + Number(sale.transportValue);
+        const adjustedContractTotal = sale.adjustedContractTotal !== null ? Number(sale.adjustedContractTotal) : null;
+
+        return adjustedContractTotal ?? originalTotal;
+    }
+
     async getById(paymentId: string): Promise<Payment | null> {
         return this.prisma.payment.findUnique({
             where: { id: paymentId }
@@ -117,15 +414,26 @@ export class PaymentService {
         return payment?.saleId ?? null;
     }
 
+    /**
+     * O Asaas não possui endpoint de listagem de métodos. Retorna os métodos cadastrados
+     * localmente (tabela PaymentMethod) — o `id` retornado é o paymentMethodId real (FK),
+     * utilizável diretamente nos demais endpoints de criação de pagamento.
+     */
     async getPaymentMethods() {
-        try {
-            console.info('[getPaymentMethods] Buscando meios de pagamento disponíveis');
-            const methods = await paymentMethod.get();
-            return methods;
-        } catch (error: any) {
-            console.error('[getPaymentMethods] Erro ao buscar meios de pagamento:', error.message);
-            throw new Error(error.message || 'Erro ao buscar meios de pagamento');
-        }
+        const billingTypeByMethod: Record<string, string> = {
+            'PIX': 'PIX',
+            'Boleto': 'BOLETO',
+            'Cartão de Crédito': 'CREDIT_CARD',
+            'Cartão de Débito': 'UNDEFINED', // Asaas não aceita débito direto — só via fatura hospedada (createPreference)
+        };
+
+        const methods = await this.prisma.paymentMethod.findMany();
+
+        return methods.map(m => ({
+            id: m.id,
+            method: m.method,
+            billingType: billingTypeByMethod[m.method] ?? null
+        }));
     }
 
     async createPixPayment(params: {
@@ -140,80 +448,165 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createPixPayment] Criando pagamento PIX para venda ${params.saleId} (fase: ${phase})`);
 
-            // Quando é entrada, ignora o amount do cliente e calcula server-side
+            const existing = await this.findExistingAttempt(params.saleId, phase);
+            if (existing) {
+                console.info(`[createPixPayment] PIX já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outro.`);
+                return await this.reuseOrRetrySignal(existing, phase);
+            }
+
             let amount = params.amount;
             if (phase === 'down_payment') {
                 const calc = await this.calculateDownPaymentAmount(params.saleId);
                 amount = calc.amount;
                 console.info(`[createPixPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
+            } else if (phase === 'final_payment') {
+                amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            } else {
+                // full — nunca confia no amount do cliente; usa o total do contrato
+                amount = await this.calculateFullPaymentAmount(params.saleId);
             }
 
-            const expirationMinutes = params.expirationMinutes || 30;
-            const expirationTime = `PT${expirationMinutes}M`;
-            const idempotencyKey = randomUUID();
+            const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
+            if (!sale) throw new Error(`Venda não encontrada: ${params.saleId}`);
 
-            const orderResponse = await orderClient.create({
-                body: {
-                    type: 'online',
-                    total_amount: amount.toFixed(2),
-                    external_reference: params.saleId,
-                    processing_mode: 'automatic',
-                    transactions: {
-                        payments: [
-                            {
-                                amount: amount.toFixed(2),
-                                payment_method: {
-                                    id: 'pix',
-                                    type: 'bank_transfer'
-                                },
-                                expiration_time: expirationTime
-                            }
-                        ]
-                    },
-                    payer: {
-                        email: params.email
-                    }
-                } as any,
-                requestOptions: { idempotencyKey }
+            const reserved = await this.reservePaymentAttempt({
+                saleId: params.saleId,
+                paymentMethodId: params.paymentMethodId,
+                amount,
+                phase,
+                billingType: 'PIX'
             });
 
-            const paymentData = orderResponse.transactions?.payments?.[0];
-            if (!paymentData) {
-                throw new Error('Resposta da API não contém dados de pagamento');
-            }
+            try {
+                const customerId = await this.ensureAsaasCustomer(sale.buyerId);
 
-            const payment = await this.prisma.payment.create({
-                data: {
-                    saleId: params.saleId,
-                    paymentMethodId: params.paymentMethodId,
-                    amount,
-                    status: 'pending',
+                // PIX é liquidado instantaneamente, mas o Asaas ainda exige um dueDate;
+                // expirationMinutes (herdado da API antiga) é aproximado em dias corridos.
+                const dueDateObj = new Date();
+                if (params.expirationMinutes) dueDateObj.setMinutes(dueDateObj.getMinutes() + params.expirationMinutes);
+                const dueDate = dueDateObj.toISOString().split('T')[0];
+
+                const { data: asaasPayment } = await asaasClient.post('/payments', {
+                    customer: customerId,
+                    billingType: 'PIX',
+                    value: amount,
+                    dueDate,
+                    externalReference: params.saleId,
+                    description: this.buildPaymentDescription(sale.orderNumber, phase)
+                });
+
+                const { data: qrCode } = await asaasClient.get(`/payments/${asaasPayment.id}/pixQrCode`);
+
+                const payment = await this.prisma.payment.update({
+                    where: { id: reserved.id },
+                    data: {
+                        asaas_customer_id: customerId,
+                        asaas_payment_id: asaasPayment.id,
+                        status: this.mapAsaasStatus(asaasPayment.status)
+                    }
+                });
+
+                await this.applyCompletionIfAlreadySettled(payment);
+
+                console.info(`[createPixPayment] Pagamento PIX criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
+
+                return {
+                    paymentId: payment.id,
+                    asaas_payment_id: asaasPayment.id,
+                    status: payment.status,
                     phase,
-                    mp_order_id: orderResponse.id,
-                    mp_payment_id: paymentData.id,
+                    payment: {
+                        id: asaasPayment.id,
+                        status: asaasPayment.status,
+                        qr_code: qrCode.payload,
+                        qr_code_base64: qrCode.encodedImage,
+                        expiration_date: qrCode.expirationDate
+                    }
+                };
+            } catch (innerError) {
+                await this.releaseReservation(reserved.id);
+                throw innerError;
+            }
+        } catch (error: any) {
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento PIX');
+            console.error(`[createPixPayment] Erro ao criar pagamento PIX para venda ${params.saleId}:`, message);
+            throw new Error(message);
+        }
+    }
+
+    /**
+     * Efetivamente cria a cobrança de boleto no Asaas (reservando a linha local antes de
+     * chamar a API). Não valida fase nem recalcula valor — quem chama (`createBoletoPayment`
+     * ou `createFinalBoleto`) já fez isso com a semântica correta para o seu caso (o
+     * final-boleto admite ajuste manual pelo peso).
+     */
+    private async createBoletoCharge(params: {
+        saleId: string;
+        paymentMethodId: string;
+        amount: number;
+        expirationDays?: number;
+        phase: PaymentPhase;
+    }) {
+        const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
+        if (!sale) throw new Error(`Venda não encontrada: ${params.saleId}`);
+
+        const reserved = await this.reservePaymentAttempt({
+            saleId: params.saleId,
+            paymentMethodId: params.paymentMethodId,
+            amount: params.amount,
+            phase: params.phase,
+            billingType: 'BOLETO'
+        });
+
+        try {
+            const customerId = await this.ensureAsaasCustomer(sale.buyerId);
+
+            // ?? (não ||): expirationDays: 0 é um valor explícito válido ("vence hoje"), não deve
+            // cair no default de 3 dias.
+            const expirationDays = params.expirationDays ?? 3;
+            const dueDateObj = new Date();
+            dueDateObj.setDate(dueDateObj.getDate() + expirationDays);
+            const dueDate = dueDateObj.toISOString().split('T')[0];
+
+            const { data: asaasPayment } = await asaasClient.post('/payments', {
+                customer: customerId,
+                billingType: 'BOLETO',
+                value: params.amount,
+                dueDate,
+                externalReference: params.saleId,
+                description: this.buildPaymentDescription(sale.orderNumber, params.phase)
+            });
+
+            const payment = await this.prisma.payment.update({
+                where: { id: reserved.id },
+                data: {
+                    asaas_customer_id: customerId,
+                    asaas_payment_id: asaasPayment.id,
+                    status: this.mapAsaasStatus(asaasPayment.status)
                 }
             });
 
-            console.info(`[createPixPayment] Pagamento PIX criado com sucesso - PaymentId: ${payment.id}, OrderId: ${orderResponse.id}`);
+            await this.applyCompletionIfAlreadySettled(payment);
+
+            console.info(`[createBoletoCharge] Boleto criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
 
             return {
                 paymentId: payment.id,
-                orderId: orderResponse.id,
-                orderStatus: orderResponse.status,
-                phase,
+                asaas_payment_id: asaasPayment.id,
+                status: payment.status,
+                phase: params.phase,
                 payment: {
-                    id: paymentData.id,
-                    status: paymentData.status,
-                    status_detail: paymentData.status_detail,
-                    qr_code: (paymentData as any).payment_method?.qr_code,
-                    qr_code_base64: (paymentData as any).payment_method?.qr_code_base64,
-                    ticket_url: (paymentData as any).payment_method?.ticket_url
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    ticket_url: asaasPayment.bankSlipUrl,
+                    invoice_url: asaasPayment.invoiceUrl,
+                    expiration_date: dueDate
                 }
             };
-        } catch (error: any) {
-            const message = error?.message || JSON.stringify(error);
-            console.error(`[createPixPayment] Erro ao criar pagamento PIX para venda ${params.saleId}:`, message);
-            throw new Error(message || 'Erro ao criar pagamento PIX');
+        } catch (innerError) {
+            await this.releaseReservation(reserved.id);
+            throw innerError;
         }
     }
 
@@ -228,141 +621,181 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createBoletoPayment] Criando pagamento com boleto para venda ${params.saleId} (fase: ${phase})`);
 
-            // Quando é entrada, ignora o amount do cliente e calcula server-side
+            const existing = await this.findExistingAttempt(params.saleId, phase);
+            if (existing) {
+                console.info(`[createBoletoPayment] Boleto já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outro.`);
+                return await this.reuseOrRetrySignal(existing, phase);
+            }
+
             let amount = params.amount;
             if (phase === 'down_payment') {
                 const calc = await this.calculateDownPaymentAmount(params.saleId);
                 amount = calc.amount;
                 console.info(`[createBoletoPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
-            }
-
-            const sale = await this.prisma.saleData.findUnique({
-                where: { id: params.saleId },
-                include: {
-                    buyer: true,
-                    shippingAddress: true
-                }
-            });
-
-            if (!sale) throw new Error(`Venda não encontrada: ${params.saleId}`);
-            if (!sale.buyer) throw new Error('Dados do comprador não encontrados para esta venda');
-
-            let address = sale.shippingAddress;
-            if (!address) {
-                address = await this.prisma.address.findFirst({
-                    where: { userId: sale.buyerId, default: true }
-                });
-            }
-
-            if (!address) {
-                throw new Error('Endereço não encontrado. A venda precisa ter um endereço de entrega ou o comprador precisa ter um endereço padrão cadastrado.');
-            }
-
-            const nameParts = sale.buyer.name.trim().split(' ');
-            const firstName = nameParts[0];
-            const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0];
-
-            let identificationType: string;
-            let identificationNumber: string;
-
-            if (sale.buyer.cpf) {
-                identificationType = 'CPF';
-                identificationNumber = sale.buyer.cpf.replace(/[.\-]/g, '');
-            } else if (sale.buyer.cnpj) {
-                identificationType = 'CNPJ';
-                identificationNumber = sale.buyer.cnpj.replace(/[.\-/]/g, '');
+            } else if (phase === 'final_payment') {
+                amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
             } else {
-                throw new Error('Comprador não possui CPF ou CNPJ cadastrado');
+                // full — nunca confia no amount do cliente; usa o total do contrato
+                amount = await this.calculateFullPaymentAmount(params.saleId);
             }
 
-            const expirationDays = params.expirationDays || 3;
-            const expirationDate = new Date();
-            expirationDate.setDate(expirationDate.getDate() + expirationDays);
-            const expirationDateStr = expirationDate.toISOString().split('T')[0];
-
-            const idempotencyKey = randomUUID();
-
-            console.info(`[createBoletoPayment] Dados do pagador: ${firstName} ${lastName}, ${identificationType}: ${identificationNumber}`);
-
-            const orderResponse = await orderClient.create({
-                body: {
-                    type: 'online',
-                    total_amount: amount.toFixed(2),
-                    external_reference: params.saleId,
-                    processing_mode: 'automatic',
-                                    transactions: {
-                        payments: [
-                            {
-                                amount: amount.toFixed(2),
-                                payment_method: {
-                                    id: 'boleto',
-                                    type: 'ticket'
-                                }
-                            }
-                        ]
-                    },
-                    payer: {
-                        email: sale.buyer.email,
-                        first_name: firstName,
-                        last_name: lastName,
-                        identification: {
-                            type: identificationType,
-                            number: identificationNumber
-                        },
-                        address: {
-                            zip_code: address.cep,
-                            street_name: address.street,
-                            street_number: address.number,
-                            neighborhood: address.alias || 'Centro',
-                            city: address.city,
-                            state: address.uf
-                        }
-                    }
-                },
-                requestOptions: { idempotencyKey }
-            } as any);
-
-            const paymentData = orderResponse.transactions?.payments?.[0];
-
-            if (!paymentData) {
-                throw new Error('Resposta da API não contém dados de pagamento');
-            }
-
-            const payment = await this.prisma.payment.create({
-                data: {
-                    saleId: params.saleId,
-                    paymentMethodId: params.paymentMethodId,
-                    amount,
-                    status: 'pending',
-                    phase,
-                    mp_order_id: orderResponse.id,
-                    mp_payment_id: paymentData.id,
-                }
-            });
-
-            console.info(`[createBoletoPayment] Boleto criado com sucesso - PaymentId: ${payment.id}, OrderId: ${orderResponse.id}`);
-
-            return {
-                paymentId: payment.id,
-                orderId: orderResponse.id,
-                orderStatus: orderResponse.status,
-                phase,
-                payment: {
-                    id: paymentData.id,
-                    status: paymentData.status,
-                    status_detail: paymentData.status_detail,
-                    ticket_url: paymentData.payment_method?.ticket_url,
-                    barcode_content: paymentData.payment_method?.barcode_content,
-                    digitable_line: paymentData.payment_method?.digitable_line,
-                    financial_institution: paymentData.payment_method?.financial_institution,
-                    expiration_date: expirationDateStr
-                }
-            };
+            return await this.createBoletoCharge({ ...params, amount, phase });
         } catch (error: any) {
-            console.error(`[createBoletoPayment] Erro ao criar boleto para venda ${params.saleId}:`, JSON.stringify(error, null, 2));
-            const message = error?.message || error?.cause?.message || JSON.stringify(error) || 'Erro ao criar pagamento com boleto';
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento com boleto');
+            console.error(`[createBoletoPayment] Erro ao criar boleto para venda ${params.saleId}:`, message);
             throw new Error(message);
         }
+    }
+
+    /**
+     * Cria um pagamento com cartão de crédito (captura imediata via API do Asaas).
+     * Cartão de débito não é suportado diretamente pela API do Asaas — para débito,
+     * use `createPreference`, que gera uma fatura hospedada onde o comprador escolhe a forma de pagamento.
+     */
+    async createCreditCardPayment(params: {
+        saleId: string;
+        paymentMethodId: string;
+        amount: number;
+        remoteIp: string;
+        phase?: PaymentPhase;
+        installmentCount?: number;
+        creditCard: {
+            holderName: string;
+            number: string;
+            expiryMonth: string;
+            expiryYear: string;
+            ccv: string;
+        };
+        creditCardHolderInfo: {
+            name: string;
+            email: string;
+            cpfCnpj: string;
+            postalCode: string;
+            addressNumber: string;
+            phone: string;
+        };
+    }) {
+        try {
+            const phase = params.phase ?? 'full';
+            console.info(`[createCreditCardPayment] Criando pagamento em cartão de crédito para venda ${params.saleId} (fase: ${phase})`);
+
+            const existing = await this.findExistingAttempt(params.saleId, phase);
+            if (existing) {
+                console.info(`[createCreditCardPayment] Cobrança em cartão já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outra.`);
+                return await this.reuseOrRetrySignal(existing, phase);
+            }
+
+            let amount = params.amount;
+            if (phase === 'down_payment') {
+                const calc = await this.calculateDownPaymentAmount(params.saleId);
+                amount = calc.amount;
+                console.info(`[createCreditCardPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
+            } else if (phase === 'final_payment') {
+                amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            } else {
+                // full — nunca confia no amount do cliente; usa o total do contrato
+                amount = await this.calculateFullPaymentAmount(params.saleId);
+            }
+
+            const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
+            if (!sale) throw new Error(`Venda não encontrada: ${params.saleId}`);
+
+            const reserved = await this.reservePaymentAttempt({
+                saleId: params.saleId,
+                paymentMethodId: params.paymentMethodId,
+                amount,
+                phase,
+                billingType: 'CREDIT_CARD'
+            });
+
+            try {
+                const customerId = await this.ensureAsaasCustomer(sale.buyerId);
+                const dueDate = new Date().toISOString().split('T')[0]; // captura imediata; dueDate não agenda a cobrança
+
+                const installmentCount = params.installmentCount && params.installmentCount > 1 ? params.installmentCount : undefined;
+
+                const { data: asaasPayment } = await asaasClient.post('/payments', {
+                    customer: customerId,
+                    billingType: 'CREDIT_CARD',
+                    value: amount,
+                    dueDate,
+                    externalReference: params.saleId,
+                    description: this.buildPaymentDescription(sale.orderNumber, phase),
+                    remoteIp: params.remoteIp,
+                    creditCard: params.creditCard,
+                    creditCardHolderInfo: params.creditCardHolderInfo,
+                    ...(installmentCount && {
+                        installmentCount,
+                        installmentValue: parseFloat((amount / installmentCount).toFixed(2))
+                    })
+                });
+
+                const payment = await this.prisma.payment.update({
+                    where: { id: reserved.id },
+                    data: {
+                        asaas_customer_id: customerId,
+                        asaas_payment_id: asaasPayment.id,
+                        status: this.mapAsaasStatus(asaasPayment.status)
+                    }
+                });
+
+                await this.applyCompletionIfAlreadySettled(payment);
+
+                console.info(`[createCreditCardPayment] Pagamento em cartão criado - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}, Status: ${asaasPayment.status}`);
+
+                return {
+                    paymentId: payment.id,
+                    asaas_payment_id: asaasPayment.id,
+                    status: payment.status,
+                    phase,
+                    payment: {
+                        id: asaasPayment.id,
+                        status: asaasPayment.status,
+                        brand: asaasPayment.creditCard?.creditCardBrand,
+                        lastDigits: asaasPayment.creditCard?.creditCardNumber
+                    }
+                };
+            } catch (innerError) {
+                await this.releaseReservation(reserved.id);
+                throw innerError;
+            }
+        } catch (error: any) {
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            const message = extractAsaasErrorMessage(error, 'Erro ao processar pagamento com cartão de crédito');
+            console.error(`[createCreditCardPayment] Erro ao criar pagamento em cartão para venda ${params.saleId}:`, message);
+            throw new Error(message);
+        }
+    }
+
+    /**
+     * Valida a elegibilidade da parcela final (70%) — entrada já confirmada, pagamento final
+     * ainda não concluído, sem outra cobrança final pendente — e já retorna o valor restante a
+     * cobrar nessa mesma consulta. `errorPrefix` preserva o código de erro específico do
+     * endpoint chamador (ex.: FINAL_BOLETO_BLOCKED vs FINAL_PAYMENT_BLOCKED).
+     */
+    private async prepareFinalPayment(saleId: string, errorPrefix: string): Promise<number> {
+        const sale = await this.prisma.saleData.findUnique({
+            where: { id: saleId },
+            include: { boughtProducts: true, Payment: true },
+        });
+        if (!sale) throw new Error(`Venda (id=${saleId}) não encontrada`);
+        if (!sale.downPaymentCompleted) throw new Error(`${errorPrefix}:A entrada de 30% ainda não foi confirmada`);
+        if (sale.paymentCompleted) throw new Error(`${errorPrefix}:O pagamento final já foi concluído`);
+
+        const alreadyHasPendingFinal = sale.Payment.some(p => p.phase === 'final_payment' && p.status === 'pending');
+        if (alreadyHasPendingFinal) {
+            throw new Error(`${errorPrefix}:Já existe uma cobrança final pendente para esta venda`);
+        }
+
+        const originalTotal = sale.boughtProducts.reduce((sum, bp) => sum + bp.value, 0) + Number(sale.transportValue);
+        const adjustedContractTotal = sale.adjustedContractTotal !== null ? Number(sale.adjustedContractTotal) : null;
+        const contractTotal = adjustedContractTotal ?? originalTotal;
+        const totalDownPaid = sale.Payment
+            .filter(p => p.phase === 'down_payment' && p.status === 'completed')
+            .reduce((sum, p) => sum + p.amount, 0);
+
+        return Math.max(0, contractTotal - totalDownPaid);
     }
 
     /**
@@ -412,8 +845,12 @@ export class PaymentService {
     /**
      * Cria o boleto da segunda parcela (70%).
      * A segunda parcela é SEMPRE boleto por definição de negócio.
-     * Se amount for informado explicitamente (ajuste por peso real), esse valor é usado.
-     * Caso contrário, calcula automaticamente como contractTotal - downPaymentPaid.
+     * `amount` explícito (ajuste manual pelo peso real da carga) só deve ser aceito pelo
+     * controller quando o chamador for admin — aqui ele apenas substitui o valor calculado,
+     * mas a elegibilidade (entrada confirmada, sem pendência) é sempre verificada.
+     * Checa reaproveitamento ANTES da validação de elegibilidade — igual aos demais métodos
+     * de criação — para que um retry de uma resposta perdida reutilize o boleto já emitido em
+     * vez de ser bloqueado por "já existe cobrança final pendente".
      */
     async createFinalBoleto(params: {
         saleId: string;
@@ -421,39 +858,18 @@ export class PaymentService {
         amount?: number;
         expirationDays?: number;
     }) {
-        const sale = await this.prisma.saleData.findUnique({
-            where: { id: params.saleId },
-            include: { boughtProducts: true, Payment: true },
-        });
-
-        if (!sale) throw new Error(`Venda (id=${params.saleId}) não encontrada`);
-        if (!sale.downPaymentCompleted) throw new Error('FINAL_BOLETO_BLOCKED:A entrada de 30% ainda não foi confirmada');
-        if (sale.paymentCompleted) throw new Error('FINAL_BOLETO_BLOCKED:O pagamento final já foi concluído');
-
-        const alreadyHasPendingFinal = sale.Payment.some(
-            p => p.phase === 'final_payment' && p.status === 'pending'
-        );
-        if (alreadyHasPendingFinal) {
-            throw new Error('FINAL_BOLETO_BLOCKED:Já existe um boleto final pendente para esta venda');
+        const existing = await this.findExistingAttempt(params.saleId, 'final_payment');
+        if (existing) {
+            console.info(`[createFinalBoleto] Boleto final já existente para venda ${params.saleId} — reaproveitando em vez de criar outro.`);
+            return await this.reuseOrRetrySignal(existing, 'final_payment');
         }
 
-        let amount = params.amount;
-        if (amount === undefined) {
-            // Prefere o total ajustado pela pesagem; caso contrário usa o total original
-            const originalTotal = sale.boughtProducts.reduce((sum, bp) => sum + bp.value, 0) + Number(sale.transportValue);
-            const adjustedContractTotal = sale.adjustedContractTotal !== null
-                ? Number(sale.adjustedContractTotal)
-                : null;
-            const contractTotal = adjustedContractTotal ?? originalTotal;
-            const totalDownPaid = sale.Payment
-                .filter(p => p.phase === 'down_payment' && p.status === 'completed')
-                .reduce((sum, p) => sum + p.amount, 0);
-            amount = Math.max(0, contractTotal - totalDownPaid);
-        }
+        const computedAmount = await this.prepareFinalPayment(params.saleId, 'FINAL_BOLETO_BLOCKED');
+        const amount = params.amount ?? computedAmount;
 
         if (amount <= 0) throw new Error('FINAL_BOLETO_BLOCKED:Valor calculado para o boleto final é zero ou negativo');
 
-        return this.createBoletoPayment({
+        return this.createBoletoCharge({
             saleId: params.saleId,
             paymentMethodId: params.paymentMethodId,
             amount,
@@ -482,39 +898,22 @@ export class PaymentService {
         });
     }
 
-    private mapMercadoPagoStatus(mpStatus: string): string {
-        const statusMap: Record<string, string> = {
-            'approved': 'completed',
-            'pending': 'pending',
-            'in_process': 'pending',
-            'rejected': 'failed',
-            'cancelled': 'cancelled',
-            'refunded': 'refunded',
-            'charged_back': 'refunded',
-            'action_required': 'pending',
-            'processed': 'completed',
-            'expired': 'failed',
-            'cancelled_by_payer': 'cancelled',
-            'cancelled_by_seller': 'cancelled'
-        };
-        return statusMap[mpStatus] || 'pending';
-    }
-
     /**
      * Aplica as atualizações atomicamente no Payment e SaleData após confirmação.
      * Respeita a fase: down_payment → downPaymentCompleted; final_payment/full → paymentCompleted.
+     * Independente do gateway — recebe apenas o status já mapeado para o vocabulário interno.
      */
     private async applyPaymentCompletion(
         tx: Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>,
         paymentRecord: Payment,
         newStatus: string,
-        mpPaymentId?: string
+        asaasPaymentId?: string
     ) {
         await tx.payment.update({
             where: { id: paymentRecord.id },
             data: {
                 status: newStatus,
-                ...(mpPaymentId && { mp_payment_id: mpPaymentId }),
+                ...(asaasPaymentId && { asaas_payment_id: asaasPaymentId }),
                 updatedAt: new Date()
             }
         });
@@ -542,283 +941,168 @@ export class PaymentService {
                     data: { paymentCompleted: true, status: 'Concluído', statusChangedAt },
                 });
             }
+        } else if (REVERSAL_STATUSES.includes(newStatus) && paymentRecord.status === 'completed') {
+            // Reembolso/estorno de um pagamento que já estava confirmado: sem isso, a venda
+            // continuaria marcada como paga mesmo com o dinheiro devolvido, e verificações de
+            // negócio posteriores (liberação de colheita, conclusão de contrato) operariam
+            // sobre um pagamento que não existe mais.
+            console.info(`[applyPaymentCompletion] Pagamento ${paymentRecord.id} revertido (completed -> ${newStatus}) — recalculando status de pagamento da venda ${paymentRecord.saleId}`);
+            await this.reverseSalePaymentFlags(tx, paymentRecord.saleId, paymentRecord.phase);
         }
     }
 
-    async processWebhook(data: any) {
-        try {
-            const topic = data.topic || data.type;
-            const action = data.action;
-            const resourceId = data.data?.id || data.id;
-
-            console.info(`[Webhook] Recebido webhook - Topic: ${topic}, Action: ${action}, ResourceId: ${resourceId}`);
-
-            if (!resourceId) {
-                console.warn("[Webhook] ⚠️ Webhook sem resource ID válido");
-                return { error: "Webhook sem ID de recurso válido" };
+    /**
+     * Recalcula downPaymentCompleted/paymentCompleted a partir dos pagamentos 'completed'
+     * restantes da venda, após um reembolso/estorno desfazer um pagamento que estava
+     * confirmado. Não toca no campo `status` (texto livre) — a venda pode já ter avançado
+     * para outras etapas (envio, entrega) que um reembolso não deve reescrever automaticamente;
+     * só os sinalizadores booleanos que o restante do sistema usa para liberar/bloquear ações
+     * financeiras são corrigidos aqui.
+     */
+    private async reverseSalePaymentFlags(
+        tx: Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>,
+        saleId: string,
+        reversedPhase: string
+    ): Promise<void> {
+        if (reversedPhase === 'down_payment' || reversedPhase === 'full') {
+            const stillCompleted = await tx.payment.findFirst({
+                where: { saleId, status: 'completed', phase: { in: ['down_payment', 'full'] } },
+            });
+            if (!stillCompleted) {
+                await tx.saleData.update({ where: { id: saleId }, data: { downPaymentCompleted: false } });
             }
-
-            if (topic === 'order' || resourceId.startsWith('ORD')) {
-                return this.processOrderWebhook(resourceId, data);
+        }
+        if (reversedPhase === 'final_payment' || reversedPhase === 'full') {
+            const stillCompleted = await tx.payment.findFirst({
+                where: { saleId, status: 'completed', phase: { in: ['final_payment', 'full'] } },
+            });
+            if (!stillCompleted) {
+                await tx.saleData.update({ where: { id: saleId }, data: { paymentCompleted: false } });
             }
+        }
+    }
 
-            await new Promise(resolve => setTimeout(resolve, 1500));
+    /**
+     * Processa notificações de webhook do Asaas. O payload já vem com o objeto `payment`
+     * completo (id, status, externalReference), sem necessidade de consulta adicional.
+     * `receivedToken` é o header `asaas-access-token`, validado contra ASAAS_WEBHOOK_TOKEN.
+     */
+    async processWebhook(payload: any, receivedToken?: string) {
+        // Falha fechada: sem token configurado no ambiente, nenhuma requisição é aceita como
+        // autenticada (um deploy com segredo ausente não pode abrir a validação para todo mundo).
+        const expectedToken = process.env.ASAAS_WEBHOOK_TOKEN;
+        if (!expectedToken || receivedToken !== expectedToken) {
+            console.warn('[Webhook] Token de autenticação (asaas-access-token) inválido ou ausente');
+            throw new Error('WEBHOOK_UNAUTHORIZED:Token de webhook inválido');
+        }
 
-            let paymentRecord: Payment | null = null;
-            let mpPaymentData: any = null;
+        const event = payload?.event;
+        const paymentPayload = payload?.payment;
+        const asaasPaymentId = paymentPayload?.id;
+        const asaasStatus = paymentPayload?.status;
 
-            const isPreferenceId = /^\d+-/.test(resourceId);
+        console.info(`[Webhook] Recebido evento ${event} - Asaas PaymentId: ${asaasPaymentId}`);
 
-            if (isPreferenceId || topic === 'merchant_order') {
-                paymentRecord = await this.prisma.payment.findFirst({
-                    where: { mp_preference_id: resourceId },
-                    orderBy: { createdAt: 'desc' }
-                });
+        if (!event || !asaasPaymentId || !asaasStatus) {
+            console.warn('[Webhook] Payload sem event/payment.id/payment.status válido');
+            throw new Error('WEBHOOK_INVALID_PAYLOAD:Webhook sem dados de pagamento válidos');
+        }
 
-                if (!paymentRecord) {
-                    console.error("Payment não encontrado para preferência:", resourceId);
-                    return { error: "Payment não encontrado no banco" };
-                }
+        // Fora do try/catch que antes mascarava tudo: uma falha de banco/infra aqui precisa
+        // propagar como erro real (-> 5xx no controller) para que o Asaas tente novamente.
+        // Engolir isso como um retorno normal fazia o controller responder 200 mesmo quando a
+        // atualização local falhou, deixando o pagamento/venda com estado obsoleto para sempre.
 
-                try {
-                    const searchResponse = await mpPayment.search({
-                        options: {
-                            criteria: 'desc',
-                            external_reference: paymentRecord.saleId,
-                            sort: 'date_created',
-                            limit: 10
-                        }
-                    });
+        // Correlação SEMPRE pelo asaas_payment_id exato — nunca por saleId isolado: uma
+        // venda pode ter várias tentativas/fases, e um webhook atrasado de uma cobrança
+        // antiga poderia, por esse fallback, confirmar a tentativa mais recente errada.
+        const paymentRecord = await this.prisma.payment.findFirst({
+            where: { asaas_payment_id: asaasPaymentId },
+            orderBy: { createdAt: 'desc' },
+        });
 
-                    const results = searchResponse.results || [];
-                    if (results.length > 0) {
-                        mpPaymentData = results.find((p: any) => p.status === 'approved') ||
-                            results.find((p: any) => ['pending', 'in_process'].includes(p.status)) ||
-                            results[0];
-                    } else {
-                        return {
-                            success: true,
-                            message: "Webhook recebido mas pagamento ainda não processado pelo MP"
-                        };
-                    }
-                } catch (searchError: any) {
-                    console.error("Erro ao buscar pagamentos:", searchError.message);
-                    return { error: "Erro ao buscar pagamentos no Mercado Pago" };
-                }
-            } else {
-                try {
-                    mpPaymentData = await mpPayment.get({ id: resourceId });
-                    const saleId = mpPaymentData.external_reference;
+        if (!paymentRecord) {
+            // Pode ser uma corrida real: o Asaas notifica quase na hora em que cria a cobrança,
+            // antes da nossa linha local ganhar o asaas_payment_id (o POST /payments responde,
+            // mas o UPDATE local ainda não terminou — ou no caso do PIX, ainda falta buscar o
+            // QR Code antes). Devolver 200 aqui faria o Asaas desistir e nunca mais tentar, e a
+            // transição ficaria perdida até o poller alcançar (minutos depois, só se já tiver
+            // asaas_payment_id). Sinaliza como falha retentável em vez de sucesso.
+            console.warn(`[Webhook] Payment não encontrado para Asaas paymentId ${asaasPaymentId} (pode ser corrida com a criação local) — sinalizando para o Asaas tentar novamente`);
+            throw new Error('WEBHOOK_PAYMENT_NOT_FOUND:Pagamento não encontrado no banco de dados');
+        }
 
-                    paymentRecord = await this.prisma.payment.findFirst({
-                        where: { saleId: saleId },
-                        orderBy: { createdAt: 'desc' }
-                    });
+        const newStatus = this.mapAsaasStatus(asaasStatus);
 
-                    if (!paymentRecord) {
-                        paymentRecord = await this.prisma.payment.findFirst({
-                            where: { mp_payment_id: String(resourceId) }
-                        });
-                    }
-                } catch (mpError: any) {
-                    console.error("Erro ao buscar pagamento:", mpError.message);
-                    return { error: "Erro ao buscar pagamento no Mercado Pago" };
-                }
-            }
-
-            if (!paymentRecord) {
-                console.error("Payment não encontrado no banco");
-                return { error: "Pagamento não encontrado no banco de dados" };
-            }
-
-            if (!mpPaymentData) {
-                console.error("Dados do pagamento não encontrados no MP");
-                return { error: "Dados do pagamento não encontrados no Mercado Pago" };
-            }
-
-            const newStatus = this.mapMercadoPagoStatus(mpPaymentData.status);
-
-            if (paymentRecord.status !== newStatus) {
-                console.info(`[Webhook] Atualizando pagamento ${paymentRecord.id}: ${paymentRecord.status} -> ${newStatus}`);
-                await this.prisma.$transaction(async (tx) => {
-                    await this.applyPaymentCompletion(tx, paymentRecord!, newStatus, String(mpPaymentData.id));
-                });
-                console.info(`[Webhook] Pagamento ${paymentRecord.id} atualizado com sucesso`);
-            } else {
-                console.info(`[Webhook] Status do pagamento ${paymentRecord.id} não mudou (${paymentRecord.status}), nenhuma atualização necessária`);
-            }
-
+        // Um evento atrasado/fora de ordem (ex.: PAYMENT_CREATED chegando depois de
+        // PAYMENT_RECEIVED já ter sido processado) não pode regredir um status terminal de
+        // volta para 'pending' — isso deixaria o Payment e a SaleData inconsistentes e faria
+        // uma tentativa futura tratar a cobrança como se ainda estivesse ativa.
+        if (TERMINAL_STATUSES.includes(paymentRecord.status) && newStatus === 'pending') {
+            console.warn(`[Webhook] Ignorando transição regressiva ${paymentRecord.status} -> pending para o pagamento ${paymentRecord.id} (evento ${event} atrasado/fora de ordem)`);
             return {
                 success: true,
                 paymentId: paymentRecord.id,
                 saleId: paymentRecord.saleId,
                 phase: paymentRecord.phase,
-                status: newStatus,
-                mp_payment_id: mpPaymentData.id,
-                mp_status: mpPaymentData.status,
-                mp_status_detail: mpPaymentData.status_detail
+                status: paymentRecord.status,
+                ignored: true,
+                reason: 'STALE_EVENT',
+                asaas_payment_id: asaasPaymentId,
+                asaas_event: event,
+                asaas_status: asaasStatus,
             };
-        } catch (error: any) {
-            console.error("Erro crítico no webhook:", error.message);
-            console.error("Stack:", error.stack);
-            return { error: 'Erro ao processar webhook', message: error.message };
         }
-    }
 
-    private async processOrderWebhook(orderId: string, _webhookData: any) {
-        try {
-            console.info(`[processOrderWebhook] Processando webhook para Order ${orderId}`);
-
-            await new Promise(resolve => setTimeout(resolve, 1500));
-
-            let orderData: any;
+        if (paymentRecord.status !== newStatus) {
+            console.info(`[Webhook] Atualizando pagamento ${paymentRecord.id}: ${paymentRecord.status} -> ${newStatus}`);
             try {
-                orderData = await orderClient.get({ id: orderId });
-            } catch (error: any) {
-                console.error(`[processOrderWebhook] Erro ao buscar order ${orderId}:`, error.message);
-                return { error: 'Erro ao buscar order no Mercado Pago', message: error.message };
-            }
-
-            const externalReference = orderData.external_reference;
-            if (!externalReference) {
-                console.error('[processOrderWebhook] Order sem external_reference');
-                return { error: 'Order sem external_reference' };
-            }
-
-            let paymentRecord = await this.prisma.payment.findFirst({
-                where: {
-                    OR: [
-                        { saleId: externalReference },
-                        { mp_order_id: orderId },
-                        ...(!isNaN(Number(externalReference)) ? [{
-                            sale: { orderNumber: parseInt(externalReference) }
-                        }] : [])
-                    ]
-                },
-                orderBy: { createdAt: 'desc' }
-            });
-
-            if (!paymentRecord) {
-                console.error(`[processOrderWebhook] Payment não encontrado para order ${orderId}`);
-                return { error: 'Payment não encontrado no banco' };
-            }
-
-            const paymentData = orderData.transactions?.payments?.[0];
-            if (!paymentData) {
-                console.warn('[processOrderWebhook] Order sem dados de pagamento');
-                return {
-                    success: true,
-                    message: 'Order recebida mas sem dados de pagamento ainda'
-                };
-            }
-
-            const newStatus = this.mapMercadoPagoStatus(paymentData.status);
-
-            if (paymentRecord.status !== newStatus) {
-                console.info(`[processOrderWebhook] Atualizando pagamento ${paymentRecord.id}: ${paymentRecord.status} -> ${newStatus}`);
-
                 await this.prisma.$transaction(async (tx) => {
-                    await tx.payment.update({
-                        where: { id: paymentRecord!.id },
-                        data: { mp_order_id: orderId, mp_payment_id: paymentData.id }
-                    });
-                    await this.applyPaymentCompletion(tx, paymentRecord!, newStatus);
+                    await this.applyPaymentCompletion(tx, paymentRecord, newStatus, asaasPaymentId);
                 });
-
-                console.info(`[processOrderWebhook] Pagamento ${paymentRecord.id} atualizado com sucesso`);
-            } else {
-                console.info(`[processOrderWebhook] Status do pagamento ${paymentRecord.id} não mudou (${paymentRecord.status})`);
+            } catch (error: any) {
+                console.error(`[Webhook] Falha ao aplicar atualização do pagamento ${paymentRecord.id}:`, error.message);
+                throw new Error(`WEBHOOK_PROCESSING_FAILED:${error.message}`);
             }
-
-            return {
-                success: true,
-                paymentId: paymentRecord.id,
-                saleId: paymentRecord.saleId,
-                orderId: orderId,
-                phase: paymentRecord.phase,
-                status: newStatus,
-                mp_payment_id: paymentData.id,
-                mp_status: paymentData.status,
-                mp_status_detail: paymentData.status_detail
-            };
-        } catch (error: any) {
-            console.error('[processOrderWebhook] Erro crítico:', error.message);
-            console.error('Stack:', error.stack);
-            return { error: 'Erro ao processar webhook de order', message: error.message };
+            console.info(`[Webhook] Pagamento ${paymentRecord.id} atualizado com sucesso`);
+        } else {
+            console.info(`[Webhook] Status do pagamento ${paymentRecord.id} não mudou (${paymentRecord.status}), nenhuma atualização necessária`);
         }
+
+        return {
+            success: true,
+            paymentId: paymentRecord.id,
+            saleId: paymentRecord.saleId,
+            phase: paymentRecord.phase,
+            status: newStatus,
+            asaas_payment_id: asaasPaymentId,
+            asaas_event: event,
+            asaas_status: asaasStatus,
+        };
     }
 
-    async syncPaymentStatus(paymentId: string) {
+    async syncPaymentStatus(paymentId: string): Promise<{ success: boolean; error?: string; [key: string]: any }> {
         try {
-            const paymentRecord = await this.prisma.payment.findUnique({
-                where: { id: paymentId },
-                include: { sale: true }
-            });
+            const paymentRecord = await this.prisma.payment.findUnique({ where: { id: paymentId } });
 
             if (!paymentRecord) {
-                return { error: "Payment não encontrado no banco", success: false };
+                return { error: 'Payment não encontrado no banco', success: false };
             }
 
-            let mpPaymentData: any = null;
-
-            if (!mpPaymentData && paymentRecord.mp_payment_id) {
-                try {
-                    mpPaymentData = await mpPayment.get({ id: paymentRecord.mp_payment_id });
-                } catch (err) {
-                    console.warn(`[syncPaymentStatus] Pagamento não encontrado no MP pelo mp_payment_id: ${paymentRecord.mp_payment_id}`);
-                }
-            }
-
-            if (!mpPaymentData && paymentRecord.mp_preference_id) {
-                try {
-                    const searchResponse = await mpPayment.search({
-                        options: { criteria: 'desc', limit: 50 }
-                    });
-
-                    const results = searchResponse.results?.filter((p: any) =>
-                        p.metadata?.preference_id === paymentRecord.mp_preference_id ||
-                        p.external_reference === paymentRecord.saleId
-                    ) || [];
-
-                    if (results.length > 0) {
-                        mpPaymentData = results.find((p: any) => p.status === 'approved') ||
-                            results.find((p: any) => p.status === 'pending') ||
-                            results[0];
-                    }
-                } catch (err: any) {
-                    console.warn(`[syncPaymentStatus] Erro ao buscar pagamento pela preference ${paymentRecord.mp_preference_id}: ${err.message || err}`);
-                }
-            }
-
-            if (!mpPaymentData) {
-                try {
-                    const searchResponse = await mpPayment.search({
-                        options: { criteria: 'desc', external_reference: paymentRecord.saleId }
-                    });
-
-                    const results = searchResponse.results || [];
-                    if (results.length > 0) {
-                        mpPaymentData = results.find((p: any) => p.status === 'approved') || results[0];
-                    }
-                } catch (err: any) {
-                    console.warn(`[syncPaymentStatus] Erro ao buscar pagamento por external_reference ${paymentRecord.saleId}: ${err.message || err}`);
-                }
-            }
-
-            if (!mpPaymentData) {
+            if (!paymentRecord.asaas_payment_id) {
                 return {
                     success: false,
-                    message: "Pagamento ainda não foi realizado ou processado pelo Mercado Pago",
+                    message: 'Pagamento ainda não possui referência no Asaas',
                     current_status: paymentRecord.status,
-                    mp_preference_id: paymentRecord.mp_preference_id
                 };
             }
 
-            const newStatus = this.mapMercadoPagoStatus(mpPaymentData.status);
+            const { data: asaasPayment } = await asaasClient.get(`/payments/${paymentRecord.asaas_payment_id}`);
+            const newStatus = this.mapAsaasStatus(asaasPayment.status);
             console.info(`[syncPaymentStatus] Sincronizando pagamento ${paymentRecord.id}: ${paymentRecord.status} -> ${newStatus}`);
 
             const updatedPayment = await this.prisma.$transaction(async (tx) => {
-                await this.applyPaymentCompletion(tx, paymentRecord, newStatus, String(mpPaymentData.id));
+                await this.applyPaymentCompletion(tx, paymentRecord, newStatus, asaasPayment.id);
                 return tx.payment.findUnique({ where: { id: paymentRecord.id } });
             });
 
@@ -831,35 +1115,32 @@ export class PaymentService {
                     id: updatedPayment?.id,
                     status: updatedPayment?.status,
                     phase: updatedPayment?.phase,
-                    mp_payment_id: updatedPayment?.mp_payment_id,
-                    mp_status: mpPaymentData.status,
-                    mp_status_detail: mpPaymentData.status_detail
+                    asaas_payment_id: updatedPayment?.asaas_payment_id,
                 },
-                mercadopago: {
-                    id: mpPaymentData.id,
-                    status: mpPaymentData.status,
-                    status_detail: mpPaymentData.status_detail,
-                    transaction_amount: mpPaymentData.transaction_amount,
-                    date_approved: mpPaymentData.date_approved,
-                    date_created: mpPaymentData.date_created
+                asaas: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    value: asaasPayment.value,
+                    paymentDate: asaasPayment.paymentDate,
+                    dueDate: asaasPayment.dueDate,
                 }
             };
         } catch (error: any) {
-            const message = error instanceof Error ? error.message : String(error);
-            console.error("Erro ao sincronizar status:", message);
+            const message = extractAsaasErrorMessage(error, String(error));
+            console.error('Erro ao sincronizar status:', message);
             return { success: false, error: message };
         }
     }
 
     /**
-     * Verifica todos os pagamentos pendentes via Orders API e confirma os que foram pagos.
+     * Verifica todos os pagamentos pendentes com referência no Asaas e confirma os que foram pagos.
      * Chamado periodicamente pelo scheduler para tratar boletos (compensação não imediata).
      */
     async syncPendingOrderPayments(): Promise<{ checked: number; confirmed: number; errors: number }> {
         const pending = await this.prisma.payment.findMany({
             where: {
                 status: 'pending',
-                mp_order_id: { not: null },
+                asaas_payment_id: { not: null },
             },
         });
 
@@ -868,22 +1149,15 @@ export class PaymentService {
 
         for (const paymentRecord of pending) {
             try {
-                const orderData = await orderClient.get({ id: paymentRecord.mp_order_id! });
-                const paymentData = orderData.transactions?.payments?.[0];
-                if (!paymentData?.status) continue;
-
-                const newStatus = this.mapMercadoPagoStatus(paymentData.status as string);
+                const { data: asaasPayment } = await asaasClient.get(`/payments/${paymentRecord.asaas_payment_id}`);
+                const newStatus = this.mapAsaasStatus(asaasPayment.status);
                 if (newStatus !== 'completed') continue;
 
                 await this.prisma.$transaction(async (tx) => {
-                    await tx.payment.update({
-                        where: { id: paymentRecord.id },
-                        data: { mp_payment_id: paymentData.id },
-                    });
-                    await this.applyPaymentCompletion(tx, paymentRecord, newStatus, String(paymentData.id));
+                    await this.applyPaymentCompletion(tx, paymentRecord, newStatus, asaasPayment.id);
                 });
 
-                console.info(`[syncPendingOrderPayments] Pagamento ${paymentRecord.id} confirmado (order: ${paymentRecord.mp_order_id})`);
+                console.info(`[syncPendingOrderPayments] Pagamento ${paymentRecord.id} confirmado (Asaas: ${paymentRecord.asaas_payment_id})`);
                 confirmed++;
             } catch (err: any) {
                 console.warn(`[syncPendingOrderPayments] Erro ao verificar pagamento ${paymentRecord.id}: ${err.message}`);
@@ -903,32 +1177,22 @@ export class PaymentService {
             });
 
             if (!paymentRecord) {
-                return { error: "Payment não encontrado no banco" };
+                return { error: 'Payment não encontrado no banco' };
             }
 
-            let mpData: any = null;
-            if (paymentRecord.mp_payment_id) {
+            let asaasData: any = null;
+            if (paymentRecord.asaas_payment_id) {
                 try {
-                    mpData = await mpPayment.get({ id: paymentRecord.mp_payment_id });
+                    const { data } = await asaasClient.get(`/payments/${paymentRecord.asaas_payment_id}`);
+                    asaasData = data;
                 } catch (err: any) {
-                    console.warn(`[debugPayment] Pagamento não encontrado no MP pelo mp_payment_id: ${paymentRecord.mp_payment_id}`);
+                    console.warn(`[debugPayment] Pagamento não encontrado no Asaas pelo asaas_payment_id: ${paymentRecord.asaas_payment_id}`);
                 }
             }
 
-            if (!mpData) {
-                try {
-                    const searchResponse = await mpPayment.search({
-                        options: { criteria: 'desc', external_reference: paymentRecord.saleId }
-                    });
-                    mpData = searchResponse.results?.[0] || null;
-                } catch (err: any) {
-                    console.warn(`[debugPayment] Pagamento não encontrado no MP por external_reference: ${paymentRecord.saleId}`);
-                }
-            }
-
-            return { paymentRecord, mpData, canSync: !!mpData };
+            return { paymentRecord, asaasData, canSync: !!asaasData };
         } catch (error: any) {
-            console.error("Erro no debug:", error);
+            console.error('Erro no debug:', error);
             return { error: error.message };
         }
     }
@@ -968,29 +1232,34 @@ export class PaymentService {
 
     async configureWebhook() {
         try {
-            const webhookUrl = `${process.env.URL_BACKEND}/payment-methods/webhook`;
+            const webhookUrl = `${process.env.URL_BACKEND}/payment/webhook`;
 
-            const response = await fetch('https://api.mercadopago.com/v1/webhooks', {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${process.env.ACCESS_TOKEN}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    url: webhookUrl,
-                    events: [
-                        { topic: 'payment' },
-                        { topic: 'merchant_order' },
-                        { topic: 'order' }
-                    ]
-                })
+            const { data } = await asaasClient.post('/webhooks', {
+                name: 'Venda+ Agromarket',
+                url: webhookUrl,
+                email: process.env.ASAAS_WEBHOOK_EMAIL,
+                enabled: true,
+                interrupted: false,
+                apiVersion: 3,
+                authToken: process.env.ASAAS_WEBHOOK_TOKEN,
+                sendType: 'SEQUENTIALLY',
+                events: [
+                    'PAYMENT_CREATED',
+                    'PAYMENT_CONFIRMED',
+                    'PAYMENT_RECEIVED',
+                    'PAYMENT_OVERDUE',
+                    'PAYMENT_DELETED',
+                    'PAYMENT_REFUNDED',
+                    'PAYMENT_REFUND_IN_PROGRESS',
+                    'PAYMENT_CHARGEBACK_REQUESTED',
+                ]
             });
 
-            const data = await response.json();
             return data;
         } catch (error: any) {
-            console.error('Erro ao configurar webhook:', error);
-            throw error;
+            const message = extractAsaasErrorMessage(error, 'Erro ao configurar webhook');
+            console.error('Erro ao configurar webhook:', message);
+            throw new Error(message);
         }
     }
 }
