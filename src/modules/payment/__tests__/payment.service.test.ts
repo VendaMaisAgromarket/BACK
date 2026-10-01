@@ -79,8 +79,12 @@ function buildSale(overrides: Partial<SaleData> = {}): SaleData {
     penaltyApplied: false,
     penaltyAmount: null,
     penaltyReason: null,
+    // Não é um campo real de SaleData (é uma relation, só populada via `include`), mas desde
+    // que phase 'full' recalcula o valor no servidor (calculateFullPaymentAmount), a maioria
+    // dos testes passa a precisar disso — default aqui evita repetir em cada teste.
+    boughtProducts: [{ value: 1000 }],
     ...overrides,
-  } as SaleData;
+  } as unknown as SaleData;
 }
 
 function buildUser(overrides: Partial<User> = {}): User {
@@ -209,6 +213,26 @@ describe('PaymentService', () => {
   });
 
   describe('createPixPayment — regra de negócio da entrada (30%)', () => {
+    it('phase=full (padrão) IGNORA o amount do cliente e cobra o total do contrato calculado no servidor', async () => {
+      prisma.saleData.findUnique.mockResolvedValue(buildSale({ transportValue: 0 })); // boughtProducts padrão: [{value:1000}]
+      prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
+      mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_full', status: 'PENDING' } });
+      mockAsaasGet.mockResolvedValueOnce({ data: { payload: 'x', encodedImage: 'y', expirationDate: '2026-01-02' } });
+      prisma.payment.create.mockResolvedValue(buildPayment({ status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ amount: 1000, phase: 'full' }));
+
+      await service.createPixPayment({
+        saleId: 'sale-1',
+        paymentMethodId: 'pm-1',
+        amount: 0.01, // valor simbólico enviado pelo cliente — deve ser ignorado
+        email: 'comprador@teste.com',
+        // phase omitido -> default 'full'
+      });
+
+      const paymentsCall = mockAsaasPost.mock.calls.find(([url]) => url === '/payments');
+      expect(paymentsCall?.[1]).toMatchObject({ value: 1000 });
+    });
+
     it('recalcula o valor server-side quando phase = down_payment, ignorando o amount enviado pelo cliente', async () => {
       const sale = buildSale({
         downPaymentPercent: null, // usa o default de 30%
@@ -368,7 +392,9 @@ describe('PaymentService', () => {
         expirationDays: 5,
       });
 
-      expect(mockAsaasPost).toHaveBeenCalledWith('/payments', expect.objectContaining({ billingType: 'BOLETO', value: 500 }));
+      // amount: 500 enviado pelo cliente é ignorado — phase 'full' sempre usa o total do
+      // contrato calculado no servidor (1000 + 10 de transporte, do buildSale/boughtProducts padrão).
+      expect(mockAsaasPost).toHaveBeenCalledWith('/payments', expect.objectContaining({ billingType: 'BOLETO', value: 1010 }));
       expect(result.payment.ticket_url).toBe('https://asaas.com/boleto/1');
       expect(result.payment.invoice_url).toBe('https://asaas.com/i/1');
     });
@@ -423,6 +449,30 @@ describe('PaymentService', () => {
       expect(mockAsaasPost).not.toHaveBeenCalled();
       expect(result.paymentId).toBe('existing-boleto');
     });
+
+    it('reaproveita uma cobrança PIX pendente da mesma venda/fase ao chamar /boleto — invariante é por venda+fase, não por meio de pagamento (bug corrigido)', async () => {
+      // Antes, o índice único incluía billingType na chave, permitindo que /pix e /boleto
+      // para a mesma venda/fase reservassem simultaneamente, gerando duas cobranças a pagar
+      // para a mesma parcela. Agora a busca de tentativa existente não filtra por billingType.
+      prisma.payment.findFirst.mockResolvedValue(
+        buildPayment({ id: 'existing-pix-for-boleto', asaas_payment_id: 'pay_existing_pix', status: 'pending', billingType: 'PIX' })
+      );
+      mockAsaasGet
+        .mockResolvedValueOnce({ data: { id: 'pay_existing_pix', status: 'PENDING' } })
+        .mockResolvedValueOnce({ data: { payload: 'x', encodedImage: 'y', expirationDate: '2026-01-02' } });
+
+      const result = await service.createBoletoPayment({
+        saleId: 'sale-1',
+        paymentMethodId: 'pm-1',
+        amount: 500,
+      });
+
+      expect(mockAsaasPost).not.toHaveBeenCalled();
+      expect(result.paymentId).toBe('existing-pix-for-boleto');
+      expect(prisma.payment.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { saleId: 'sale-1', phase: 'full', status: { in: ['pending', 'completed'] } } })
+      );
+    });
   });
 
   describe('createCreditCardPayment', () => {
@@ -443,9 +493,11 @@ describe('PaymentService', () => {
         creditCardHolderInfo: { name: 'Fulano', email: 'f@f.com', cpfCnpj: '12345678900', postalCode: '00000000', addressNumber: '10', phone: '11999999999' },
       });
 
+      // amount: 300 enviado pelo cliente é ignorado — phase 'full' usa o total do contrato
+      // (1000 + 10 de transporte, do buildSale/boughtProducts padrão) / 3 parcelas.
       expect(mockAsaasPost).toHaveBeenCalledWith('/payments', expect.objectContaining({
         installmentCount: 3,
-        installmentValue: 100,
+        installmentValue: 336.67,
       }));
     });
 
@@ -611,13 +663,15 @@ describe('PaymentService', () => {
       expect(prisma.payment.findFirst).not.toHaveBeenCalled();
     });
 
-    it('NÃO cai de volta para busca por saleId quando o asaas_payment_id exato não é encontrado — apenas reporta não encontrado', async () => {
+    it('NÃO cai de volta para busca por saleId quando o asaas_payment_id exato não é encontrado — rejeita como falha retentável', async () => {
       prisma.payment.findFirst.mockResolvedValue(null);
 
-      await service.processWebhook(
-        { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_desconhecido', status: 'RECEIVED', externalReference: 'sale-1' } },
-        'webhook-secret-token'
-      );
+      await expect(
+        service.processWebhook(
+          { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_desconhecido', status: 'RECEIVED', externalReference: 'sale-1' } },
+          'webhook-secret-token'
+        )
+      ).rejects.toThrow('WEBHOOK_PAYMENT_NOT_FOUND:');
 
       // Uma única consulta, só pelo asaas_payment_id — sem fallback por saleId que poderia
       // confirmar a tentativa de pagamento errada de uma venda com múltiplas fases/tentativas.
@@ -719,6 +773,37 @@ describe('PaymentService', () => {
       }));
     });
 
+    it('reembolso de um pagamento full já completed desfaz downPaymentCompleted e paymentCompleted na venda (bug corrigido)', async () => {
+      const payment = buildPayment({ phase: 'full', status: 'completed' });
+      // 1ª chamada: correlação pelo asaas_payment_id do webhook. Chamadas seguintes (dentro de
+      // reverseSalePaymentFlags): nenhum outro pagamento 'completed' restante -> flags voltam a false.
+      prisma.payment.findFirst.mockResolvedValueOnce(payment).mockResolvedValue(null);
+
+      await service.processWebhook(
+        { event: 'PAYMENT_REFUNDED', payment: { id: 'pay_1', status: 'REFUNDED', externalReference: 'sale-1' } },
+        'webhook-secret-token'
+      );
+
+      expect(prisma.saleData.update).toHaveBeenCalledWith({ where: { id: 'sale-1' }, data: { downPaymentCompleted: false } });
+      expect(prisma.saleData.update).toHaveBeenCalledWith({ where: { id: 'sale-1' }, data: { paymentCompleted: false } });
+    });
+
+    it('reembolso NÃO desfaz downPaymentCompleted se ainda existe outro pagamento completed cobrindo a entrada', async () => {
+      const payment = buildPayment({ phase: 'down_payment', status: 'completed' });
+      // 1ª chamada: correlação pelo asaas_payment_id do webhook. 2ª chamada (dentro de
+      // reverseSalePaymentFlags): existe outro pagamento completed cobrindo a entrada.
+      prisma.payment.findFirst
+        .mockResolvedValueOnce(payment)
+        .mockResolvedValueOnce(buildPayment({ id: 'outro-pagamento', phase: 'down_payment', status: 'completed' }));
+
+      await service.processWebhook(
+        { event: 'PAYMENT_REFUNDED', payment: { id: 'pay_1', status: 'REFUNDED', externalReference: 'sale-1' } },
+        'webhook-secret-token'
+      );
+
+      expect(prisma.saleData.update).not.toHaveBeenCalled();
+    });
+
     it('não toca no banco quando o status do Asaas não muda o status interno já armazenado', async () => {
       const payment = buildPayment({ phase: 'full', status: 'pending' });
       prisma.payment.findFirst.mockResolvedValue(payment);
@@ -732,16 +817,6 @@ describe('PaymentService', () => {
       expect(prisma.saleData.update).not.toHaveBeenCalled();
     });
 
-    it('retorna erro (200, sem lançar) quando o pagamento não é encontrado no banco local', async () => {
-      prisma.payment.findFirst.mockResolvedValue(null);
-
-      const result = await service.processWebhook(
-        { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_desconhecido', status: 'RECEIVED', externalReference: 'sale-x' } },
-        'webhook-secret-token'
-      );
-
-      expect(result).toEqual({ error: 'Pagamento não encontrado no banco de dados' });
-    });
   });
 
   describe('getFinalInstallmentAmount — regra 30/70', () => {

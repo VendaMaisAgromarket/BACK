@@ -15,6 +15,37 @@ function isValidPhase(phase: unknown): boolean {
     return phase === undefined || phase === null || (typeof phase === 'string' && (VALID_PAYMENT_PHASES as readonly string[]).includes(phase));
 }
 
+function isNonEmptyString(value: unknown): boolean {
+    return typeof value === 'string' && value.trim().length > 0;
+}
+
+const REQUIRED_CREDIT_CARD_FIELDS = ['holderName', 'number', 'expiryMonth', 'expiryYear', 'ccv'] as const;
+const REQUIRED_CARD_HOLDER_FIELDS = ['name', 'email', 'cpfCnpj', 'postalCode', 'addressNumber', 'phone'] as const;
+
+/**
+ * Antes só checava se `creditCard`/`creditCardHolderInfo` existiam como objetos — um objeto
+ * vazio ou parcial passava e era enviado direto para a Asaas, que rejeitava com um erro de
+ * provedor exibido como 500 genérico, mesmo o endpoint documentando 400 para dados malformados.
+ */
+function validateCreditCardPayload(creditCard: any, creditCardHolderInfo: any, installmentCount: unknown): string | null {
+    for (const field of REQUIRED_CREDIT_CARD_FIELDS) {
+        if (!isNonEmptyString(creditCard?.[field])) {
+            return `Campo obrigatório do cartão ausente ou inválido: creditCard.${field}`;
+        }
+    }
+    for (const field of REQUIRED_CARD_HOLDER_FIELDS) {
+        if (!isNonEmptyString(creditCardHolderInfo?.[field])) {
+            return `Campo obrigatório do titular ausente ou inválido: creditCardHolderInfo.${field}`;
+        }
+    }
+    if (installmentCount !== undefined) {
+        if (typeof installmentCount !== 'number' || !Number.isInteger(installmentCount) || installmentCount < 1 || installmentCount > 21) {
+            return 'installmentCount deve ser um número inteiro entre 1 e 21.';
+        }
+    }
+    return null;
+}
+
 /** Mapeia os erros de bloqueio/conflito lançados pelo service para a resposta HTTP 409 correta. */
 function handleKnownPaymentErrors(error: any, res: Response): boolean {
     const prefixes = ['FINAL_PAYMENT_BLOCKED:', 'FINAL_BOLETO_BLOCKED:', 'DUPLICATE_PAYMENT_ATTEMPT:'];
@@ -165,6 +196,12 @@ export class PaymentController {
             }
             if (error.message?.startsWith('WEBHOOK_INVALID_PAYLOAD:')) {
                 res.status(400).json({ error: error.message.split(':').slice(1).join(':') });
+                return;
+            }
+            if (error.message?.startsWith('WEBHOOK_PAYMENT_NOT_FOUND:')) {
+                // Pode ser uma corrida com a criação local (ver comentário no service) — 404
+                // sinaliza "tente novamente", nunca 200 (que faria o Asaas desistir de vez).
+                res.status(404).json({ error: error.message.split(':').slice(1).join(':') });
                 return;
             }
             // Falha ao persistir a atualização (banco/infra) é transiente — responde 5xx para
@@ -430,6 +467,12 @@ export class PaymentController {
 
             if (!isValidPhase(phase)) {
                 res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
+            const cardValidationError = validateCreditCardPayload(creditCard, creditCardHolderInfo, installmentCount);
+            if (cardValidationError) {
+                res.status(400).json({ error: cardValidationError });
                 return;
             }
 

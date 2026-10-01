@@ -23,6 +23,9 @@ const PRISMA_UNIQUE_VIOLATION = 'P2002';
 /** Status que, uma vez alcançados, nunca devem regredir para 'pending' por um evento atrasado/fora de ordem. */
 const TERMINAL_STATUSES = ['completed', 'refunded', 'cancelled'];
 
+/** Status que, ao sair de 'completed', exigem recalcular os sinalizadores de pagamento da venda. */
+const REVERSAL_STATUSES = ['refunded', 'cancelled'];
+
 export class PaymentService {
     private readonly prisma: PrismaClient;
     constructor(prisma?: PrismaClient) {
@@ -112,8 +115,12 @@ export class PaymentService {
 
     /**
      * Idempotência por tentativa: reaproveita uma cobrança pendente/concluída já existente
-     * para a mesma venda/fase/meio de pagamento, em vez de criar uma nova no Asaas a cada
-     * reenvio (ex.: timeout no cliente após o Asaas já ter aceitado a cobrança anterior).
+     * para a mesma venda+fase, em vez de criar uma nova no Asaas a cada reenvio (ex.: timeout
+     * no cliente após o Asaas já ter aceitado a cobrança anterior). A invariante é "uma
+     * tentativa ativa por venda+fase" — INDEPENDENTE do meio de pagamento: se já existe uma
+     * cobrança pendente via PIX e o cliente chama o endpoint de boleto para a mesma fase, a
+     * cobrança PIX existente é reaproveitada — não criamos uma segunda cobrança ativa
+     * concorrente para a mesma parcela só porque o endpoint/meio de pagamento mudou.
      * Chamada SEMPRE antes de qualquer validação de fase, para que um retry de final_payment
      * reaproveite a cobrança pendente em vez de ser bloqueado por "já existe cobrança final".
      *
@@ -121,9 +128,9 @@ export class PaymentService {
      * concorrente que ainda não terminou de falar com o Asaas), não há nada para reaproveitar
      * ainda — quem chamar deve tratar isso como "tente novamente", nunca tentar reusar.
      */
-    private async findExistingAttempt(saleId: string, phase: PaymentPhase, billingType: string) {
+    private async findExistingAttempt(saleId: string, phase: PaymentPhase) {
         return this.prisma.payment.findFirst({
-            where: { saleId, phase, billingType, status: { in: ['pending', 'completed'] } },
+            where: { saleId, phase, status: { in: ['pending', 'completed'] } },
             orderBy: { createdAt: 'desc' },
         });
     }
@@ -284,7 +291,7 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createPreference] Criando fatura Asaas para venda ${params.saleId} (fase: ${phase})`);
 
-            const existing = await this.findExistingAttempt(params.saleId, phase, 'UNDEFINED');
+            const existing = await this.findExistingAttempt(params.saleId, phase);
             if (existing) {
                 console.info(`[createPreference] Fatura já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outra.`);
                 return await this.reuseOrRetrySignal(existing, phase);
@@ -297,6 +304,9 @@ export class PaymentService {
                 console.info(`[createPreference] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
             } else if (phase === 'final_payment') {
                 amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            } else {
+                // full — nunca confia no amount do cliente; usa o total do contrato
+                amount = await this.calculateFullPaymentAmount(params.saleId);
             }
 
             const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
@@ -371,6 +381,25 @@ export class PaymentService {
         return { amount, contractTotal, percent };
     }
 
+    /**
+     * Calcula o valor do pagamento integral (phase 'full'): o total do contrato, ajustado pelo
+     * peso real quando disponível. Nunca confia no `amount` enviado pelo cliente — mesma
+     * proteção já aplicada a down_payment e final_payment, para que um comprador não possa
+     * liquidar a venda inteira com um valor simbólico.
+     */
+    private async calculateFullPaymentAmount(saleId: string): Promise<number> {
+        const sale = await this.prisma.saleData.findUnique({
+            where: { id: saleId },
+            include: { boughtProducts: true },
+        });
+        if (!sale) throw new Error(`Venda (id=${saleId}) não encontrada`);
+
+        const originalTotal = sale.boughtProducts.reduce((sum, bp) => sum + bp.value, 0) + Number(sale.transportValue);
+        const adjustedContractTotal = sale.adjustedContractTotal !== null ? Number(sale.adjustedContractTotal) : null;
+
+        return adjustedContractTotal ?? originalTotal;
+    }
+
     async getById(paymentId: string): Promise<Payment | null> {
         return this.prisma.payment.findUnique({
             where: { id: paymentId }
@@ -419,7 +448,7 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createPixPayment] Criando pagamento PIX para venda ${params.saleId} (fase: ${phase})`);
 
-            const existing = await this.findExistingAttempt(params.saleId, phase, 'PIX');
+            const existing = await this.findExistingAttempt(params.saleId, phase);
             if (existing) {
                 console.info(`[createPixPayment] PIX já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outro.`);
                 return await this.reuseOrRetrySignal(existing, phase);
@@ -432,6 +461,9 @@ export class PaymentService {
                 console.info(`[createPixPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
             } else if (phase === 'final_payment') {
                 amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            } else {
+                // full — nunca confia no amount do cliente; usa o total do contrato
+                amount = await this.calculateFullPaymentAmount(params.saleId);
             }
 
             const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
@@ -589,7 +621,7 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createBoletoPayment] Criando pagamento com boleto para venda ${params.saleId} (fase: ${phase})`);
 
-            const existing = await this.findExistingAttempt(params.saleId, phase, 'BOLETO');
+            const existing = await this.findExistingAttempt(params.saleId, phase);
             if (existing) {
                 console.info(`[createBoletoPayment] Boleto já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outro.`);
                 return await this.reuseOrRetrySignal(existing, phase);
@@ -602,6 +634,9 @@ export class PaymentService {
                 console.info(`[createBoletoPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
             } else if (phase === 'final_payment') {
                 amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            } else {
+                // full — nunca confia no amount do cliente; usa o total do contrato
+                amount = await this.calculateFullPaymentAmount(params.saleId);
             }
 
             return await this.createBoletoCharge({ ...params, amount, phase });
@@ -645,7 +680,7 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createCreditCardPayment] Criando pagamento em cartão de crédito para venda ${params.saleId} (fase: ${phase})`);
 
-            const existing = await this.findExistingAttempt(params.saleId, phase, 'CREDIT_CARD');
+            const existing = await this.findExistingAttempt(params.saleId, phase);
             if (existing) {
                 console.info(`[createCreditCardPayment] Cobrança em cartão já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outra.`);
                 return await this.reuseOrRetrySignal(existing, phase);
@@ -658,6 +693,9 @@ export class PaymentService {
                 console.info(`[createCreditCardPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
             } else if (phase === 'final_payment') {
                 amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            } else {
+                // full — nunca confia no amount do cliente; usa o total do contrato
+                amount = await this.calculateFullPaymentAmount(params.saleId);
             }
 
             const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
@@ -820,7 +858,7 @@ export class PaymentService {
         amount?: number;
         expirationDays?: number;
     }) {
-        const existing = await this.findExistingAttempt(params.saleId, 'final_payment', 'BOLETO');
+        const existing = await this.findExistingAttempt(params.saleId, 'final_payment');
         if (existing) {
             console.info(`[createFinalBoleto] Boleto final já existente para venda ${params.saleId} — reaproveitando em vez de criar outro.`);
             return await this.reuseOrRetrySignal(existing, 'final_payment');
@@ -903,6 +941,44 @@ export class PaymentService {
                     data: { paymentCompleted: true, status: 'Concluído', statusChangedAt },
                 });
             }
+        } else if (REVERSAL_STATUSES.includes(newStatus) && paymentRecord.status === 'completed') {
+            // Reembolso/estorno de um pagamento que já estava confirmado: sem isso, a venda
+            // continuaria marcada como paga mesmo com o dinheiro devolvido, e verificações de
+            // negócio posteriores (liberação de colheita, conclusão de contrato) operariam
+            // sobre um pagamento que não existe mais.
+            console.info(`[applyPaymentCompletion] Pagamento ${paymentRecord.id} revertido (completed -> ${newStatus}) — recalculando status de pagamento da venda ${paymentRecord.saleId}`);
+            await this.reverseSalePaymentFlags(tx, paymentRecord.saleId, paymentRecord.phase);
+        }
+    }
+
+    /**
+     * Recalcula downPaymentCompleted/paymentCompleted a partir dos pagamentos 'completed'
+     * restantes da venda, após um reembolso/estorno desfazer um pagamento que estava
+     * confirmado. Não toca no campo `status` (texto livre) — a venda pode já ter avançado
+     * para outras etapas (envio, entrega) que um reembolso não deve reescrever automaticamente;
+     * só os sinalizadores booleanos que o restante do sistema usa para liberar/bloquear ações
+     * financeiras são corrigidos aqui.
+     */
+    private async reverseSalePaymentFlags(
+        tx: Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>,
+        saleId: string,
+        reversedPhase: string
+    ): Promise<void> {
+        if (reversedPhase === 'down_payment' || reversedPhase === 'full') {
+            const stillCompleted = await tx.payment.findFirst({
+                where: { saleId, status: 'completed', phase: { in: ['down_payment', 'full'] } },
+            });
+            if (!stillCompleted) {
+                await tx.saleData.update({ where: { id: saleId }, data: { downPaymentCompleted: false } });
+            }
+        }
+        if (reversedPhase === 'final_payment' || reversedPhase === 'full') {
+            const stillCompleted = await tx.payment.findFirst({
+                where: { saleId, status: 'completed', phase: { in: ['final_payment', 'full'] } },
+            });
+            if (!stillCompleted) {
+                await tx.saleData.update({ where: { id: saleId }, data: { paymentCompleted: false } });
+            }
         }
     }
 
@@ -946,8 +1022,14 @@ export class PaymentService {
         });
 
         if (!paymentRecord) {
-            console.error(`[Webhook] Payment não encontrado para Asaas paymentId ${asaasPaymentId}`);
-            return { error: 'Pagamento não encontrado no banco de dados' };
+            // Pode ser uma corrida real: o Asaas notifica quase na hora em que cria a cobrança,
+            // antes da nossa linha local ganhar o asaas_payment_id (o POST /payments responde,
+            // mas o UPDATE local ainda não terminou — ou no caso do PIX, ainda falta buscar o
+            // QR Code antes). Devolver 200 aqui faria o Asaas desistir e nunca mais tentar, e a
+            // transição ficaria perdida até o poller alcançar (minutos depois, só se já tiver
+            // asaas_payment_id). Sinaliza como falha retentável em vez de sucesso.
+            console.warn(`[Webhook] Payment não encontrado para Asaas paymentId ${asaasPaymentId} (pode ser corrida com a criação local) — sinalizando para o Asaas tentar novamente`);
+            throw new Error('WEBHOOK_PAYMENT_NOT_FOUND:Pagamento não encontrado no banco de dados');
         }
 
         const newStatus = this.mapAsaasStatus(asaasStatus);
