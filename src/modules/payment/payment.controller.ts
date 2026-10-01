@@ -137,6 +137,14 @@ export class PaymentController {
             const result = await service.processWebhook(req.body, receivedToken);
             res.status(200).send(result);
         } catch (error: any) {
+            if (error.message?.startsWith('WEBHOOK_UNAUTHORIZED:')) {
+                res.status(401).json({ error: error.message.split(':').slice(1).join(':') });
+                return;
+            }
+            if (error.message?.startsWith('WEBHOOK_INVALID_PAYLOAD:')) {
+                res.status(400).json({ error: error.message.split(':').slice(1).join(':') });
+                return;
+            }
             res.status(400).send(error);
         }
     };
@@ -276,11 +284,13 @@ export class PaymentController {
                 return;
             }
 
-            // Validação do expirationMinutes (se fornecido)
+            // Validação do expirationMinutes (se fornecido). OBS: o Asaas só suporta vencimento
+            // por dia (sem granularidade de minuto) — o valor é convertido para dias corridos
+            // no service; 30, 60 e 90 min, por exemplo, podem resultar na mesma data de vencimento.
             if (expirationMinutes !== undefined) {
                 if (typeof expirationMinutes !== 'number' || expirationMinutes < 30 || expirationMinutes > 43200) {
                     res.status(400).json({
-                        error: 'O tempo de expiração deve estar entre 30 minutos e 30 dias (43200 minutos).'
+                        error: 'O tempo de expiração deve estar entre 30 minutos e 30 dias (43200 minutos). Atenção: a Asaas só controla o vencimento por dia, não por minuto.'
                     });
                     return;
                 }
@@ -404,6 +414,10 @@ export class PaymentController {
 
             res.status(201).json(result);
         } catch (error: any) {
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:')) {
+                res.status(409).json({ error: error.message.split(':').slice(1).join(':'), code: 'FINAL_PAYMENT_BLOCKED' });
+                return;
+            }
             console.error('Erro ao criar pagamento com cartão de crédito:', error);
             res.status(500).json({
                 error: 'Erro ao criar pagamento com cartão de crédito.',

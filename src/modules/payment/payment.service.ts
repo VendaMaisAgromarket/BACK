@@ -46,18 +46,27 @@ export class PaymentService {
             email: buyer.email,
             mobilePhone: buyer.phone_number,
             externalReference: buyer.id,
+            // Sem campo de bairro no nosso modelo de Address — "alias" é um rótulo do
+            // próprio usuário (ex. "Casa"), não um bairro/província; não mapear para `province`.
+            // Asaas resolve cidade/UF a partir do CEP automaticamente.
             ...(address && {
                 postalCode: address.cep,
                 address: address.street,
-                addressNumber: address.number,
-                province: address.alias
+                addressNumber: address.number
             })
         });
 
-        await this.prisma.user.update({
-            where: { id: buyer.id },
+        // Grava o id só se ninguém venceu a corrida antes (evita sobrescrever um
+        // asaas_customer_id já persistido por uma requisição concorrente para o mesmo comprador).
+        const updateResult = await this.prisma.user.updateMany({
+            where: { id: buyer.id, asaas_customer_id: null },
             data: { asaas_customer_id: data.id }
         });
+
+        if (updateResult.count === 0) {
+            const current = await this.prisma.user.findUnique({ where: { id: buyer.id } });
+            if (current?.asaas_customer_id) return current.asaas_customer_id;
+        }
 
         return data.id as string;
     }
@@ -89,7 +98,8 @@ export class PaymentService {
             'CHARGEBACK_DISPUTE': 'refunded',
             'AWAITING_CHARGEBACK_REVERSAL': 'refunded',
             'DUNNING_REQUESTED': 'pending',
-            'DUNNING_RECEIVED': 'pending'
+            'DUNNING_RECEIVED': 'pending',
+            'DELETED': 'cancelled'
         };
         return statusMap[asaasStatus] || 'pending';
     }
@@ -193,14 +203,26 @@ export class PaymentService {
         return payment?.saleId ?? null;
     }
 
-    /** O Asaas não possui endpoint de listagem de métodos — retorna a lista estática suportada pelo sistema. */
+    /**
+     * O Asaas não possui endpoint de listagem de métodos. Retorna os métodos cadastrados
+     * localmente (tabela PaymentMethod) — o `id` retornado é o paymentMethodId real (FK),
+     * utilizável diretamente nos demais endpoints de criação de pagamento.
+     */
     async getPaymentMethods() {
-        return [
-            { id: 'PIX', name: 'Pix', description: 'Pagamento instantâneo via QR Code ou copia e cola' },
-            { id: 'BOLETO', name: 'Boleto bancário', description: 'Vencimento configurável, compensação em até 2 dias úteis' },
-            { id: 'CREDIT_CARD', name: 'Cartão de crédito', description: 'Captura imediata via API, com opção de parcelamento' },
-            { id: 'UNDEFINED', name: 'Fatura Asaas', description: 'Página hospedada pelo Asaas onde o comprador escolhe Pix, boleto ou cartão — único caminho para débito' },
-        ];
+        const billingTypeByMethod: Record<string, string> = {
+            'PIX': 'PIX',
+            'Boleto': 'BOLETO',
+            'Cartão de Crédito': 'CREDIT_CARD',
+            'Cartão de Débito': 'UNDEFINED', // Asaas não aceita débito direto — só via fatura hospedada (createPreference)
+        };
+
+        const methods = await this.prisma.paymentMethod.findMany();
+
+        return methods.map(m => ({
+            id: m.id,
+            method: m.method,
+            billingType: billingTypeByMethod[m.method] ?? null
+        }));
     }
 
     async createPixPayment(params: {
@@ -383,6 +405,10 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createCreditCardPayment] Criando pagamento em cartão de crédito para venda ${params.saleId} (fase: ${phase})`);
 
+            if (phase === 'final_payment') {
+                await this.assertFinalPaymentAllowed(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            }
+
             let amount = params.amount;
             if (phase === 'down_payment') {
                 const calc = await this.calculateDownPaymentAmount(params.saleId);
@@ -445,6 +471,26 @@ export class PaymentService {
             const message = extractAsaasErrorMessage(error, 'Erro ao processar pagamento com cartão de crédito');
             console.error(`[createCreditCardPayment] Erro ao criar pagamento em cartão para venda ${params.saleId}:`, message);
             throw new Error(message);
+        }
+    }
+
+    /**
+     * Garante que a venda está apta a receber a parcela final (70%): entrada já confirmada,
+     * pagamento final ainda não concluído, e sem outra cobrança final já pendente.
+     * Usa `errorPrefix` para preservar o código de erro específico de cada endpoint chamador.
+     */
+    private async assertFinalPaymentAllowed(saleId: string, errorPrefix: string): Promise<void> {
+        const sale = await this.prisma.saleData.findUnique({
+            where: { id: saleId },
+            include: { Payment: true },
+        });
+        if (!sale) throw new Error(`Venda (id=${saleId}) não encontrada`);
+        if (!sale.downPaymentCompleted) throw new Error(`${errorPrefix}:A entrada de 30% ainda não foi confirmada`);
+        if (sale.paymentCompleted) throw new Error(`${errorPrefix}:O pagamento final já foi concluído`);
+
+        const alreadyHasPendingFinal = sale.Payment.some(p => p.phase === 'final_payment' && p.status === 'pending');
+        if (alreadyHasPendingFinal) {
+            throw new Error(`${errorPrefix}:Já existe uma cobrança final pendente para esta venda`);
         }
     }
 
@@ -617,23 +663,26 @@ export class PaymentService {
      * `receivedToken` é o header `asaas-access-token`, validado contra ASAAS_WEBHOOK_TOKEN.
      */
     async processWebhook(payload: any, receivedToken?: string) {
+        // Falha fechada: sem token configurado no ambiente, nenhuma requisição é aceita como
+        // autenticada (um deploy com segredo ausente não pode abrir a validação para todo mundo).
+        const expectedToken = process.env.ASAAS_WEBHOOK_TOKEN;
+        if (!expectedToken || receivedToken !== expectedToken) {
+            console.warn('[Webhook] Token de autenticação (asaas-access-token) inválido ou ausente');
+            throw new Error('WEBHOOK_UNAUTHORIZED:Token de webhook inválido');
+        }
+
+        const event = payload?.event;
+        const paymentPayload = payload?.payment;
+        const asaasPaymentId = paymentPayload?.id;
+
+        console.info(`[Webhook] Recebido evento ${event} - Asaas PaymentId: ${asaasPaymentId}`);
+
+        if (!event || !asaasPaymentId) {
+            console.warn('[Webhook] Payload sem event/payment.id válido');
+            throw new Error('WEBHOOK_INVALID_PAYLOAD:Webhook sem dados de pagamento válidos');
+        }
+
         try {
-            const expectedToken = process.env.ASAAS_WEBHOOK_TOKEN;
-            if (expectedToken && receivedToken !== expectedToken) {
-                console.warn('[Webhook] Token de autenticação (asaas-access-token) inválido ou ausente');
-                return { error: 'Token de webhook inválido' };
-            }
-
-            const event = payload?.event;
-            const paymentPayload = payload?.payment;
-            const asaasPaymentId = paymentPayload?.id;
-
-            console.info(`[Webhook] Recebido evento ${event} - Asaas PaymentId: ${asaasPaymentId}`);
-
-            if (!event || !asaasPaymentId) {
-                console.warn('[Webhook] Payload sem event/payment.id válido');
-                return { error: 'Webhook sem dados de pagamento válidos' };
-            }
 
             let paymentRecord = await this.prisma.payment.findFirst({
                 where: { asaas_payment_id: asaasPaymentId },
