@@ -152,6 +152,13 @@ model Payment {
 
   sale          SaleData      @relation(fields: [saleId], references: [id])
   paymentMethod PaymentMethod @relation(fields: [paymentMethodId], references: [id])
+
+  // NOTA: existe um índice único PARCIAL em (saleId, phase, billingType) para status
+  // IN ('pending','completed'), criado via SQL manual na migration
+  // add_payment_active_attempt_unique_index — a sintaxe do Prisma não suporta índice único
+  // condicional (WHERE), então não aparece aqui como @@unique. Ele impede duas cobranças
+  // ativas simultâneas para a mesma venda/fase/meio de pagamento (corrida de requisições
+  // concorrentes). Não remover essa migration ao rodar `prisma migrate dev`/`db push`.
 }
 
 model TransportTypes {

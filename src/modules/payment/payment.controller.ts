@@ -9,6 +9,22 @@ const saleService = new SaleService(prisma);
 
 type PartyRole = 'admin' | 'buyer' | 'seller' | null;
 
+/** `phase` chega de req.body como `any` — o tipo do TypeScript não valida isso em runtime. */
+const VALID_PAYMENT_PHASES = ['down_payment', 'final_payment', 'full'] as const;
+function isValidPhase(phase: unknown): boolean {
+    return phase === undefined || phase === null || (typeof phase === 'string' && (VALID_PAYMENT_PHASES as readonly string[]).includes(phase));
+}
+
+/** Mapeia os erros de bloqueio/conflito lançados pelo service para a resposta HTTP 409 correta. */
+function handleKnownPaymentErrors(error: any, res: Response): boolean {
+    const prefixes = ['FINAL_PAYMENT_BLOCKED:', 'FINAL_BOLETO_BLOCKED:', 'DUPLICATE_PAYMENT_ATTEMPT:'];
+    const prefix = prefixes.find(p => error.message?.startsWith(p));
+    if (!prefix) return false;
+    const code = prefix.slice(0, -1);
+    res.status(409).json({ error: error.message.split(':').slice(1).join(':'), code });
+    return true;
+}
+
 /** Retorna o papel do usuário autenticado em relação à venda (admin, comprador, vendedor ou nenhum). */
 async function getRoleForSale(req: Request, saleId: string): Promise<PartyRole> {
     const parties = await saleService.getSaleParties(saleId);
@@ -39,6 +55,11 @@ export class PaymentController {
                 return;
             }
 
+            if (!isValidPhase(phase)) {
+                res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
             const role = await getRoleForSale(req, saleId);
             if (!role) {
                 res.status(403).json({ error: 'Forbidden' });
@@ -60,6 +81,7 @@ export class PaymentController {
             });
             res.status(201).json(result);
         } catch (error: any) {
+            if (handleKnownPaymentErrors(error, res)) return;
             console.error(error);
             res.status(500).json({
                 error: 'Erro ao criar preferência de pagamento.',
@@ -284,6 +306,11 @@ export class PaymentController {
                 return;
             }
 
+            if (!isValidPhase(phase)) {
+                res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
             // Validação do expirationMinutes (se fornecido). OBS: o Asaas só suporta vencimento
             // por dia (sem granularidade de minuto) — o valor é convertido para dias corridos
             // no service; 30, 60 e 90 min, por exemplo, podem resultar na mesma data de vencimento.
@@ -317,6 +344,7 @@ export class PaymentController {
 
             res.status(201).json(result);
         } catch (error: any) {
+            if (handleKnownPaymentErrors(error, res)) return;
             console.error('Erro ao criar pagamento PIX:', error);
             res.status(500).json({
                 error: 'Erro ao criar pagamento PIX.',
@@ -345,6 +373,11 @@ export class PaymentController {
                 return;
             }
 
+            if (!isValidPhase(phase)) {
+                res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
             const boletoRole = await getRoleForSale(req, saleId);
             if (!boletoRole) {
                 res.status(403).json({ error: 'Forbidden' });
@@ -359,6 +392,7 @@ export class PaymentController {
 
             res.status(201).json(result);
         } catch (error: any) {
+            if (handleKnownPaymentErrors(error, res)) return;
             console.error('Erro ao criar boleto:', error);
             res.status(500).json({
                 error: 'Erro ao criar boleto.',
@@ -391,6 +425,11 @@ export class PaymentController {
                 return;
             }
 
+            if (!isValidPhase(phase)) {
+                res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
             const cardRole = await getRoleForSale(req, saleId);
             if (!cardRole) {
                 res.status(403).json({ error: 'Forbidden' });
@@ -414,10 +453,7 @@ export class PaymentController {
 
             res.status(201).json(result);
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:')) {
-                res.status(409).json({ error: error.message.split(':').slice(1).join(':'), code: 'FINAL_PAYMENT_BLOCKED' });
-                return;
-            }
+            if (handleKnownPaymentErrors(error, res)) return;
             console.error('Erro ao criar pagamento com cartão de crédito:', error);
             res.status(500).json({
                 error: 'Erro ao criar pagamento com cartão de crédito.',
@@ -531,13 +567,19 @@ export class PaymentController {
                 return;
             }
 
-            const result = await service.createFinalBoleto({ saleId, paymentMethodId, amount, expirationDays });
+            // O ajuste manual de valor (peso real da carga) é uma ação de operador — um
+            // comprador não pode declarar unilateralmente quanto ainda deve; o servidor sempre
+            // recalcula o saldo restante para quem não é admin, mesmo que um amount seja enviado.
+            const isAdmin = req.user?.role === 'admin';
+            const result = await service.createFinalBoleto({
+                saleId,
+                paymentMethodId,
+                amount: isAdmin ? amount : undefined,
+                expirationDays,
+            });
             res.status(201).json(result);
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_BOLETO_BLOCKED:')) {
-                res.status(409).json({ error: error.message.split(':').slice(1).join(':'), code: 'FINAL_BOLETO_BLOCKED' });
-                return;
-            }
+            if (handleKnownPaymentErrors(error, res)) return;
             if (error.message?.includes('não encontrada')) {
                 res.status(404).json({ error: error.message });
                 return;

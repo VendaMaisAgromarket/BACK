@@ -17,6 +17,9 @@ function extractAsaasErrorMessage(error: any, fallback: string): string {
     return error?.response?.data?.errors?.[0]?.description || error?.message || fallback;
 }
 
+/** Código de erro do Prisma para violação de constraint única (corrida concorrente detectada no banco). */
+const PRISMA_UNIQUE_VIOLATION = 'P2002';
+
 export class PaymentService {
     private readonly prisma: PrismaClient;
     constructor(prisma?: PrismaClient) {
@@ -105,6 +108,134 @@ export class PaymentService {
     }
 
     /**
+     * Idempotência por tentativa: reaproveita uma cobrança pendente/concluída já existente
+     * para a mesma venda/fase/meio de pagamento, em vez de criar uma nova no Asaas a cada
+     * reenvio (ex.: timeout no cliente após o Asaas já ter aceitado a cobrança anterior).
+     * Chamada SEMPRE antes de qualquer validação de fase, para que um retry de final_payment
+     * reaproveite a cobrança pendente em vez de ser bloqueado por "já existe cobrança final".
+     */
+    private async findExistingAttempt(saleId: string, phase: PaymentPhase, billingType: string) {
+        return this.prisma.payment.findFirst({
+            where: { saleId, phase, billingType, status: { in: ['pending', 'completed'] } },
+            orderBy: { createdAt: 'desc' },
+        });
+    }
+
+    /**
+     * Monta a resposta de uma cobrança já existente (reaproveitada), buscando os dados
+     * complementares específicos de cada meio de pagamento. Único ponto que sabe o formato
+     * de resposta de cada billingType — evita duplicar essa lógica em cada método de criação.
+     */
+    private async buildReuseResponse(existing: Payment, phase: PaymentPhase): Promise<any> {
+        if (existing.billingType === 'PIX') {
+            const [paymentRes, qrRes] = await Promise.all([
+                asaasClient.get(`/payments/${existing.asaas_payment_id}`),
+                // Uma cobrança já liquidada pode não ter mais QR Code disponível no Asaas —
+                // não vale a pena pedir (e não deve quebrar a resposta se falhar).
+                existing.status === 'completed'
+                    ? Promise.resolve(null)
+                    : asaasClient.get(`/payments/${existing.asaas_payment_id}/pixQrCode`).catch(() => null)
+            ]);
+            const asaasPayment = paymentRes.data;
+            const qrCode = qrRes?.data ?? null;
+            return {
+                paymentId: existing.id,
+                asaas_payment_id: existing.asaas_payment_id,
+                status: existing.status,
+                phase,
+                payment: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    qr_code: qrCode?.payload ?? null,
+                    qr_code_base64: qrCode?.encodedImage ?? null,
+                    expiration_date: qrCode?.expirationDate ?? null
+                }
+            };
+        }
+
+        if (existing.billingType === 'BOLETO') {
+            const { data: asaasPayment } = await asaasClient.get(`/payments/${existing.asaas_payment_id}`);
+            return {
+                paymentId: existing.id,
+                asaas_payment_id: existing.asaas_payment_id,
+                status: existing.status,
+                phase,
+                payment: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    ticket_url: asaasPayment.bankSlipUrl,
+                    invoice_url: asaasPayment.invoiceUrl,
+                    expiration_date: asaasPayment.dueDate
+                }
+            };
+        }
+
+        if (existing.billingType === 'CREDIT_CARD') {
+            const { data: asaasPayment } = await asaasClient.get(`/payments/${existing.asaas_payment_id}`);
+            return {
+                paymentId: existing.id,
+                asaas_payment_id: existing.asaas_payment_id,
+                status: existing.status,
+                phase,
+                payment: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    brand: asaasPayment.creditCard?.creditCardBrand,
+                    lastDigits: asaasPayment.creditCard?.creditCardNumber
+                }
+            };
+        }
+
+        // UNDEFINED (fatura hospedada / createPreference)
+        const { data: asaasPayment } = await asaasClient.get(`/payments/${existing.asaas_payment_id}`);
+        return {
+            paymentId: existing.id,
+            asaas_payment_id: existing.asaas_payment_id,
+            init_point: asaasPayment.invoiceUrl
+        };
+    }
+
+    /**
+     * Alguns meios de pagamento confirmam de forma síncrona (ex.: cartão de crédito aprovado
+     * na hora da captura). Quando o Payment já nasce 'completed', aplica a mesma transição de
+     * SaleData que o webhook aplicaria — sem isso, a venda fica com downPaymentCompleted/
+     * paymentCompleted falsos mesmo com a cobrança já confirmada, e o webhook subsequente pula
+     * a atualização por já achar o status igual.
+     */
+    private async applyCompletionIfAlreadySettled(payment: Payment): Promise<void> {
+        if (payment.status !== 'completed') return;
+        await this.prisma.$transaction(async (tx) => {
+            await this.applyPaymentCompletion(tx, payment, payment.status);
+        });
+    }
+
+    /**
+     * Cria o Payment local a partir da cobrança criada no Asaas. Se duas requisições
+     * concorrentes passarem pela checagem de idempotência ao mesmo tempo (corrida), o índice
+     * único parcial do banco (saleId+phase+billingType, para status pending/completed) rejeita
+     * a segunda gravação — convertida aqui num erro claro em vez de uma falha genérica.
+     */
+    private async createLocalPaymentRecord(data: {
+        saleId: string;
+        paymentMethodId: string;
+        amount: number;
+        status: string;
+        phase: PaymentPhase;
+        billingType: string;
+        asaas_customer_id: string;
+        asaas_payment_id: string;
+    }): Promise<Payment> {
+        try {
+            return await this.prisma.payment.create({ data });
+        } catch (error: any) {
+            if (error?.code === PRISMA_UNIQUE_VIOLATION) {
+                throw new Error('DUPLICATE_PAYMENT_ATTEMPT:Já existe uma cobrança em andamento para esta venda/fase. Tente novamente em alguns segundos.');
+            }
+            throw error;
+        }
+    }
+
+    /**
      * Cria uma fatura hospedada no Asaas (billingType UNDEFINED): o comprador é redirecionado
      * para a página do Asaas e escolhe PIX, boleto ou cartão. É o único caminho para oferecer
      * cartão de débito, já que a API do Asaas não aceita dados de débito diretamente.
@@ -122,11 +253,19 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createPreference] Criando fatura Asaas para venda ${params.saleId} (fase: ${phase})`);
 
+            const existing = await this.findExistingAttempt(params.saleId, phase, 'UNDEFINED');
+            if (existing) {
+                console.info(`[createPreference] Fatura já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outra.`);
+                return await this.buildReuseResponse(existing, phase);
+            }
+
             let amount = params.amount;
             if (phase === 'down_payment') {
                 const calc = await this.calculateDownPaymentAmount(params.saleId);
                 amount = calc.amount;
                 console.info(`[createPreference] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
+            } else if (phase === 'final_payment') {
+                amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
             }
 
             const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
@@ -144,18 +283,18 @@ export class PaymentService {
                 description: params.title
             });
 
-            const payment = await this.prisma.payment.create({
-                data: {
-                    saleId: params.saleId,
-                    paymentMethodId: params.paymentMethodId,
-                    amount,
-                    status: this.mapAsaasStatus(asaasPayment.status),
-                    phase,
-                    billingType: 'UNDEFINED',
-                    asaas_customer_id: customerId,
-                    asaas_payment_id: asaasPayment.id
-                }
+            const payment = await this.createLocalPaymentRecord({
+                saleId: params.saleId,
+                paymentMethodId: params.paymentMethodId,
+                amount,
+                status: this.mapAsaasStatus(asaasPayment.status),
+                phase,
+                billingType: 'UNDEFINED',
+                asaas_customer_id: customerId,
+                asaas_payment_id: asaasPayment.id
             });
+
+            await this.applyCompletionIfAlreadySettled(payment);
 
             console.info(`[createPreference] Fatura criada com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
 
@@ -165,6 +304,7 @@ export class PaymentService {
                 init_point: asaasPayment.invoiceUrl
             };
         } catch (error: any) {
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar fatura do Asaas');
             console.error(`[createPreference] Erro ao criar fatura para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -237,11 +377,19 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createPixPayment] Criando pagamento PIX para venda ${params.saleId} (fase: ${phase})`);
 
+            const existing = await this.findExistingAttempt(params.saleId, phase, 'PIX');
+            if (existing) {
+                console.info(`[createPixPayment] PIX já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outro.`);
+                return await this.buildReuseResponse(existing, phase);
+            }
+
             let amount = params.amount;
             if (phase === 'down_payment') {
                 const calc = await this.calculateDownPaymentAmount(params.saleId);
                 amount = calc.amount;
                 console.info(`[createPixPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
+            } else if (phase === 'final_payment') {
+                amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
             }
 
             const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
@@ -266,18 +414,18 @@ export class PaymentService {
 
             const { data: qrCode } = await asaasClient.get(`/payments/${asaasPayment.id}/pixQrCode`);
 
-            const payment = await this.prisma.payment.create({
-                data: {
-                    saleId: params.saleId,
-                    paymentMethodId: params.paymentMethodId,
-                    amount,
-                    status: this.mapAsaasStatus(asaasPayment.status),
-                    phase,
-                    billingType: 'PIX',
-                    asaas_customer_id: customerId,
-                    asaas_payment_id: asaasPayment.id
-                }
+            const payment = await this.createLocalPaymentRecord({
+                saleId: params.saleId,
+                paymentMethodId: params.paymentMethodId,
+                amount,
+                status: this.mapAsaasStatus(asaasPayment.status),
+                phase,
+                billingType: 'PIX',
+                asaas_customer_id: customerId,
+                asaas_payment_id: asaasPayment.id
             });
+
+            await this.applyCompletionIfAlreadySettled(payment);
 
             console.info(`[createPixPayment] Pagamento PIX criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
 
@@ -295,10 +443,74 @@ export class PaymentService {
                 }
             };
         } catch (error: any) {
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento PIX');
             console.error(`[createPixPayment] Erro ao criar pagamento PIX para venda ${params.saleId}:`, message);
             throw new Error(message);
         }
+    }
+
+    /**
+     * Efetivamente cria a cobrança de boleto no Asaas e o registro local. Não valida fase nem
+     * recalcula valor — quem chama (`createBoletoPayment` ou `createFinalBoleto`) já fez isso
+     * com a semântica correta para o seu caso (o final-boleto admite ajuste manual pelo peso).
+     */
+    private async createBoletoCharge(params: {
+        saleId: string;
+        paymentMethodId: string;
+        amount: number;
+        expirationDays?: number;
+        phase: PaymentPhase;
+    }) {
+        const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
+        if (!sale) throw new Error(`Venda não encontrada: ${params.saleId}`);
+
+        const customerId = await this.ensureAsaasCustomer(sale.buyerId);
+
+        // ?? (não ||): expirationDays: 0 é um valor explícito válido ("vence hoje"), não deve
+        // cair no default de 3 dias.
+        const expirationDays = params.expirationDays ?? 3;
+        const dueDateObj = new Date();
+        dueDateObj.setDate(dueDateObj.getDate() + expirationDays);
+        const dueDate = dueDateObj.toISOString().split('T')[0];
+
+        const { data: asaasPayment } = await asaasClient.post('/payments', {
+            customer: customerId,
+            billingType: 'BOLETO',
+            value: params.amount,
+            dueDate,
+            externalReference: params.saleId,
+            description: this.buildPaymentDescription(sale.orderNumber, params.phase)
+        });
+
+        const payment = await this.createLocalPaymentRecord({
+            saleId: params.saleId,
+            paymentMethodId: params.paymentMethodId,
+            amount: params.amount,
+            status: this.mapAsaasStatus(asaasPayment.status),
+            phase: params.phase,
+            billingType: 'BOLETO',
+            asaas_customer_id: customerId,
+            asaas_payment_id: asaasPayment.id
+        });
+
+        await this.applyCompletionIfAlreadySettled(payment);
+
+        console.info(`[createBoletoCharge] Boleto criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
+
+        return {
+            paymentId: payment.id,
+            asaas_payment_id: asaasPayment.id,
+            status: payment.status,
+            phase: params.phase,
+            payment: {
+                id: asaasPayment.id,
+                status: asaasPayment.status,
+                ticket_url: asaasPayment.bankSlipUrl,
+                invoice_url: asaasPayment.invoiceUrl,
+                expiration_date: dueDate
+            }
+        };
     }
 
     async createBoletoPayment(params: {
@@ -312,61 +524,24 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createBoletoPayment] Criando pagamento com boleto para venda ${params.saleId} (fase: ${phase})`);
 
+            const existing = await this.findExistingAttempt(params.saleId, phase, 'BOLETO');
+            if (existing) {
+                console.info(`[createBoletoPayment] Boleto já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outro.`);
+                return await this.buildReuseResponse(existing, phase);
+            }
+
             let amount = params.amount;
             if (phase === 'down_payment') {
                 const calc = await this.calculateDownPaymentAmount(params.saleId);
                 amount = calc.amount;
                 console.info(`[createBoletoPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
+            } else if (phase === 'final_payment') {
+                amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
             }
 
-            const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
-            if (!sale) throw new Error(`Venda não encontrada: ${params.saleId}`);
-
-            const customerId = await this.ensureAsaasCustomer(sale.buyerId);
-
-            const expirationDays = params.expirationDays || 3;
-            const dueDateObj = new Date();
-            dueDateObj.setDate(dueDateObj.getDate() + expirationDays);
-            const dueDate = dueDateObj.toISOString().split('T')[0];
-
-            const { data: asaasPayment } = await asaasClient.post('/payments', {
-                customer: customerId,
-                billingType: 'BOLETO',
-                value: amount,
-                dueDate,
-                externalReference: params.saleId,
-                description: this.buildPaymentDescription(sale.orderNumber, phase)
-            });
-
-            const payment = await this.prisma.payment.create({
-                data: {
-                    saleId: params.saleId,
-                    paymentMethodId: params.paymentMethodId,
-                    amount,
-                    status: this.mapAsaasStatus(asaasPayment.status),
-                    phase,
-                    billingType: 'BOLETO',
-                    asaas_customer_id: customerId,
-                    asaas_payment_id: asaasPayment.id
-                }
-            });
-
-            console.info(`[createBoletoPayment] Boleto criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
-
-            return {
-                paymentId: payment.id,
-                asaas_payment_id: asaasPayment.id,
-                status: payment.status,
-                phase,
-                payment: {
-                    id: asaasPayment.id,
-                    status: asaasPayment.status,
-                    ticket_url: asaasPayment.bankSlipUrl,
-                    invoice_url: asaasPayment.invoiceUrl,
-                    expiration_date: dueDate
-                }
-            };
+            return await this.createBoletoCharge({ ...params, amount, phase });
         } catch (error: any) {
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento com boleto');
             console.error(`[createBoletoPayment] Erro ao criar boleto para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -405,8 +580,10 @@ export class PaymentService {
             const phase = params.phase ?? 'full';
             console.info(`[createCreditCardPayment] Criando pagamento em cartão de crédito para venda ${params.saleId} (fase: ${phase})`);
 
-            if (phase === 'final_payment') {
-                await this.assertFinalPaymentAllowed(params.saleId, 'FINAL_PAYMENT_BLOCKED');
+            const existing = await this.findExistingAttempt(params.saleId, phase, 'CREDIT_CARD');
+            if (existing) {
+                console.info(`[createCreditCardPayment] Cobrança em cartão já existente para venda ${params.saleId} (fase: ${phase}) — reaproveitando em vez de criar outra.`);
+                return await this.buildReuseResponse(existing, phase);
             }
 
             let amount = params.amount;
@@ -414,6 +591,8 @@ export class PaymentService {
                 const calc = await this.calculateDownPaymentAmount(params.saleId);
                 amount = calc.amount;
                 console.info(`[createCreditCardPayment] Valor da entrada calculado: ${calc.percent}% de R$${calc.contractTotal} = R$${amount}`);
+            } else if (phase === 'final_payment') {
+                amount = await this.prepareFinalPayment(params.saleId, 'FINAL_PAYMENT_BLOCKED');
             }
 
             const sale = await this.prisma.saleData.findUnique({ where: { id: params.saleId } });
@@ -440,18 +619,18 @@ export class PaymentService {
                 })
             });
 
-            const payment = await this.prisma.payment.create({
-                data: {
-                    saleId: params.saleId,
-                    paymentMethodId: params.paymentMethodId,
-                    amount,
-                    status: this.mapAsaasStatus(asaasPayment.status),
-                    phase,
-                    billingType: 'CREDIT_CARD',
-                    asaas_customer_id: customerId,
-                    asaas_payment_id: asaasPayment.id
-                }
+            const payment = await this.createLocalPaymentRecord({
+                saleId: params.saleId,
+                paymentMethodId: params.paymentMethodId,
+                amount,
+                status: this.mapAsaasStatus(asaasPayment.status),
+                phase,
+                billingType: 'CREDIT_CARD',
+                asaas_customer_id: customerId,
+                asaas_payment_id: asaasPayment.id
             });
+
+            await this.applyCompletionIfAlreadySettled(payment);
 
             console.info(`[createCreditCardPayment] Pagamento em cartão criado - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}, Status: ${asaasPayment.status}`);
 
@@ -468,6 +647,7 @@ export class PaymentService {
                 }
             };
         } catch (error: any) {
+            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao processar pagamento com cartão de crédito');
             console.error(`[createCreditCardPayment] Erro ao criar pagamento em cartão para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -475,14 +655,15 @@ export class PaymentService {
     }
 
     /**
-     * Garante que a venda está apta a receber a parcela final (70%): entrada já confirmada,
-     * pagamento final ainda não concluído, e sem outra cobrança final já pendente.
-     * Usa `errorPrefix` para preservar o código de erro específico de cada endpoint chamador.
+     * Valida a elegibilidade da parcela final (70%) — entrada já confirmada, pagamento final
+     * ainda não concluído, sem outra cobrança final pendente — e já retorna o valor restante a
+     * cobrar nessa mesma consulta. `errorPrefix` preserva o código de erro específico do
+     * endpoint chamador (ex.: FINAL_BOLETO_BLOCKED vs FINAL_PAYMENT_BLOCKED).
      */
-    private async assertFinalPaymentAllowed(saleId: string, errorPrefix: string): Promise<void> {
+    private async prepareFinalPayment(saleId: string, errorPrefix: string): Promise<number> {
         const sale = await this.prisma.saleData.findUnique({
             where: { id: saleId },
-            include: { Payment: true },
+            include: { boughtProducts: true, Payment: true },
         });
         if (!sale) throw new Error(`Venda (id=${saleId}) não encontrada`);
         if (!sale.downPaymentCompleted) throw new Error(`${errorPrefix}:A entrada de 30% ainda não foi confirmada`);
@@ -492,6 +673,15 @@ export class PaymentService {
         if (alreadyHasPendingFinal) {
             throw new Error(`${errorPrefix}:Já existe uma cobrança final pendente para esta venda`);
         }
+
+        const originalTotal = sale.boughtProducts.reduce((sum, bp) => sum + bp.value, 0) + Number(sale.transportValue);
+        const adjustedContractTotal = sale.adjustedContractTotal !== null ? Number(sale.adjustedContractTotal) : null;
+        const contractTotal = adjustedContractTotal ?? originalTotal;
+        const totalDownPaid = sale.Payment
+            .filter(p => p.phase === 'down_payment' && p.status === 'completed')
+            .reduce((sum, p) => sum + p.amount, 0);
+
+        return Math.max(0, contractTotal - totalDownPaid);
     }
 
     /**
@@ -541,8 +731,9 @@ export class PaymentService {
     /**
      * Cria o boleto da segunda parcela (70%).
      * A segunda parcela é SEMPRE boleto por definição de negócio.
-     * Se amount for informado explicitamente (ajuste por peso real), esse valor é usado.
-     * Caso contrário, calcula automaticamente como contractTotal - downPaymentPaid.
+     * `amount` explícito (ajuste manual pelo peso real da carga) só deve ser aceito pelo
+     * controller quando o chamador for admin — aqui ele apenas substitui o valor calculado,
+     * mas a elegibilidade (entrada confirmada, sem pendência) é sempre verificada.
      */
     async createFinalBoleto(params: {
         saleId: string;
@@ -550,39 +741,12 @@ export class PaymentService {
         amount?: number;
         expirationDays?: number;
     }) {
-        const sale = await this.prisma.saleData.findUnique({
-            where: { id: params.saleId },
-            include: { boughtProducts: true, Payment: true },
-        });
-
-        if (!sale) throw new Error(`Venda (id=${params.saleId}) não encontrada`);
-        if (!sale.downPaymentCompleted) throw new Error('FINAL_BOLETO_BLOCKED:A entrada de 30% ainda não foi confirmada');
-        if (sale.paymentCompleted) throw new Error('FINAL_BOLETO_BLOCKED:O pagamento final já foi concluído');
-
-        const alreadyHasPendingFinal = sale.Payment.some(
-            p => p.phase === 'final_payment' && p.status === 'pending'
-        );
-        if (alreadyHasPendingFinal) {
-            throw new Error('FINAL_BOLETO_BLOCKED:Já existe um boleto final pendente para esta venda');
-        }
-
-        let amount = params.amount;
-        if (amount === undefined) {
-            // Prefere o total ajustado pela pesagem; caso contrário usa o total original
-            const originalTotal = sale.boughtProducts.reduce((sum, bp) => sum + bp.value, 0) + Number(sale.transportValue);
-            const adjustedContractTotal = sale.adjustedContractTotal !== null
-                ? Number(sale.adjustedContractTotal)
-                : null;
-            const contractTotal = adjustedContractTotal ?? originalTotal;
-            const totalDownPaid = sale.Payment
-                .filter(p => p.phase === 'down_payment' && p.status === 'completed')
-                .reduce((sum, p) => sum + p.amount, 0);
-            amount = Math.max(0, contractTotal - totalDownPaid);
-        }
+        const computedAmount = await this.prepareFinalPayment(params.saleId, 'FINAL_BOLETO_BLOCKED');
+        const amount = params.amount ?? computedAmount;
 
         if (amount <= 0) throw new Error('FINAL_BOLETO_BLOCKED:Valor calculado para o boleto final é zero ou negativo');
 
-        return this.createBoletoPayment({
+        return this.createBoletoCharge({
             saleId: params.saleId,
             paymentMethodId: params.paymentMethodId,
             amount,
@@ -674,34 +838,30 @@ export class PaymentService {
         const event = payload?.event;
         const paymentPayload = payload?.payment;
         const asaasPaymentId = paymentPayload?.id;
+        const asaasStatus = paymentPayload?.status;
 
         console.info(`[Webhook] Recebido evento ${event} - Asaas PaymentId: ${asaasPaymentId}`);
 
-        if (!event || !asaasPaymentId) {
-            console.warn('[Webhook] Payload sem event/payment.id válido');
+        if (!event || !asaasPaymentId || !asaasStatus) {
+            console.warn('[Webhook] Payload sem event/payment.id/payment.status válido');
             throw new Error('WEBHOOK_INVALID_PAYLOAD:Webhook sem dados de pagamento válidos');
         }
 
         try {
-
-            let paymentRecord = await this.prisma.payment.findFirst({
+            // Correlação SEMPRE pelo asaas_payment_id exato — nunca por saleId isolado: uma
+            // venda pode ter várias tentativas/fases, e um webhook atrasado de uma cobrança
+            // antiga poderia, por esse fallback, confirmar a tentativa mais recente errada.
+            const paymentRecord = await this.prisma.payment.findFirst({
                 where: { asaas_payment_id: asaasPaymentId },
                 orderBy: { createdAt: 'desc' },
             });
-
-            if (!paymentRecord && paymentPayload.externalReference) {
-                paymentRecord = await this.prisma.payment.findFirst({
-                    where: { saleId: paymentPayload.externalReference },
-                    orderBy: { createdAt: 'desc' },
-                });
-            }
 
             if (!paymentRecord) {
                 console.error(`[Webhook] Payment não encontrado para Asaas paymentId ${asaasPaymentId}`);
                 return { error: 'Pagamento não encontrado no banco de dados' };
             }
 
-            const newStatus = this.mapAsaasStatus(paymentPayload.status);
+            const newStatus = this.mapAsaasStatus(asaasStatus);
 
             if (paymentRecord.status !== newStatus) {
                 console.info(`[Webhook] Atualizando pagamento ${paymentRecord.id}: ${paymentRecord.status} -> ${newStatus}`);
@@ -721,7 +881,7 @@ export class PaymentService {
                 status: newStatus,
                 asaas_payment_id: asaasPaymentId,
                 asaas_event: event,
-                asaas_status: paymentPayload.status,
+                asaas_status: asaasStatus,
             };
         } catch (error: any) {
             console.error('Erro crítico no webhook:', error.message);

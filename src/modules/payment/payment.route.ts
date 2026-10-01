@@ -9,9 +9,17 @@ const controller = new PaymentController();
  * @swagger
  * /payment/webhook:
  *   post:
- *     summary: Endpoint para processar webhooks do Mercado Pago
- *     description: Recebe notificações do Mercado Pago sobre mudanças no status dos pagamentos (Payment API e Orders API)
+ *     summary: Endpoint para processar webhooks do Asaas
+ *     description: >
+ *       Recebe notificações do Asaas sobre mudanças no status das cobranças. Requer o header
+ *       `asaas-access-token` (validado contra ASAAS_WEBHOOK_TOKEN) — ausente ou incorreto retorna 401.
+ *       Payload malformado (sem `event`, `payment.id` ou `payment.status`) retorna 400.
  *     tags: [PaymentMethods]
+ *     parameters:
+ *       - in: header
+ *         name: asaas-access-token
+ *         required: true
+ *         schema: { type: string }
  *     requestBody:
  *       required: true
  *       content:
@@ -19,21 +27,20 @@ const controller = new PaymentController();
  *           schema:
  *             type: object
  *             properties:
- *               type:
+ *               event:
  *                 type: string
- *                 example: "payment"
- *               topic:
- *                 type: string
- *                 example: "order"
- *               action:
- *                 type: string
- *                 example: "payment.updated"
- *               data:
+ *                 example: "PAYMENT_RECEIVED"
+ *               payment:
  *                 type: object
  *                 properties:
  *                   id:
  *                     type: string
- *                     example: "ORD01HRYFWNYRE1MR1E60MW3X0T2P"
+ *                     example: "pay_080225913252"
+ *                   status:
+ *                     type: string
+ *                     example: "RECEIVED"
+ *                   externalReference:
+ *                     type: string
  *     responses:
  *       200:
  *         description: Webhook processado com sucesso
@@ -49,6 +56,10 @@ const controller = new PaymentController();
  *                   type: string
  *                 status:
  *                   type: string
+ *       400:
+ *         description: Payload malformado (sem event, payment.id ou payment.status)
+ *       401:
+ *         description: Header asaas-access-token ausente ou incorreto
  *       500:
  *         description: Erro ao processar webhook
  *         content:
@@ -251,6 +262,86 @@ router.post('/pix', controller.createPixPayment as RequestHandler);
  *         description: Erro ao criar boleto
  */
 router.post('/boleto', controller.createBoletoPayment as RequestHandler);
+
+/**
+ * @swagger
+ * /payment/card:
+ *   post:
+ *     summary: Cria um pagamento com cartão de crédito (captura imediata via Asaas)
+ *     description: >
+ *       Cartão de débito não é suportado diretamente pela API do Asaas — para débito, use
+ *       `POST /payment/preference`, que gera uma fatura hospedada onde o comprador escolhe a
+ *       forma de pagamento. `phase` segue a mesma regra 30/70 dos demais endpoints: `final_payment`
+ *       exige que a entrada já esteja confirmada e tem o valor recalculado no servidor (ignora
+ *       qualquer `amount` enviado para essa fase).
+ *     tags: [PaymentMethods]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [saleId, paymentMethodId, amount, creditCard, creditCardHolderInfo]
+ *             properties:
+ *               saleId:
+ *                 type: string
+ *               paymentMethodId:
+ *                 type: string
+ *               amount:
+ *                 type: number
+ *                 description: Ignorado quando phase=final_payment (recalculado no servidor)
+ *               phase:
+ *                 type: string
+ *                 enum: [down_payment, final_payment, full]
+ *                 default: full
+ *               installmentCount:
+ *                 type: integer
+ *                 description: Número de parcelas (opcional, parcela única se omitido)
+ *               creditCard:
+ *                 type: object
+ *                 required: [holderName, number, expiryMonth, expiryYear, ccv]
+ *                 properties:
+ *                   holderName: { type: string }
+ *                   number: { type: string }
+ *                   expiryMonth: { type: string }
+ *                   expiryYear: { type: string }
+ *                   ccv: { type: string }
+ *               creditCardHolderInfo:
+ *                 type: object
+ *                 required: [name, email, cpfCnpj, postalCode, addressNumber, phone]
+ *                 properties:
+ *                   name: { type: string }
+ *                   email: { type: string }
+ *                   cpfCnpj: { type: string }
+ *                   postalCode: { type: string }
+ *                   addressNumber: { type: string }
+ *                   phone: { type: string }
+ *     responses:
+ *       201:
+ *         description: Pagamento criado (ou já capturado, se o Asaas confirmar na hora)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 paymentId: { type: string }
+ *                 asaas_payment_id: { type: string }
+ *                 status: { type: string, example: "completed" }
+ *                 phase: { type: string }
+ *                 payment:
+ *                   type: object
+ *                   properties:
+ *                     id: { type: string }
+ *                     status: { type: string }
+ *                     brand: { type: string, example: "VISA" }
+ *                     lastDigits: { type: string }
+ *       400: { description: Dados obrigatórios ausentes, valor inválido ou phase inválida }
+ *       403: { description: Somente o comprador pode iniciar o pagamento }
+ *       409: { description: "Parcela final bloqueada (entrada não confirmada, já concluída, ou já existe cobrança final pendente)" }
+ *       500: { description: Erro ao processar pagamento com cartão de crédito }
+ */
 router.post('/card', controller.createCreditCardPayment as RequestHandler);
 router.post('/final-boleto', controller.createFinalBoleto as RequestHandler);
 router.post('/configure-webhook', requireAdmin as RequestHandler, controller.configureWebhook as RequestHandler);
