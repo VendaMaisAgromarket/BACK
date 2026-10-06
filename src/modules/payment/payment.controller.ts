@@ -9,6 +9,53 @@ const saleService = new SaleService(prisma);
 
 type PartyRole = 'admin' | 'buyer' | 'seller' | null;
 
+/** `phase` chega de req.body como `any` — o tipo do TypeScript não valida isso em runtime. */
+const VALID_PAYMENT_PHASES = ['down_payment', 'final_payment', 'full'] as const;
+function isValidPhase(phase: unknown): boolean {
+    return phase === undefined || phase === null || (typeof phase === 'string' && (VALID_PAYMENT_PHASES as readonly string[]).includes(phase));
+}
+
+function isNonEmptyString(value: unknown): boolean {
+    return typeof value === 'string' && value.trim().length > 0;
+}
+
+const REQUIRED_CREDIT_CARD_FIELDS = ['holderName', 'number', 'expiryMonth', 'expiryYear', 'ccv'] as const;
+const REQUIRED_CARD_HOLDER_FIELDS = ['name', 'email', 'cpfCnpj', 'postalCode', 'addressNumber', 'phone'] as const;
+
+/**
+ * Antes só checava se `creditCard`/`creditCardHolderInfo` existiam como objetos — um objeto
+ * vazio ou parcial passava e era enviado direto para a Asaas, que rejeitava com um erro de
+ * provedor exibido como 500 genérico, mesmo o endpoint documentando 400 para dados malformados.
+ */
+function validateCreditCardPayload(creditCard: any, creditCardHolderInfo: any, installmentCount: unknown): string | null {
+    for (const field of REQUIRED_CREDIT_CARD_FIELDS) {
+        if (!isNonEmptyString(creditCard?.[field])) {
+            return `Campo obrigatório do cartão ausente ou inválido: creditCard.${field}`;
+        }
+    }
+    for (const field of REQUIRED_CARD_HOLDER_FIELDS) {
+        if (!isNonEmptyString(creditCardHolderInfo?.[field])) {
+            return `Campo obrigatório do titular ausente ou inválido: creditCardHolderInfo.${field}`;
+        }
+    }
+    if (installmentCount !== undefined) {
+        if (typeof installmentCount !== 'number' || !Number.isInteger(installmentCount) || installmentCount < 1 || installmentCount > 21) {
+            return 'installmentCount deve ser um número inteiro entre 1 e 21.';
+        }
+    }
+    return null;
+}
+
+/** Mapeia os erros de bloqueio/conflito lançados pelo service para a resposta HTTP 409 correta. */
+function handleKnownPaymentErrors(error: any, res: Response): boolean {
+    const prefixes = ['FINAL_PAYMENT_BLOCKED:', 'FINAL_BOLETO_BLOCKED:', 'DUPLICATE_PAYMENT_ATTEMPT:'];
+    const prefix = prefixes.find(p => error.message?.startsWith(p));
+    if (!prefix) return false;
+    const code = prefix.slice(0, -1);
+    res.status(409).json({ error: error.message.split(':').slice(1).join(':'), code });
+    return true;
+}
+
 /** Retorna o papel do usuário autenticado em relação à venda (admin, comprador, vendedor ou nenhum). */
 async function getRoleForSale(req: Request, saleId: string): Promise<PartyRole> {
     const parties = await saleService.getSaleParties(saleId);
@@ -39,6 +86,11 @@ export class PaymentController {
                 return;
             }
 
+            if (!isValidPhase(phase)) {
+                res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
             const role = await getRoleForSale(req, saleId);
             if (!role) {
                 res.status(403).json({ error: 'Forbidden' });
@@ -60,6 +112,7 @@ export class PaymentController {
             });
             res.status(201).json(result);
         } catch (error: any) {
+            if (handleKnownPaymentErrors(error, res)) return;
             console.error(error);
             res.status(500).json({
                 error: 'Erro ao criar preferência de pagamento.',
@@ -133,10 +186,28 @@ export class PaymentController {
         res: Response
     ): Promise<void> => {
         try {
-            const result = await service.processWebhook(req.body);
+            const receivedToken = req.header('asaas-access-token');
+            const result = await service.processWebhook(req.body, receivedToken);
             res.status(200).send(result);
         } catch (error: any) {
-            res.status(400).send(error);
+            if (error.message?.startsWith('WEBHOOK_UNAUTHORIZED:')) {
+                res.status(401).json({ error: error.message.split(':').slice(1).join(':') });
+                return;
+            }
+            if (error.message?.startsWith('WEBHOOK_INVALID_PAYLOAD:')) {
+                res.status(400).json({ error: error.message.split(':').slice(1).join(':') });
+                return;
+            }
+            if (error.message?.startsWith('WEBHOOK_PAYMENT_NOT_FOUND:')) {
+                // Pode ser uma corrida com a criação local (ver comentário no service) — 404
+                // sinaliza "tente novamente", nunca 200 (que faria o Asaas desistir de vez).
+                res.status(404).json({ error: error.message.split(':').slice(1).join(':') });
+                return;
+            }
+            // Falha ao persistir a atualização (banco/infra) é transiente — responde 5xx para
+            // que o Asaas tente de novo, em vez de 400 (que sinaliza "não tente novamente").
+            console.error('[Webhook] Erro ao processar notificação:', error);
+            res.status(500).json({ error: 'Erro ao processar webhook.', message: error.message });
         }
     };
 
@@ -275,11 +346,18 @@ export class PaymentController {
                 return;
             }
 
-            // Validação do expirationMinutes (se fornecido)
+            if (!isValidPhase(phase)) {
+                res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
+            // Validação do expirationMinutes (se fornecido). OBS: o Asaas só suporta vencimento
+            // por dia (sem granularidade de minuto) — o valor é convertido para dias corridos
+            // no service; 30, 60 e 90 min, por exemplo, podem resultar na mesma data de vencimento.
             if (expirationMinutes !== undefined) {
                 if (typeof expirationMinutes !== 'number' || expirationMinutes < 30 || expirationMinutes > 43200) {
                     res.status(400).json({
-                        error: 'O tempo de expiração deve estar entre 30 minutos e 30 dias (43200 minutos).'
+                        error: 'O tempo de expiração deve estar entre 30 minutos e 30 dias (43200 minutos). Atenção: a Asaas só controla o vencimento por dia, não por minuto.'
                     });
                     return;
                 }
@@ -306,6 +384,7 @@ export class PaymentController {
 
             res.status(201).json(result);
         } catch (error: any) {
+            if (handleKnownPaymentErrors(error, res)) return;
             console.error('Erro ao criar pagamento PIX:', error);
             res.status(500).json({
                 error: 'Erro ao criar pagamento PIX.',
@@ -334,6 +413,11 @@ export class PaymentController {
                 return;
             }
 
+            if (!isValidPhase(phase)) {
+                res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
             const boletoRole = await getRoleForSale(req, saleId);
             if (!boletoRole) {
                 res.status(403).json({ error: 'Forbidden' });
@@ -348,9 +432,77 @@ export class PaymentController {
 
             res.status(201).json(result);
         } catch (error: any) {
+            if (handleKnownPaymentErrors(error, res)) return;
             console.error('Erro ao criar boleto:', error);
             res.status(500).json({
                 error: 'Erro ao criar boleto.',
+                message: error.message,
+            });
+        }
+    };
+
+    /**
+     * Cria um pagamento com cartão de crédito (captura imediata via API do Asaas).
+     * Cartão de débito não é suportado diretamente pela API — nesse caso, use /payment/preference.
+     */
+    public createCreditCardPayment: RequestHandler = async (
+        req: Request,
+        res: Response
+    ): Promise<void> => {
+        try {
+            const { saleId, paymentMethodId, amount, phase, creditCard, creditCardHolderInfo, installmentCount } = req.body;
+
+            if (!saleId || !paymentMethodId || !amount || !creditCard || !creditCardHolderInfo) {
+                res.status(400).json({
+                    error: 'Dados obrigatórios não fornecidos.',
+                    required: ['saleId', 'paymentMethodId', 'amount', 'creditCard', 'creditCardHolderInfo']
+                });
+                return;
+            }
+
+            if (typeof amount !== 'number' || amount <= 0) {
+                res.status(400).json({ error: 'O valor do pagamento deve ser um número maior que zero.' });
+                return;
+            }
+
+            if (!isValidPhase(phase)) {
+                res.status(400).json({ error: `phase inválida. Valores aceitos: ${VALID_PAYMENT_PHASES.join(', ')}.` });
+                return;
+            }
+
+            const cardValidationError = validateCreditCardPayload(creditCard, creditCardHolderInfo, installmentCount);
+            if (cardValidationError) {
+                res.status(400).json({ error: cardValidationError });
+                return;
+            }
+
+            const cardRole = await getRoleForSale(req, saleId);
+            if (!cardRole) {
+                res.status(403).json({ error: 'Forbidden' });
+                return;
+            }
+            if (cardRole === 'seller') {
+                res.status(403).json({ error: 'Somente o comprador pode iniciar o pagamento.' });
+                return;
+            }
+
+            const result = await service.createCreditCardPayment({
+                saleId,
+                paymentMethodId,
+                amount,
+                phase,
+                creditCard,
+                creditCardHolderInfo,
+                installmentCount,
+                remoteIp: req.ip || req.socket.remoteAddress || '0.0.0.0',
+            });
+
+            res.status(201).json(result);
+        } catch (error: any) {
+            if (handleKnownPaymentErrors(error, res)) return;
+            console.error('Erro ao criar pagamento com cartão de crédito:', error);
+            res.status(500).json({
+                error: 'Erro ao criar pagamento com cartão de crédito.',
                 message: error.message,
             });
         }
@@ -461,13 +613,19 @@ export class PaymentController {
                 return;
             }
 
-            const result = await service.createFinalBoleto({ saleId, paymentMethodId, amount, expirationDays });
+            // O ajuste manual de valor (peso real da carga) é uma ação de operador — um
+            // comprador não pode declarar unilateralmente quanto ainda deve; o servidor sempre
+            // recalcula o saldo restante para quem não é admin, mesmo que um amount seja enviado.
+            const isAdmin = req.user?.role === 'admin';
+            const result = await service.createFinalBoleto({
+                saleId,
+                paymentMethodId,
+                amount: isAdmin ? amount : undefined,
+                expirationDays,
+            });
             res.status(201).json(result);
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_BOLETO_BLOCKED:')) {
-                res.status(409).json({ error: error.message.split(':').slice(1).join(':'), code: 'FINAL_BOLETO_BLOCKED' });
-                return;
-            }
+            if (handleKnownPaymentErrors(error, res)) return;
             if (error.message?.includes('não encontrada')) {
                 res.status(404).json({ error: error.message });
                 return;

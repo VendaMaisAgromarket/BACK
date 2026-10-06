@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vendamais_postgres_dev
+    environment:
+      POSTGRES_USER: vendamais
+      POSTGRES_PASSWORD: vendamais
+      POSTGRES_DB: vendamais_dev
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - vendamais_postgres_dev_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vendamais -d vendamais_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  vendamais_postgres_dev_data:

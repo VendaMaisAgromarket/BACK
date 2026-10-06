@@ -10,3 +10,4 @@ docker-compose*.yml
 dockerfile
 README.md
 scripts
+.claude

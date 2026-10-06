@@ -14,6 +14,7 @@
     "create-admin": "ts-node scripts/create-admin.ts",
     "seed-units": "ts-node scripts/seed-selling-units.ts",
     "seed-sales": "ts-node scripts/seed-sales-data.ts",
+    "seed-admin": "ts-node scripts/seed-admin.ts",
     "seed": "prisma db seed",
     "pretest": "node -e \"const fs=require('fs');if(!fs.existsSync('.env.test')){console.error('\\nERRO: Arquivo .env.test não encontrado.\\nTestes não podem rodar sem um banco de dados dedicado para testes.\\nCrie o .env.test com a DATABASE_URL do banco de testes antes de continuar.\\n');process.exit(1)}\"",
     "test": "jest --passWithNoTests"
@@ -28,9 +29,9 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.892.0",
     "@aws-sdk/s3-request-presigner": "^3.892.0",
-    "@mercadopago/sdk-js": "^0.0.3",
     "@nestjs/jwt": "^11.0.0",
     "@nestjs/passport": "^11.0.5",
+    "@prisma/client": "^6.19.2",
     "axios": "^1.11.0",
     "bcrypt": "^5.1.1",
     "bcryptjs": "^3.0.2",
@@ -44,7 +45,6 @@
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
-    "mercadopago": "^2.9.0",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "passport": "^0.7.0",
@@ -52,15 +52,14 @@
     "pdf-parse": "^1.1.1",
     "pdf2table": "^0.0.2",
     "pdfkit": "^0.17.1",
+    "prisma": "^6.19.2",
     "puppeteer": "^24.19.0",
     "sharp": "^0.34.3",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "tesseract.js": "^6.0.1",
     "uuid": "^13.0.0",
-    "zod": "^4.0.5",
-    "@prisma/client": "^6.19.2",
-    "prisma": "^6.19.2"
+    "zod": "^4.0.5"
   },
   "devDependencies": {
     "@types/bcrypt": "^5.0.2",
