@@ -512,4 +512,142 @@ router.get("/alerts", controller.getOperationalAlerts as RequestHandler);
  */
 router.get("/logistics", controller.getLogisticsOverview as RequestHandler);
 
+/**
+ * @swagger
+ * /dashboard/financial:
+ *   get:
+ *     summary: Controle Financeiro — saldo vinculado, liberado, pendente, inadimplência, operações críticas, evolução e performance por parceiro
+ *     description: >
+ *       Considera vendas com createdAt no período (mesmo critério do Pipeline), fora Canceladas/Recusadas,
+ *       com os filtros produto/comprador/vendedor/parceiro aplicados. Cada venda cai em um único balde de recurso
+ *       (as fatias de situacaoRecursos somam totalGerenciado): recebido nas etapas 9-10 = liberado (repasse líquido,
+ *       descontada a taxa da plataforma de regras.taxaPlataformaPercent — aproximação até o repasse ser modelado);
+ *       recebido antes da etapa 9 = saldo vinculado; em aberto = inadimplente (parte coberta por cobrança pendente
+ *       vencida há mais de regras.diasParaVencimento dias) ou pendente (resto).
+ *       operacoesBloqueadas/gargalos.bloqueadas/gargalos.pagamentoVencido usam a mesma regra de pagamento vencido
+ *       do Pipeline e dos Alertas. vencimento é aproximado (criação da cobrança + diasParaVencimento) até existir
+ *       Payment.dueDate; variacaoMesAnterior é sempre null até existir Payment.confirmedAt. semTermoAditivo é sempre 0
+ *       (sem campo no schema). evolucao: sempre os últimos 12 meses (previsto = valor contratado por plannedDeliveryDate;
+ *       realizado = recebido por mês de confirmação), ignora startDate/endDate. performancePorParceiro: vendedores,
+ *       com faturamento/recebido rateados pela participação de cada vendedor nos produtos da venda (top 5 + Outros).
+ *       resumoPagamento: regra única 30/70 — porFase separa entrada (down_payment), saldo (final_payment) e integral (full).
+ *     tags: [Dashboard]
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - { in: query, name: startDate, schema: { type: string, format: date-time } }
+ *       - { in: query, name: endDate, schema: { type: string, format: date-time } }
+ *       - { in: query, name: parceiro, schema: { type: string, format: uuid }, description: Comprador OU vendedor da venda }
+ *       - { in: query, name: produto, schema: { type: string, format: uuid } }
+ *       - { in: query, name: comprador, schema: { type: string, format: uuid } }
+ *       - { in: query, name: vendedor, schema: { type: string, format: uuid } }
+ *       - { in: query, name: limit, schema: { type: integer, default: 10, maximum: 200 }, description: Itens de operacoesCriticas }
+ *     responses:
+ *       200:
+ *         description: Indicadores financeiros do período
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 generatedAt: { type: string, format: date-time }
+ *                 regras:
+ *                   type: object
+ *                   properties:
+ *                     taxaPlataformaPercent: { type: number, example: 5 }
+ *                     diasParaVencimento: { type: integer, example: 3 }
+ *                 counters:
+ *                   type: object
+ *                   properties:
+ *                     saldoVinculado: { type: number, example: 350000 }
+ *                     valorLiberado: { type: number, example: 1200000 }
+ *                     valorPendente: { type: number, example: 180000 }
+ *                     inadimplencia: { type: number, example: 25000 }
+ *                     operacoesBloqueadas: { type: integer, example: 6 }
+ *                     variacaoMesAnterior: { type: object, nullable: true, example: null }
+ *                 situacaoRecursos:
+ *                   type: object
+ *                   properties:
+ *                     totalGerenciado: { type: number, example: 1755000 }
+ *                     slices:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           key: { type: string, enum: [liberado, vinculado, pendente, inadimplente] }
+ *                           label: { type: string, example: "Liberado" }
+ *                           valor: { type: number, example: 1200000 }
+ *                           percentual: { type: number, example: 60 }
+ *                 taxaPlataforma: { type: number, example: 63157.89 }
+ *                 operacoesCriticas:
+ *                   type: object
+ *                   properties:
+ *                     total: { type: integer, example: 14 }
+ *                     limit: { type: integer, example: 10 }
+ *                     items:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id: { type: string, format: uuid }
+ *                           orderNumber: { type: integer, example: 27 }
+ *                           comprador: { type: string, example: "Exportador X" }
+ *                           valor: { type: number, example: 100000 }
+ *                           situacao: { type: string, enum: [Inadimplente, Aguardando Pagamento, Parcial] }
+ *                           vencimento: { type: string, format: date-time, nullable: true }
+ *                 gargalos:
+ *                   type: object
+ *                   properties:
+ *                     aguardandoPagamento: { type: integer, example: 11 }
+ *                     semTermoAditivo: { type: integer, example: 0 }
+ *                     bloqueadas: { type: integer, example: 6 }
+ *                     pagamentoVencido: { type: integer, example: 6 }
+ *                 evolucao:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       month: { type: string, example: "2026-07" }
+ *                       label: { type: string, example: "jul. de 2026" }
+ *                       previsto: { type: number, example: 500000 }
+ *                       realizado: { type: number, example: 300000 }
+ *                 performancePorParceiro:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id: { type: string, format: uuid, nullable: true, description: null no bucket "Outros Parceiros" }
+ *                       nome: { type: string, example: "COOMANGA" }
+ *                       operacoes: { type: integer, example: 15 }
+ *                       faturamento: { type: number, example: 450000 }
+ *                       recebido: { type: number, example: 450000 }
+ *                       percentualRecebido: { type: number, example: 100 }
+ *                 resumoPagamento:
+ *                   type: object
+ *                   properties:
+ *                     valorTotal: { type: number, example: 1755000 }
+ *                     recebido: { type: number, example: 1550000 }
+ *                     aReceber: { type: number, example: 205000 }
+ *                     percentualRecebido: { type: number, example: 88.3 }
+ *                     porFase:
+ *                       type: object
+ *                       properties:
+ *                         entrada: { type: number, example: 520000 }
+ *                         saldo: { type: number, example: 1030000 }
+ *                         integral: { type: number, example: 0 }
+ *                 embarque:
+ *                   type: object
+ *                   properties:
+ *                     aptas: { type: integer, example: 8 }
+ *                     aguardandoPagamento: { type: integer, example: 11 }
+ *                     bloqueadas: { type: integer, example: 6 }
+ *                 filterOptions:
+ *                   type: object
+ *                   description: produtos/compradores/vendedores/parceiros ({ id, name }) do período; tiposOperacao sempre [].
+ *       400: { description: Parâmetro inválido (limit, startDate ou endDate) }
+ *       401: { description: Não autenticado }
+ *       403: { description: Acesso restrito a administradores }
+ */
+router.get("/financial", controller.getFinancialOverview as RequestHandler);
+
 export default router;
