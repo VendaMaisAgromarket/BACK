@@ -17,6 +17,24 @@ function extractAsaasErrorMessage(error: any, fallback: string): string {
     return error?.response?.data?.errors?.[0]?.description || error?.message || fallback;
 }
 
+/**
+ * Prefixos de erros de negócio que o controller converte em 409 (handleKnownPaymentErrors).
+ * Os métodos de criação precisam relançá-los intactos no catch externo — senão caem no tratamento
+ * de erro do gateway (extractAsaasErrorMessage + log de falha) junto com erros reais do Asaas.
+ * Lista única para o service e o controller não divergirem quando surgir um prefixo novo.
+ */
+export const KNOWN_PAYMENT_ERROR_PREFIXES = [
+    'FINAL_PAYMENT_BLOCKED:',
+    'FINAL_BOLETO_BLOCKED:',
+    'DUPLICATE_PAYMENT_ATTEMPT:',
+    'PAYMENT_ALREADY_COMPLETED:',
+] as const;
+
+export function findKnownPaymentErrorPrefix(error: unknown): string | undefined {
+    const message = error instanceof Error ? error.message : undefined;
+    return KNOWN_PAYMENT_ERROR_PREFIXES.find(prefix => message?.startsWith(prefix));
+}
+
 /** Código de erro do Prisma para violação de constraint única (corrida concorrente detectada no banco). */
 const PRISMA_UNIQUE_VIOLATION = 'P2002';
 
@@ -127,10 +145,32 @@ export class PaymentService {
      * Se o registro encontrado ainda não tem `asaas_payment_id` (reserva de uma requisição
      * concorrente que ainda não terminou de falar com o Asaas), não há nada para reaproveitar
      * ainda — quem chamar deve tratar isso como "tente novamente", nunca tentar reusar.
+     *
+     * Linhas legadas do Mercado Pago (billingType nulo) seguem a mesma regra do índice único
+     * parcial (migration payment_active_attempt_index_filtered, que só cobre billingType NOT NULL):
+     * - legado 'pending' é ignorado: é uma tentativa abandonada que não tem como ser reaproveitada
+     *   no Asaas, e não pode travar a criação de uma cobrança nova;
+     * - legado 'completed' continua sendo encontrado: a parcela já foi paga, e ignorá-lo permitiria
+     *   cobrar o comprador de novo (calculateDownPaymentAmount não checa downPaymentCompleted).
+     *   reuseOrRetrySignal transforma isso em PAYMENT_ALREADY_COMPLETED.
+     *
+     * 'completed' tem prioridade sobre 'pending' (duas consultas, não um findFirst por createdAt):
+     * como o índice ignora billingType nulo, um legado 'completed' pode coexistir com uma cobrança
+     * Asaas 'pending' da mesma parcela — ex.: o legado estava 'pending' (ignorado), a cobrança Asaas
+     * foi criada, e depois um admin marcou o legado como pago via PATCH /payment/:id. Ordenar só por
+     * data reaproveitaria a cobrança pendente, mais nova, mantendo um segundo pagamento disponível.
+     * A cobrança pendente que sobra no Asaas precisa ser cancelada manualmente — esse estado aparece
+     * em scripts/check-payment-active-duplicates.ts.
      */
     private async findExistingAttempt(saleId: string, phase: PaymentPhase) {
+        const completed = await this.prisma.payment.findFirst({
+            where: { saleId, phase, status: 'completed' },
+            orderBy: { createdAt: 'desc' },
+        });
+        if (completed) return completed;
+
         return this.prisma.payment.findFirst({
-            where: { saleId, phase, status: { in: ['pending', 'completed'] } },
+            where: { saleId, phase, status: 'pending', billingType: { not: null } },
             orderBy: { createdAt: 'desc' },
         });
     }
@@ -141,6 +181,10 @@ export class PaymentService {
      * tentar novamente em breve se for apenas uma reserva em andamento de outra requisição.
      */
     private async reuseOrRetrySignal(existing: Payment, phase: PaymentPhase): Promise<any> {
+        // Só um pagamento legado 'completed' chega aqui com billingType nulo (ver findExistingAttempt).
+        if (existing.billingType === null) {
+            throw new Error('PAYMENT_ALREADY_COMPLETED:Esta parcela já foi paga (pagamento anterior à migração para o Asaas).');
+        }
         if (!existing.asaas_payment_id) {
             throw new Error('DUPLICATE_PAYMENT_ATTEMPT:Uma cobrança para esta venda/fase já está sendo criada. Tente novamente em alguns segundos.');
         }
@@ -237,7 +281,7 @@ export class PaymentService {
 
     /**
      * Reserva localmente a tentativa de pagamento ANTES de chamar o Asaas. O índice único
-     * parcial do banco (saleId+phase+billingType, para status pending/completed) garante que
+     * parcial do banco (saleId+phase, para status pending/completed e billingType NOT NULL) garante que
      * só uma requisição concorrente consiga reservar a mesma combinação — a perdedora recebe
      * o erro aqui e NUNCA chega a criar uma cobrança remota, então não existe cenário de
      * cobrança órfã no Asaas por causa de uma corrida entre duas requisições.
@@ -356,7 +400,7 @@ export class PaymentService {
                 throw innerError;
             }
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar fatura do Asaas');
             console.error(`[createPreference] Erro ao criar fatura para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -528,7 +572,7 @@ export class PaymentService {
                 throw innerError;
             }
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento PIX');
             console.error(`[createPixPayment] Erro ao criar pagamento PIX para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -641,7 +685,7 @@ export class PaymentService {
 
             return await this.createBoletoCharge({ ...params, amount, phase });
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento com boleto');
             console.error(`[createBoletoPayment] Erro ao criar boleto para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -761,7 +805,7 @@ export class PaymentService {
                 throw innerError;
             }
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao processar pagamento com cartão de crédito');
             console.error(`[createCreditCardPayment] Erro ao criar pagamento em cartão para venda ${params.saleId}:`, message);
             throw new Error(message);
