@@ -153,13 +153,15 @@ model Payment {
   sale          SaleData      @relation(fields: [saleId], references: [id])
   paymentMethod PaymentMethod @relation(fields: [paymentMethodId], references: [id])
 
-  // NOTA: existe um índice único PARCIAL em (saleId, phase) — SEM billingType — para status
-  // IN ('pending','completed'), criado via SQL manual nas migrations
-  // add_payment_active_attempt_unique_index + fix_payment_active_attempt_unique_index.
-  // A sintaxe do Prisma não suporta índice único condicional (WHERE), então não aparece aqui
-  // como @@unique. A invariante é "uma tentativa ativa por venda+fase", independente do meio
-  // de pagamento — billingType foi removido da chave porque permitia duas cobranças ativas
-  // simultâneas pra mesma parcela via endpoints diferentes (ex.: /pix e /boleto ao mesmo tempo).
+  // NOTA: existe um índice único PARCIAL em (saleId, phase) — SEM billingType na chave — para
+  // status IN ('pending','completed') AND billingType IS NOT NULL, criado via SQL manual nas
+  // migrations add_payment_active_attempt_unique_index + fix_payment_active_attempt_unique_index +
+  // payment_active_attempt_index_filtered. A sintaxe do Prisma não suporta índice único condicional
+  // (WHERE), então não aparece aqui como @@unique. A invariante é "uma tentativa ativa por
+  // venda+fase", independente do meio de pagamento — billingType foi removido da chave porque
+  // permitia duas cobranças ativas simultâneas pra mesma parcela via endpoints diferentes (ex.:
+  // /pix e /boleto ao mesmo tempo). Linhas legadas do Mercado Pago (billingType nulo) ficam fora
+  // do índice; PaymentService.findExistingAttempt aplica a regra correspondente na aplicação.
   // Não remover essas migrations ao rodar `prisma migrate dev`/`db push`.
 }
 
@@ -224,6 +226,7 @@ model SaleData {
   conformityCertifier ConformityCertifier?
   operationDocuments  OperationDocument[]
   saleContract        SaleContract?
+  addenda             SaleAddendum[]
 }
 
 model BoughtProduct {
@@ -351,6 +354,25 @@ model ConformityCertifier {
   createdAt    DateTime  @default(now()) @map("created_at")
 
   sale SaleData @relation(fields: [saleId], references: [id])
+}
+
+/// Termo aditivo: diferença de valor do contrato gerada por um ajuste pós-contrato (hoje só a pesagem).
+/// Registro automático, sem aceite das partes. `difference` tem sinal: positivo = acréscimo, negativo = redução.
+/// Guarda o total original porque registerManualWeight sobrescreve BoughtProduct.value com o valor pesado.
+model SaleAddendum {
+  id               String   @id @default(uuid())
+  saleId           String   @map("sale_id")
+  kind             String   @default("weight_adjustment")
+  originalTotal    Decimal  @map("original_total") @db.Decimal(12, 2)
+  adjustedTotal    Decimal  @map("adjusted_total") @db.Decimal(12, 2)
+  difference       Decimal  @db.Decimal(12, 2)
+  weightKg         Decimal? @map("weight_kg") @db.Decimal(10, 2)
+  weightDocumentId String?  @map("weight_document_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  sale SaleData @relation(fields: [saleId], references: [id])
+
+  @@unique([saleId, kind])
 }
 
 model OperationDocument {

@@ -1,6 +1,6 @@
 import { RequestHandler, Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
-import { PaymentService } from './payment.service';
+import { PaymentService, findKnownPaymentErrorPrefix } from './payment.service';
 import { SaleService } from '../sales/sales.service';
 
 const prisma = new PrismaClient();
@@ -48,8 +48,7 @@ function validateCreditCardPayload(creditCard: any, creditCardHolderInfo: any, i
 
 /** Mapeia os erros de bloqueio/conflito lançados pelo service para a resposta HTTP 409 correta. */
 function handleKnownPaymentErrors(error: any, res: Response): boolean {
-    const prefixes = ['FINAL_PAYMENT_BLOCKED:', 'FINAL_BOLETO_BLOCKED:', 'DUPLICATE_PAYMENT_ATTEMPT:'];
-    const prefix = prefixes.find(p => error.message?.startsWith(p));
+    const prefix = findKnownPaymentErrorPrefix(error);
     if (!prefix) return false;
     const code = prefix.slice(0, -1);
     res.status(409).json({ error: error.message.split(':').slice(1).join(':'), code });

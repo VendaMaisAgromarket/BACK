@@ -1,4 +1,5 @@
 import { Request, Response, RequestHandler } from "express";
+import { logger } from "../../lib/logger";
 import { DashboardService, ALERT_CATEGORIAS, ALERT_CRITICIDADES, AlertCategoria, AlertCriticidade } from "./dashboard.service";
 
 const service = new DashboardService();
@@ -154,6 +155,37 @@ export class DashboardController {
     } catch (error: any) {
       console.error(error);
       res.status(500).json({ error: "Failed to load logistics overview" });
+    }
+  };
+
+  public getFinancialOverview: RequestHandler = async (req: Request, res: Response): Promise<void> => {
+    try {
+      const limit = parsePositiveIntParam(req.query.limit);
+      const startDate = parseDateParam(req.query.startDate);
+      const endDate = parseDateParam(req.query.endDate);
+
+      if (limit === "invalid") {
+        res.status(400).json({ error: "limit deve ser um número inteiro positivo" });
+        return;
+      }
+      if (startDate === "invalid" || endDate === "invalid") {
+        res.status(400).json({ error: "startDate e endDate devem ser datas válidas (ISO 8601)" });
+        return;
+      }
+
+      const result = await service.getFinancialOverview({
+        limit,
+        startDate,
+        endDate,
+        parceiroId: parseOptionalStringParam(req.query.parceiro),
+        produtoId: parseOptionalStringParam(req.query.produto),
+        compradorId: parseOptionalStringParam(req.query.comprador),
+        vendedorId: parseOptionalStringParam(req.query.vendedor),
+      });
+      res.status(200).json(result);
+    } catch (error: unknown) {
+      logger.error(error);
+      res.status(500).json({ error: "Failed to load financial overview" });
     }
   };
 }

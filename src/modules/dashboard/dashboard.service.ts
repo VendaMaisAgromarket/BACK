@@ -1,5 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import { calculatePipelineStage, PIPELINE_STAGES } from "../../lib/pipelineStage";
+import { PLATFORM_FEE_PERCENT, splitReleasedAmount } from "../../lib/financialRules";
 
 interface MonthBucket {
   key: string; // "2026-07"
@@ -390,13 +391,36 @@ function pagamentoVencidoWhere(overdueCutoff: Date, extra: Record<string, unknow
   };
 }
 
+/**
+ * "Sem termo aditivo": venda pesada que recalculou o contrato (adjustedContractTotal) mas não tem o
+ * registro SaleAddendum. Desde a migration add_sale_addendum o registro é criado na própria pesagem,
+ * então isso só pega vendas pesadas antes dela (ou um registro perdido).
+ */
+function semTermoAditivoWhere(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    AND: [
+      { weightDocumentId: { not: null }, adjustedContractTotal: { not: null }, addenda: { none: {} }, status: ACTIVE_SALE_STATUS_FILTER },
+      extra,
+    ],
+  };
+}
+
 /** Filtra por comprador OU vendedor da venda — usado pelo filtro "Parceiro" dos Alertas Operacionais. */
 function buildParceiroWhere(parceiroId?: string): Record<string, unknown> {
   if (!parceiroId) return {};
   return { OR: [{ buyerId: parceiroId }, { boughtProducts: { some: { product: { sellerId: parceiroId } } } }] };
 }
 
-export const ALERT_CATEGORIAS = ["Financeiro", "Documentação", "Logística", "Contratual", "Outros"] as const;
+/** Opções do filtro "Parceiro": compradores + vendedores do catálogo, sem duplicar quem é os dois. */
+function mergeParceiroOptions(catalog: Pick<ExecutiveFilterOptions, "compradores" | "vendedores">): FilterOption[] {
+  const parceirosMap = new Map<string, string>();
+  for (const p of [...catalog.compradores, ...catalog.vendedores]) parceirosMap.set(p.id, p.name);
+  return [...parceirosMap.entries()]
+    .map(([id, name]) => ({ id, name }))
+    .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+}
+
+export const ALERT_CATEGORIAS =["Financeiro", "Documentação", "Logística", "Contratual", "Outros"] as const;
 export type AlertCategoria = (typeof ALERT_CATEGORIAS)[number];
 
 export const ALERT_CRITICIDADES = ["Crítico", "Médio", "Baixo"] as const;
@@ -466,7 +490,7 @@ export interface OperationalAlertCounts {
   entregaAtrasada: number;
   /** Mesma regra/definição de "Bloqueada" do Pipeline — ver ALERT_RULE_META/pagamentoVencidoWhere. */
   bloqueadas: number;
-  /** Sempre 0 — não há campo no schema pra "termo aditivo". Ver resumo de pendência entregue ao time. */
+  /** Vendas pesadas sem registro de termo aditivo — ver semTermoAditivoWhere. Contador informativo, não vira item da lista. */
   semTermoAditivo: number;
 }
 
@@ -546,6 +570,91 @@ export interface LogisticsOverview {
   averageDelayDays: number | null;
   byBuyer: LogisticsPartyPerformance[];
   bySeller: LogisticsPartyPerformance[];
+}
+
+const DEFAULT_CRITICAL_LIST_LIMIT = 10;
+const MAX_CRITICAL_LIST_LIMIT = 200;
+
+export type FinancialSituacao = "Inadimplente" | "Aguardando Pagamento" | "Parcial";
+
+export interface FinancialFilters extends SaleFilters, PipelineDateFilter {
+  parceiroId?: string;
+  limit?: number;
+}
+
+export interface FinancialCounters {
+  saldoVinculado: number;
+  /** Repasse líquido ao vendedor — aproximação, ver src/lib/financialRules.ts. */
+  valorLiberado: number;
+  valorPendente: number;
+  inadimplencia: number;
+  operacoesBloqueadas: number;
+  /** Sempre null até existir Payment.confirmedAt — ver comentário em getFinancialOverview. */
+  variacaoMesAnterior: null;
+}
+
+export interface FinancialResourceSlice {
+  key: "liberado" | "vinculado" | "pendente" | "inadimplente";
+  label: string;
+  valor: number;
+  percentual: number;
+}
+
+export interface FinancialCriticalItem {
+  id: string;
+  orderNumber: number;
+  comprador: string;
+  valor: number;
+  situacao: FinancialSituacao;
+  /** Aproximado (criação da cobrança + PENDING_PAYMENT_OVERDUE_DAYS) até existir Payment.dueDate; null sem cobrança gerada. */
+  vencimento: string | null;
+}
+
+export interface FinancialPartnerPerformance {
+  id: string | null;
+  nome: string;
+  operacoes: number;
+  faturamento: number;
+  recebido: number;
+  percentualRecebido: number;
+}
+
+export interface FinancialPaymentSummary {
+  valorTotal: number;
+  recebido: number;
+  aReceber: number;
+  percentualRecebido: number;
+  /** Quebra do recebido por parcela da regra 30/70 (down_payment / final_payment; full = pagamento integral). */
+  porFase: { entrada: number; saldo: number; integral: number };
+}
+
+/** Termos aditivos (diferença do contrato após a pesagem) das vendas do período. */
+export interface FinancialAddendumSummary {
+  quantidade: number;
+  /** Soma das diferenças positivas (contrato aumentou). */
+  acrescimo: number;
+  /** Soma das diferenças negativas, com sinal (ex.: -1200). */
+  reducao: number;
+  /** acrescimo + reducao. */
+  saldoLiquido: number;
+  /** Vendas pesadas com contrato recalculado mas sem registro — ver semTermoAditivoWhere. */
+  semRegistro: number;
+}
+
+export interface FinancialOverview {
+  generatedAt: string;
+  regras: { taxaPlataformaPercent: number; diasParaVencimento: number };
+  counters: FinancialCounters;
+  situacaoRecursos: { slices: FinancialResourceSlice[]; totalGerenciado: number };
+  taxaPlataforma: number;
+  operacoesCriticas: { items: FinancialCriticalItem[]; total: number; limit: number };
+  gargalos: { aguardandoPagamento: number; semTermoAditivo: number; bloqueadas: number; pagamentoVencido: number };
+  aditivos: FinancialAddendumSummary;
+  evolucao: MonthlyValue[];
+  performancePorParceiro: FinancialPartnerPerformance[];
+  resumoPagamento: FinancialPaymentSummary;
+  embarque: { aptas: number; aguardandoPagamento: number; bloqueadas: number };
+  filterOptions: ExecutiveFilterOptions & { parceiros: FilterOption[] };
 }
 
 export class DashboardService {
@@ -1435,8 +1544,8 @@ export class DashboardService {
 
   /**
    * Alertas Operacionais — 4 regras reais (semPagamentoAntesColheita, documentosPendentes,
-   * entregaAtrasada, pagamentoVencido) + semTermoAditivo em standby (sempre 0 — ver resumo de
-   * pendência entregue ao time). categoria/criticidade filtram QUAIS regras entram na conta (fixas por
+   * entregaAtrasada, pagamentoVencido) + semTermoAditivo como contador avulso (semTermoAditivoWhere,
+   * não entra em criticos/medios nem na lista — ainda sem categoria/criticidade definidas). categoria/criticidade filtram QUAIS regras entram na conta (fixas por
    * tipo de regra, não por venda); período/parceiro filtram as vendas de cada regra.
    * saudeOperacionalPercent é calculado por computeSaudeOperacionalPercent (null só quando não há
    * nenhuma operação ativa no escopo filtrado — ver o comentário daquele método).
@@ -1472,13 +1581,14 @@ export class DashboardService {
       activeRules.map(async (rule) => [rule, await this.fetchAlertTriggerRows(rule, ruleWhere[rule])] as const)
     );
     const openRowsByRule = new Map(openRowsEntries);
+    const semTermoAditivoCount = await this.prisma.saleData.count({ where: semTermoAditivoWhere(extraWhere) });
 
     const counts: OperationalAlertCounts = {
       semPagamentoAntesColheita: openRowsByRule.get("semPagamentoAntesColheita")?.length ?? 0,
       documentosPendentes: openRowsByRule.get("documentosPendentes")?.length ?? 0,
       entregaAtrasada: openRowsByRule.get("entregaAtrasada")?.length ?? 0,
       bloqueadas: openRowsByRule.get("pagamentoVencido")?.length ?? 0,
-      semTermoAditivo: 0,
+      semTermoAditivo: semTermoAditivoCount,
     };
 
     let criticos = 0;
@@ -1554,11 +1664,7 @@ export class DashboardService {
       .filter((item): item is OperationalAlertItem => item !== null);
 
     const filterCatalog = await this.getFilterCatalog(dateWhere);
-    const parceirosMap = new Map<string, string>();
-    for (const p of [...filterCatalog.compradores, ...filterCatalog.vendedores]) parceirosMap.set(p.id, p.name);
-    const parceiros = [...parceirosMap.entries()]
-      .map(([id, name]) => ({ id, name }))
-      .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+    const parceiros = mergeParceiroOptions(filterCatalog);
 
     return {
       counters: { criticos, medios, resolvidos, bloqueadas: counts.bloqueadas, saudeOperacionalPercent },
@@ -1652,5 +1758,313 @@ export class DashboardService {
       byBuyer: toPerformanceList(buyerStats),
       bySeller: toPerformanceList(sellerStats),
     };
+  }
+
+  /**
+   * Controle Financeiro. Um único scan das vendas do período (createdAt, mesmo critério do Pipeline),
+   * com os filtros produto/comprador/vendedor/parceiro, reaproveitando a etapa do pipeline
+   * (calculatePipelineStage) e a regra de pagamento vencido (mesma de pagamentoVencidoWhere, avaliada em
+   * memória porque aqui precisamos do VALOR vencido, não só da contagem). Cancelado/Recusado (stage 0)
+   * ficam de fora de tudo.
+   *
+   * Cada venda ativa cai em exatamente um "balde" de recurso, então as fatias somam o total gerenciado:
+   * - recebido em vendas nas etapas 9-10 → liberado (repasse líquido; a retenção da plataforma vai em taxaPlataforma);
+   * - recebido em vendas antes da etapa 9 → saldo vinculado (mesma ideia do valorRetido da Visão Executiva);
+   * - em aberto (total do contrato - recebido) → inadimplente na parte coberta por cobrança vencida, pendente no resto.
+   *
+   * variacaoMesAnterior fica null: comparar com o mês anterior exige saber QUANDO cada pagamento foi
+   * confirmado, e hoje só existe Payment.updatedAt (muda também em estorno/cancelamento). Entra junto
+   * da migration de Payment.confirmedAt/dueDate.
+   */
+  async getFinancialOverview(filters: FinancialFilters = {}, now: Date = new Date()): Promise<FinancialOverview> {
+    const limit = Math.min(MAX_CRITICAL_LIST_LIMIT, Math.max(1, filters.limit ?? DEFAULT_CRITICAL_LIST_LIMIT));
+    const overdueCutoff = new Date(now.getTime() - PENDING_PAYMENT_OVERDUE_DAYS * 86_400_000);
+    const dateWhere = buildCreatedAtWhere(filters);
+    // AND em vez de spread: buildParceiroWhere usa OR — ver comentário dos predicados de alerta.
+    // O status entra no escopo compartilhado (não só no `stage === 0` do loop) porque getMonthlyPrevistoRecebido
+    // reusa este predicado — sem ele, Cancelado/Recusado vazavam em `evolucao`.
+    const scopeWhere = {
+      AND: [{ status: ACTIVE_SALE_STATUS_FILTER }, buildSaleFilterWhere(filters), buildParceiroWhere(filters.parceiroId)],
+    };
+
+    const [sales, evolucao, filterCatalog] = await Promise.all([
+      this.prisma.saleData.findMany({
+        where: { AND: [dateWhere, scopeWhere] },
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          createdAt: true,
+          statusChangedAt: true,
+          downPaymentCompleted: true,
+          paymentCompleted: true,
+          shippedAt: true,
+          arrivedAt: true,
+          actualDeliveryDate: true,
+          weightDocumentId: true,
+          transportValue: true,
+          adjustedContractTotal: true,
+          buyer: { select: { name: true } },
+          boughtProducts: {
+            select: { productId: true, value: true, product: { select: { sellerId: true, seller: { select: { name: true } } } } },
+          },
+          Payment: {
+            where: { status: { in: ["completed", "pending"] } },
+            select: { phase: true, status: true, amount: true, createdAt: true, updatedAt: true },
+          },
+          addenda: { select: { difference: true } },
+        },
+      }),
+      this.getMonthlyPrevistoRecebido(scopeWhere, now),
+      this.getFilterCatalog(dateWhere),
+    ]);
+
+    let grossReleased = 0;
+    let saldoVinculado = 0;
+    let valorPendente = 0;
+    let inadimplencia = 0;
+    let operacoesBloqueadas = 0;
+    let aguardandoPagamento = 0;
+    let aptas = 0;
+    let valorTotal = 0;
+    const porFase = { entrada: 0, saldo: 0, integral: 0 };
+    const aditivos = { quantidade: 0, acrescimo: 0, reducao: 0, semRegistro: 0 };
+    const criticalItems: (FinancialCriticalItem & { vencimentoDate: Date | null })[] = [];
+    const sellerTotals = new Map<string, { nome: string; operacoes: number; faturamento: number; recebido: number }>();
+
+    const dueDateOf = (payments: { createdAt: Date }[]): Date | null => {
+      if (payments.length === 0) return null;
+      const oldest = payments.reduce((min, p) => (p.createdAt < min ? p.createdAt : min), payments[0].createdAt);
+      return new Date(oldest.getTime() + PENDING_PAYMENT_OVERDUE_DAYS * 86_400_000);
+    };
+
+    for (const sale of sales) {
+      const stage = calculatePipelineStage(sale, now).stage;
+      if (stage === 0) continue;
+
+      const contractTotal = contractTotalOf(sale);
+      const completed = sale.Payment.filter((p) => p.status === "completed");
+      const pending = sale.Payment.filter((p) => p.status === "pending");
+      const recebido = completed.reduce((sum, p) => sum + p.amount, 0);
+      // paymentCompleted: false pelo mesmo motivo de pagamentoVencidoWhere (venda quitada com tentativa pending antiga).
+      const overduePending = sale.paymentCompleted ? [] : pending.filter((p) => p.createdAt < overdueCutoff);
+      const isOverdue = overduePending.length > 0;
+
+      valorTotal += contractTotal;
+      for (const addendum of sale.addenda) {
+        const difference = Number(addendum.difference);
+        aditivos.quantidade += 1;
+        if (difference >= 0) aditivos.acrescimo += difference;
+        else aditivos.reducao += difference;
+      }
+      // Mesma regra de semTermoAditivoWhere, avaliada em memória sobre o scan já feito.
+      if (sale.weightDocumentId && sale.adjustedContractTotal !== null && sale.addenda.length === 0) aditivos.semRegistro += 1;
+
+      for (const p of completed) {
+        if (p.phase === "down_payment") porFase.entrada += p.amount;
+        else if (p.phase === "final_payment") porFase.saldo += p.amount;
+        else porFase.integral += p.amount;
+      }
+
+      if (stage >= 9) grossReleased += recebido;
+      else saldoVinculado += recebido;
+
+      const emAberto = sale.paymentCompleted ? 0 : Math.max(0, contractTotal - recebido);
+      const vencido = Math.min(emAberto, overduePending.reduce((sum, p) => sum + p.amount, 0));
+      inadimplencia += vencido;
+      valorPendente += emAberto - vencido;
+
+      if (isOverdue) operacoesBloqueadas += 1;
+      if (stage === 1) aguardandoPagamento += 1;
+      if ((stage === 2 || stage === 3) && !isOverdue) aptas += 1;
+
+      // Parcial = entrada paga e cobrança do saldo (70%) já emitida, ainda sem confirmação.
+      const pendingFinal = pending.filter((p) => p.phase === "final_payment");
+      let situacao: FinancialSituacao | null = null;
+      let vencimentoDate: Date | null = null;
+      if (isOverdue) {
+        situacao = "Inadimplente";
+        vencimentoDate = dueDateOf(overduePending);
+      } else if (stage === 1) {
+        situacao = "Aguardando Pagamento";
+        vencimentoDate = dueDateOf(pending);
+      } else if (sale.downPaymentCompleted && !sale.paymentCompleted && pendingFinal.length > 0) {
+        situacao = "Parcial";
+        vencimentoDate = dueDateOf(pendingFinal);
+      }
+      if (situacao) {
+        criticalItems.push({
+          id: sale.id,
+          orderNumber: sale.orderNumber,
+          comprador: sale.buyer.name,
+          valor: round2(emAberto),
+          situacao,
+          vencimento: vencimentoDate ? vencimentoDate.toISOString() : null,
+          vencimentoDate,
+        });
+      }
+
+      // Pagamento é por venda, não por vendedor: faturamento/recebido são rateados pela participação de
+      // cada vendedor no valor dos produtos da venda (todas as linhas, para o rateio fechar em 100%).
+      const productsTotal = sale.boughtProducts.reduce((sum, bp) => sum + bp.value, 0);
+      if (productsTotal > 0) {
+        const valorPorVendedor = new Map<string, { nome: string; valor: number }>();
+        for (const bp of sale.boughtProducts) {
+          if (!boughtProductMatchesFilters(bp, filters)) continue;
+          const entry = valorPorVendedor.get(bp.product.sellerId) ?? { nome: bp.product.seller.name, valor: 0 };
+          entry.valor += bp.value;
+          valorPorVendedor.set(bp.product.sellerId, entry);
+        }
+        for (const [sellerId, { nome, valor }] of valorPorVendedor) {
+          const share = valor / productsTotal;
+          const entry = sellerTotals.get(sellerId) ?? { nome, operacoes: 0, faturamento: 0, recebido: 0 };
+          entry.operacoes += 1;
+          entry.faturamento += contractTotal * share;
+          entry.recebido += recebido * share;
+          sellerTotals.set(sellerId, entry);
+        }
+      }
+    }
+
+    const { sellerPayout, platformFee } = splitReleasedAmount(grossReleased);
+    const slicesRaw: Omit<FinancialResourceSlice, "percentual">[] = [
+      { key: "liberado", label: "Liberado", valor: sellerPayout },
+      { key: "vinculado", label: "Saldo Vinculado", valor: saldoVinculado },
+      { key: "pendente", label: "Pendente", valor: valorPendente },
+      { key: "inadimplente", label: "Inadimplente", valor: inadimplencia },
+    ];
+    const totalGerenciado = slicesRaw.reduce((sum, s) => sum + s.valor, 0);
+    const slices = slicesRaw.map((s) => ({
+      ...s,
+      valor: round2(s.valor),
+      percentual: totalGerenciado > 0 ? round1((s.valor / totalGerenciado) * 100) : 0,
+    }));
+
+    const SITUACAO_RANK: Record<FinancialSituacao, number> = { Inadimplente: 0, "Aguardando Pagamento": 1, Parcial: 2 };
+    criticalItems.sort(
+      (a, b) =>
+        SITUACAO_RANK[a.situacao] - SITUACAO_RANK[b.situacao] ||
+        (a.vencimentoDate?.getTime() ?? Infinity) - (b.vencimentoDate?.getTime() ?? Infinity) ||
+        a.orderNumber - b.orderNumber
+    );
+
+    const totalRecebido = porFase.entrada + porFase.saldo + porFase.integral;
+
+    return {
+      generatedAt: now.toISOString(),
+      regras: { taxaPlataformaPercent: PLATFORM_FEE_PERCENT, diasParaVencimento: PENDING_PAYMENT_OVERDUE_DAYS },
+      counters: {
+        saldoVinculado: round2(saldoVinculado),
+        valorLiberado: round2(sellerPayout),
+        valorPendente: round2(valorPendente),
+        inadimplencia: round2(inadimplencia),
+        operacoesBloqueadas,
+        variacaoMesAnterior: null,
+      },
+      situacaoRecursos: { slices, totalGerenciado: round2(totalGerenciado) },
+      taxaPlataforma: round2(platformFee),
+      operacoesCriticas: {
+        items: criticalItems.slice(0, limit).map(({ vencimentoDate: _vencimentoDate, ...item }) => item),
+        total: criticalItems.length,
+        limit,
+      },
+      gargalos: {
+        aguardandoPagamento,
+        semTermoAditivo: aditivos.semRegistro,
+        bloqueadas: operacoesBloqueadas,
+        // Hoje é a mesma regra de "bloqueadas" (pagamento vencido) — o Pipeline e os Alertas usam uma régua só.
+        pagamentoVencido: operacoesBloqueadas,
+      },
+      aditivos: {
+        quantidade: aditivos.quantidade,
+        acrescimo: round2(aditivos.acrescimo),
+        reducao: round2(aditivos.reducao),
+        saldoLiquido: round2(aditivos.acrescimo + aditivos.reducao),
+        semRegistro: aditivos.semRegistro,
+      },
+      evolucao,
+      performancePorParceiro: this.rankFinancialPartners(sellerTotals),
+      resumoPagamento: {
+        valorTotal: round2(valorTotal),
+        recebido: round2(totalRecebido),
+        aReceber: round2(Math.max(0, valorTotal - totalRecebido)),
+        percentualRecebido: valorTotal > 0 ? round1((totalRecebido / valorTotal) * 100) : 0,
+        porFase: { entrada: round2(porFase.entrada), saldo: round2(porFase.saldo), integral: round2(porFase.integral) },
+      },
+      embarque: { aptas, aguardandoPagamento, bloqueadas: operacoesBloqueadas },
+      filterOptions: { ...filterCatalog, tiposOperacao: [], parceiros: mergeParceiroOptions(filterCatalog) },
+    };
+  }
+
+  /**
+   * Previsto x Recebido dos últimos 12 meses (sempre 12, independente do período da página — igual ao
+   * mockup). Mesmo critério da série `receita` da Visão Executiva: previsto = valor contratado pelo mês de
+   * plannedDeliveryDate; recebido = Payment completed pelo mês de updatedAt (até existir confirmedAt).
+   * Diferente da Visão Executiva, exclui Cancelado/Recusado — o filtro de status vem no scopeWhere.
+   */
+  private async getMonthlyPrevistoRecebido(scopeWhere: Record<string, unknown>, now: Date): Promise<MonthlyValue[]> {
+    const months = buildLast12Months(now);
+    const windowStart = months[0].start;
+    const windowEnd = months[months.length - 1].end;
+
+    const [previstoSales, completedPayments] = await Promise.all([
+      this.prisma.saleData.findMany({
+        where: { AND: [{ plannedDeliveryDate: { gte: windowStart, lt: windowEnd } }, scopeWhere] },
+        select: { plannedDeliveryDate: true, transportValue: true, adjustedContractTotal: true, boughtProducts: { select: { value: true } } },
+      }),
+      this.prisma.payment.findMany({
+        where: { status: "completed", updatedAt: { gte: windowStart, lt: windowEnd }, sale: scopeWhere },
+        select: { amount: true, updatedAt: true },
+      }),
+    ]);
+
+    const previstoPorMes = new Map<string, number>();
+    for (const sale of previstoSales) {
+      const key = monthKey(sale.plannedDeliveryDate as Date);
+      previstoPorMes.set(key, (previstoPorMes.get(key) ?? 0) + contractTotalOf(sale));
+    }
+    const recebidoPorMes = new Map<string, number>();
+    for (const payment of completedPayments) {
+      const key = monthKey(payment.updatedAt);
+      recebidoPorMes.set(key, (recebidoPorMes.get(key) ?? 0) + payment.amount);
+    }
+
+    return months.map(({ key, label }) => ({
+      month: key,
+      label,
+      previsto: round2(previstoPorMes.get(key) ?? 0),
+      realizado: round2(recebidoPorMes.get(key) ?? 0),
+    }));
+  }
+
+  /** Top N vendedores por faturamento + "Outros" agregado (mesmo formato de rankWithOutros, com operações/recebido). */
+  private rankFinancialPartners(
+    totals: Map<string, { nome: string; operacoes: number; faturamento: number; recebido: number }>
+  ): FinancialPartnerPerformance[] {
+    const toRow = (id: string | null, e: { nome: string; operacoes: number; faturamento: number; recebido: number }) => ({
+      id,
+      nome: e.nome,
+      operacoes: e.operacoes,
+      faturamento: round2(e.faturamento),
+      recebido: round2(e.recebido),
+      percentualRecebido: e.faturamento > 0 ? round1((e.recebido / e.faturamento) * 100) : 0,
+    });
+
+    const sorted = [...totals.entries()].sort(([, a], [, b]) => b.faturamento - a.faturamento);
+    const result = sorted.slice(0, TOP_RANKING_SIZE).map(([id, e]) => toRow(id, e));
+    const rest = sorted.slice(TOP_RANKING_SIZE);
+    if (rest.length > 0) {
+      const outros = rest.reduce(
+        (acc, [, e]) => ({
+          nome: "Outros Parceiros",
+          operacoes: acc.operacoes + e.operacoes,
+          faturamento: acc.faturamento + e.faturamento,
+          recebido: acc.recebido + e.recebido,
+        }),
+        { nome: "Outros Parceiros", operacoes: 0, faturamento: 0, recebido: 0 }
+      );
+      result.push(toRow(null, outros));
+    }
+    return result;
   }
 }
