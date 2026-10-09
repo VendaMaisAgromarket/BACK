@@ -511,6 +511,21 @@ describe('PaymentService', () => {
       expect(prisma.payment.create).not.toHaveBeenCalled();
       expect(mockAsaasPost).not.toHaveBeenCalled();
     });
+
+    it.each([
+      ['createPixPayment', () => service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'c@teste.com' })],
+      ['createPreference', () => service.createPreference({ saleId: 'sale-1', paymentMethodId: 'pm-1', title: 't', unit_price: 1, quantity: 1, amount: 1 })],
+      ['createBoletoPayment', () => service.createBoletoPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 500 })],
+    ])('%s relança PAYMENT_ALREADY_COMPLETED intacto, sem tratá-lo como falha do gateway', async (_name, call) => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      prisma.payment.findFirst.mockResolvedValue(
+        buildPayment({ id: 'legacy-mp', status: 'completed', billingType: null, asaas_payment_id: null })
+      );
+
+      await expect(call()).rejects.toThrow('PAYMENT_ALREADY_COMPLETED:');
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
   });
 
   describe('createCreditCardPayment', () => {

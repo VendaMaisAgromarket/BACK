@@ -17,6 +17,24 @@ function extractAsaasErrorMessage(error: any, fallback: string): string {
     return error?.response?.data?.errors?.[0]?.description || error?.message || fallback;
 }
 
+/**
+ * Prefixos de erros de negócio que o controller converte em 409 (handleKnownPaymentErrors).
+ * Os métodos de criação precisam relançá-los intactos no catch externo — senão caem no tratamento
+ * de erro do gateway (extractAsaasErrorMessage + log de falha) junto com erros reais do Asaas.
+ * Lista única para o service e o controller não divergirem quando surgir um prefixo novo.
+ */
+export const KNOWN_PAYMENT_ERROR_PREFIXES = [
+    'FINAL_PAYMENT_BLOCKED:',
+    'FINAL_BOLETO_BLOCKED:',
+    'DUPLICATE_PAYMENT_ATTEMPT:',
+    'PAYMENT_ALREADY_COMPLETED:',
+] as const;
+
+export function findKnownPaymentErrorPrefix(error: unknown): string | undefined {
+    const message = error instanceof Error ? error.message : undefined;
+    return KNOWN_PAYMENT_ERROR_PREFIXES.find(prefix => message?.startsWith(prefix));
+}
+
 /** Código de erro do Prisma para violação de constraint única (corrida concorrente detectada no banco). */
 const PRISMA_UNIQUE_VIOLATION = 'P2002';
 
@@ -372,7 +390,7 @@ export class PaymentService {
                 throw innerError;
             }
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar fatura do Asaas');
             console.error(`[createPreference] Erro ao criar fatura para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -544,7 +562,7 @@ export class PaymentService {
                 throw innerError;
             }
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento PIX');
             console.error(`[createPixPayment] Erro ao criar pagamento PIX para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -657,7 +675,7 @@ export class PaymentService {
 
             return await this.createBoletoCharge({ ...params, amount, phase });
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento com boleto');
             console.error(`[createBoletoPayment] Erro ao criar boleto para venda ${params.saleId}:`, message);
             throw new Error(message);
@@ -777,7 +795,7 @@ export class PaymentService {
                 throw innerError;
             }
         } catch (error: any) {
-            if (error.message?.startsWith('FINAL_PAYMENT_BLOCKED:') || error.message?.startsWith('DUPLICATE_PAYMENT_ATTEMPT:')) throw error;
+            if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao processar pagamento com cartão de crédito');
             console.error(`[createCreditCardPayment] Erro ao criar pagamento em cartão para venda ${params.saleId}:`, message);
             throw new Error(message);
