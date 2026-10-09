@@ -153,14 +153,24 @@ export class PaymentService {
      * - legado 'completed' continua sendo encontrado: a parcela já foi paga, e ignorá-lo permitiria
      *   cobrar o comprador de novo (calculateDownPaymentAmount não checa downPaymentCompleted).
      *   reuseOrRetrySignal transforma isso em PAYMENT_ALREADY_COMPLETED.
+     *
+     * 'completed' tem prioridade sobre 'pending' (duas consultas, não um findFirst por createdAt):
+     * como o índice ignora billingType nulo, um legado 'completed' pode coexistir com uma cobrança
+     * Asaas 'pending' da mesma parcela — ex.: o legado estava 'pending' (ignorado), a cobrança Asaas
+     * foi criada, e depois um admin marcou o legado como pago via PATCH /payment/:id. Ordenar só por
+     * data reaproveitaria a cobrança pendente, mais nova, mantendo um segundo pagamento disponível.
+     * A cobrança pendente que sobra no Asaas precisa ser cancelada manualmente — esse estado aparece
+     * em scripts/check-payment-active-duplicates.ts.
      */
     private async findExistingAttempt(saleId: string, phase: PaymentPhase) {
+        const completed = await this.prisma.payment.findFirst({
+            where: { saleId, phase, status: 'completed' },
+            orderBy: { createdAt: 'desc' },
+        });
+        if (completed) return completed;
+
         return this.prisma.payment.findFirst({
-            where: {
-                saleId,
-                phase,
-                OR: [{ status: 'completed' }, { status: 'pending', billingType: { not: null } }],
-            },
+            where: { saleId, phase, status: 'pending', billingType: { not: null } },
             orderBy: { createdAt: 'desc' },
         });
     }

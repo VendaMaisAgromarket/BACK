@@ -454,9 +454,12 @@ describe('PaymentService', () => {
       // Antes, o índice único incluía billingType na chave, permitindo que /pix e /boleto
       // para a mesma venda/fase reservassem simultaneamente, gerando duas cobranças a pagar
       // para a mesma parcela. Agora a busca de tentativa existente não filtra por billingType.
-      prisma.payment.findFirst.mockResolvedValue(
-        buildPayment({ id: 'existing-pix-for-boleto', asaas_payment_id: 'pay_existing_pix', status: 'pending', billingType: 'PIX' })
-      );
+      // 1ª consulta (completed) vazia; 2ª (pending) acha o PIX.
+      prisma.payment.findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(
+          buildPayment({ id: 'existing-pix-for-boleto', asaas_payment_id: 'pay_existing_pix', status: 'pending', billingType: 'PIX' })
+        );
       mockAsaasGet
         .mockResolvedValueOnce({ data: { id: 'pay_existing_pix', status: 'PENDING' } })
         .mockResolvedValueOnce({ data: { payload: 'x', encodedImage: 'y', expirationDate: '2026-01-02' } });
@@ -469,15 +472,27 @@ describe('PaymentService', () => {
 
       expect(mockAsaasPost).not.toHaveBeenCalled();
       expect(result.paymentId).toBe('existing-pix-for-boleto');
-      expect(prisma.payment.findFirst).toHaveBeenCalledWith(
+      // Busca pendente sem filtrar por um billingType específico (só exclui o legado nulo).
+      expect(prisma.payment.findFirst).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          where: {
-            saleId: 'sale-1',
-            phase: 'full',
-            OR: [{ status: 'completed' }, { status: 'pending', billingType: { not: null } }],
-          },
+          where: { saleId: 'sale-1', phase: 'full', status: 'pending', billingType: { not: null } },
         })
       );
+    });
+
+    it('prioriza legado completed sobre cobrança Asaas pendente da mesma parcela — não reaproveita a cobrança pagável', async () => {
+      // Estado possível com o índice filtrado: legado pago (ex.: marcado por admin depois) + PIX Asaas pendente mais novo.
+      const legacyCompleted = buildPayment({ id: 'legacy-mp', status: 'completed', billingType: null, asaas_payment_id: null });
+      const asaasPending = buildPayment({ id: 'asaas-pix', status: 'pending', billingType: 'PIX', asaas_payment_id: 'pay_pix' });
+      prisma.payment.findFirst.mockImplementation((async (args: any) =>
+        args.where.status === 'completed' ? legacyCompleted : asaasPending) as any);
+
+      await expect(
+        service.createBoletoPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 500 })
+      ).rejects.toThrow('PAYMENT_ALREADY_COMPLETED:');
+
+      expect(mockAsaasGet).not.toHaveBeenCalled();
+      expect(prisma.payment.create).not.toHaveBeenCalled();
     });
 
     it('ignora tentativa legada pendente do Mercado Pago (billingType nulo) — mesmo recorte do índice único parcial', async () => {
@@ -492,9 +507,7 @@ describe('PaymentService', () => {
       await service.createBoletoPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 500 });
 
       expect(prisma.payment.findFirst).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({ OR: expect.arrayContaining([{ status: 'pending', billingType: { not: null } }]) }),
-        })
+        expect.objectContaining({ where: expect.objectContaining({ status: 'pending', billingType: { not: null } }) })
       );
       expect(mockAsaasPost).toHaveBeenCalled();
     });
