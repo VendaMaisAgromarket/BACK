@@ -1781,7 +1781,11 @@ export class DashboardService {
     const overdueCutoff = new Date(now.getTime() - PENDING_PAYMENT_OVERDUE_DAYS * 86_400_000);
     const dateWhere = buildCreatedAtWhere(filters);
     // AND em vez de spread: buildParceiroWhere usa OR — ver comentário dos predicados de alerta.
-    const scopeWhere = { AND: [buildSaleFilterWhere(filters), buildParceiroWhere(filters.parceiroId)] };
+    // O status entra no escopo compartilhado (não só no `stage === 0` do loop) porque getMonthlyPrevistoRecebido
+    // reusa este predicado — sem ele, Cancelado/Recusado vazavam em `evolucao`.
+    const scopeWhere = {
+      AND: [{ status: ACTIVE_SALE_STATUS_FILTER }, buildSaleFilterWhere(filters), buildParceiroWhere(filters.parceiroId)],
+    };
 
     const [sales, evolucao, filterCatalog] = await Promise.all([
       this.prisma.saleData.findMany({
@@ -1996,6 +2000,7 @@ export class DashboardService {
    * Previsto x Recebido dos últimos 12 meses (sempre 12, independente do período da página — igual ao
    * mockup). Mesmo critério da série `receita` da Visão Executiva: previsto = valor contratado pelo mês de
    * plannedDeliveryDate; recebido = Payment completed pelo mês de updatedAt (até existir confirmedAt).
+   * Diferente da Visão Executiva, exclui Cancelado/Recusado — o filtro de status vem no scopeWhere.
    */
   private async getMonthlyPrevistoRecebido(scopeWhere: Record<string, unknown>, now: Date): Promise<MonthlyValue[]> {
     const months = buildLast12Months(now);

@@ -501,6 +501,19 @@ export class SaleService {
         where: { saleId: id }
       });
 
+      // Filhos com FK restritiva criados ao longo da operação: termo aditivo e ticket de balança
+      // nascem juntos na pesagem (registerManualWeight), então os dois precisam sair — remover só o
+      // aditivo ainda deixaria a exclusão falhando pelo OperationDocument. Os arquivos no S3 não são apagados.
+      await tx.saleAddendum.deleteMany({
+        where: { saleId: id }
+      });
+      await tx.operationDocument.deleteMany({
+        where: { saleId: id }
+      });
+      await tx.conformityCertifier.deleteMany({
+        where: { saleId: id }
+      });
+
       // Por fim, deletar a venda
       return tx.saleData.delete({ where: { id } });
     });

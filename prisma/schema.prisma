@@ -153,13 +153,15 @@ model Payment {
   sale          SaleData      @relation(fields: [saleId], references: [id])
   paymentMethod PaymentMethod @relation(fields: [paymentMethodId], references: [id])
 
-  // NOTA: existe um índice único PARCIAL em (saleId, phase) — SEM billingType — para status
-  // IN ('pending','completed'), criado via SQL manual nas migrations
-  // add_payment_active_attempt_unique_index + fix_payment_active_attempt_unique_index.
-  // A sintaxe do Prisma não suporta índice único condicional (WHERE), então não aparece aqui
-  // como @@unique. A invariante é "uma tentativa ativa por venda+fase", independente do meio
-  // de pagamento — billingType foi removido da chave porque permitia duas cobranças ativas
-  // simultâneas pra mesma parcela via endpoints diferentes (ex.: /pix e /boleto ao mesmo tempo).
+  // NOTA: existe um índice único PARCIAL em (saleId, phase) — SEM billingType na chave — para
+  // status IN ('pending','completed') AND billingType IS NOT NULL, criado via SQL manual nas
+  // migrations add_payment_active_attempt_unique_index + fix_payment_active_attempt_unique_index +
+  // payment_active_attempt_index_filtered. A sintaxe do Prisma não suporta índice único condicional
+  // (WHERE), então não aparece aqui como @@unique. A invariante é "uma tentativa ativa por
+  // venda+fase", independente do meio de pagamento — billingType foi removido da chave porque
+  // permitia duas cobranças ativas simultâneas pra mesma parcela via endpoints diferentes (ex.:
+  // /pix e /boleto ao mesmo tempo). Linhas legadas do Mercado Pago (billingType nulo) ficam fora
+  // do índice; PaymentService.findExistingAttempt aplica a regra correspondente na aplicação.
   // Não remover essas migrations ao rodar `prisma migrate dev`/`db push`.
 }
 

@@ -48,7 +48,7 @@ function validateCreditCardPayload(creditCard: any, creditCardHolderInfo: any, i
 
 /** Mapeia os erros de bloqueio/conflito lançados pelo service para a resposta HTTP 409 correta. */
 function handleKnownPaymentErrors(error: any, res: Response): boolean {
-    const prefixes = ['FINAL_PAYMENT_BLOCKED:', 'FINAL_BOLETO_BLOCKED:', 'DUPLICATE_PAYMENT_ATTEMPT:'];
+    const prefixes = ['FINAL_PAYMENT_BLOCKED:', 'FINAL_BOLETO_BLOCKED:', 'DUPLICATE_PAYMENT_ATTEMPT:', 'PAYMENT_ALREADY_COMPLETED:'];
     const prefix = prefixes.find(p => error.message?.startsWith(p));
     if (!prefix) return false;
     const code = prefix.slice(0, -1);
