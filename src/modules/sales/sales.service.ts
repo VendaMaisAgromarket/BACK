@@ -734,6 +734,11 @@ export class SaleService {
     const adjustedContractTotal = adjustedProductsTotal !== null
       ? parseFloat((adjustedProductsTotal + Number(sale.transportValue)).toFixed(2))
       : null;
+    // Capturado ANTES da transação: logo abaixo BoughtProduct.value é sobrescrito com o valor pesado,
+    // e esse total original só sobrevive no termo aditivo.
+    const originalContractTotal = parseFloat(
+      (boughtProducts.reduce((sum, bp) => sum + bp.value, 0) + Number(sale.transportValue)).toFixed(2)
+    );
 
     return this.prisma.$transaction(async (tx) => {
       const doc = await tx.operationDocument.create({
@@ -756,6 +761,22 @@ export class SaleService {
         },
         include: { boughtProducts: true },
       });
+
+      // Termo aditivo automático: diferença com sinal (+ acréscimo / - redução). Só quando o peso
+      // gerou um novo total — unidade que não é de peso não recalcula o contrato, então não há aditivo.
+      const addendum = adjustedContractTotal !== null
+        ? await tx.saleAddendum.create({
+            data: {
+              saleId: params.saleId,
+              kind: 'weight_adjustment',
+              originalTotal: originalContractTotal,
+              adjustedTotal: adjustedContractTotal,
+              difference: parseFloat((adjustedContractTotal - originalContractTotal).toFixed(2)),
+              weightKg: params.weightKg,
+              weightDocumentId: doc.id,
+            },
+          })
+        : null;
 
       // Atualiza BoughtProduct.value usando a mesma fórmula de calculateWeightBasedTotal (peso × preço/unidade)
       if (adjustedProductsTotal !== null && boughtProducts.length > 0) {
@@ -787,6 +808,7 @@ export class SaleService {
         sale: updatedSale,
         adjustedContractTotal,
         weightCalculated: adjustedContractTotal !== null,
+        addendum,
       };
     });
   }

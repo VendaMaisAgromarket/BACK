@@ -391,6 +391,20 @@ function pagamentoVencidoWhere(overdueCutoff: Date, extra: Record<string, unknow
   };
 }
 
+/**
+ * "Sem termo aditivo": venda pesada que recalculou o contrato (adjustedContractTotal) mas não tem o
+ * registro SaleAddendum. Desde a migration add_sale_addendum o registro é criado na própria pesagem,
+ * então isso só pega vendas pesadas antes dela (ou um registro perdido).
+ */
+function semTermoAditivoWhere(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    AND: [
+      { weightDocumentId: { not: null }, adjustedContractTotal: { not: null }, addenda: { none: {} }, status: ACTIVE_SALE_STATUS_FILTER },
+      extra,
+    ],
+  };
+}
+
 /** Filtra por comprador OU vendedor da venda — usado pelo filtro "Parceiro" dos Alertas Operacionais. */
 function buildParceiroWhere(parceiroId?: string): Record<string, unknown> {
   if (!parceiroId) return {};
@@ -476,7 +490,7 @@ export interface OperationalAlertCounts {
   entregaAtrasada: number;
   /** Mesma regra/definição de "Bloqueada" do Pipeline — ver ALERT_RULE_META/pagamentoVencidoWhere. */
   bloqueadas: number;
-  /** Sempre 0 — não há campo no schema pra "termo aditivo". Ver resumo de pendência entregue ao time. */
+  /** Vendas pesadas sem registro de termo aditivo — ver semTermoAditivoWhere. Contador informativo, não vira item da lista. */
   semTermoAditivo: number;
 }
 
@@ -614,6 +628,19 @@ export interface FinancialPaymentSummary {
   porFase: { entrada: number; saldo: number; integral: number };
 }
 
+/** Termos aditivos (diferença do contrato após a pesagem) das vendas do período. */
+export interface FinancialAddendumSummary {
+  quantidade: number;
+  /** Soma das diferenças positivas (contrato aumentou). */
+  acrescimo: number;
+  /** Soma das diferenças negativas, com sinal (ex.: -1200). */
+  reducao: number;
+  /** acrescimo + reducao. */
+  saldoLiquido: number;
+  /** Vendas pesadas com contrato recalculado mas sem registro — ver semTermoAditivoWhere. */
+  semRegistro: number;
+}
+
 export interface FinancialOverview {
   generatedAt: string;
   regras: { taxaPlataformaPercent: number; diasParaVencimento: number };
@@ -622,6 +649,7 @@ export interface FinancialOverview {
   taxaPlataforma: number;
   operacoesCriticas: { items: FinancialCriticalItem[]; total: number; limit: number };
   gargalos: { aguardandoPagamento: number; semTermoAditivo: number; bloqueadas: number; pagamentoVencido: number };
+  aditivos: FinancialAddendumSummary;
   evolucao: MonthlyValue[];
   performancePorParceiro: FinancialPartnerPerformance[];
   resumoPagamento: FinancialPaymentSummary;
@@ -1516,8 +1544,8 @@ export class DashboardService {
 
   /**
    * Alertas Operacionais — 4 regras reais (semPagamentoAntesColheita, documentosPendentes,
-   * entregaAtrasada, pagamentoVencido) + semTermoAditivo em standby (sempre 0 — ver resumo de
-   * pendência entregue ao time). categoria/criticidade filtram QUAIS regras entram na conta (fixas por
+   * entregaAtrasada, pagamentoVencido) + semTermoAditivo como contador avulso (semTermoAditivoWhere,
+   * não entra em criticos/medios nem na lista — ainda sem categoria/criticidade definidas). categoria/criticidade filtram QUAIS regras entram na conta (fixas por
    * tipo de regra, não por venda); período/parceiro filtram as vendas de cada regra.
    * saudeOperacionalPercent é calculado por computeSaudeOperacionalPercent (null só quando não há
    * nenhuma operação ativa no escopo filtrado — ver o comentário daquele método).
@@ -1553,13 +1581,14 @@ export class DashboardService {
       activeRules.map(async (rule) => [rule, await this.fetchAlertTriggerRows(rule, ruleWhere[rule])] as const)
     );
     const openRowsByRule = new Map(openRowsEntries);
+    const semTermoAditivoCount = await this.prisma.saleData.count({ where: semTermoAditivoWhere(extraWhere) });
 
     const counts: OperationalAlertCounts = {
       semPagamentoAntesColheita: openRowsByRule.get("semPagamentoAntesColheita")?.length ?? 0,
       documentosPendentes: openRowsByRule.get("documentosPendentes")?.length ?? 0,
       entregaAtrasada: openRowsByRule.get("entregaAtrasada")?.length ?? 0,
       bloqueadas: openRowsByRule.get("pagamentoVencido")?.length ?? 0,
-      semTermoAditivo: 0,
+      semTermoAditivo: semTermoAditivoCount,
     };
 
     let criticos = 0;
@@ -1779,6 +1808,7 @@ export class DashboardService {
             where: { status: { in: ["completed", "pending"] } },
             select: { phase: true, status: true, amount: true, createdAt: true, updatedAt: true },
           },
+          addenda: { select: { difference: true } },
         },
       }),
       this.getMonthlyPrevistoRecebido(scopeWhere, now),
@@ -1794,6 +1824,7 @@ export class DashboardService {
     let aptas = 0;
     let valorTotal = 0;
     const porFase = { entrada: 0, saldo: 0, integral: 0 };
+    const aditivos = { quantidade: 0, acrescimo: 0, reducao: 0, semRegistro: 0 };
     const criticalItems: (FinancialCriticalItem & { vencimentoDate: Date | null })[] = [];
     const sellerTotals = new Map<string, { nome: string; operacoes: number; faturamento: number; recebido: number }>();
 
@@ -1816,6 +1847,15 @@ export class DashboardService {
       const isOverdue = overduePending.length > 0;
 
       valorTotal += contractTotal;
+      for (const addendum of sale.addenda) {
+        const difference = Number(addendum.difference);
+        aditivos.quantidade += 1;
+        if (difference >= 0) aditivos.acrescimo += difference;
+        else aditivos.reducao += difference;
+      }
+      // Mesma regra de semTermoAditivoWhere, avaliada em memória sobre o scan já feito.
+      if (sale.weightDocumentId && sale.adjustedContractTotal !== null && sale.addenda.length === 0) aditivos.semRegistro += 1;
+
       for (const p of completed) {
         if (p.phase === "down_payment") porFase.entrada += p.amount;
         else if (p.phase === "final_payment") porFase.saldo += p.amount;
@@ -1926,11 +1966,17 @@ export class DashboardService {
       },
       gargalos: {
         aguardandoPagamento,
-        // Sem campo no schema para termo aditivo — mesmo standby de OperationalAlertCounts.semTermoAditivo.
-        semTermoAditivo: 0,
+        semTermoAditivo: aditivos.semRegistro,
         bloqueadas: operacoesBloqueadas,
         // Hoje é a mesma regra de "bloqueadas" (pagamento vencido) — o Pipeline e os Alertas usam uma régua só.
         pagamentoVencido: operacoesBloqueadas,
+      },
+      aditivos: {
+        quantidade: aditivos.quantidade,
+        acrescimo: round2(aditivos.acrescimo),
+        reducao: round2(aditivos.reducao),
+        saldoLiquido: round2(aditivos.acrescimo + aditivos.reducao),
+        semRegistro: aditivos.semRegistro,
       },
       evolucao,
       performancePorParceiro: this.rankFinancialPartners(sellerTotals),

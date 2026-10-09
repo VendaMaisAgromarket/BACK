@@ -352,7 +352,8 @@ router.get("/pipeline", controller.getPipelineOverview as RequestHandler);
  *       counters.saudeOperacionalPercent: % de operações ATIVAS (etapa 1-9 do Pipeline) sem nenhum alerta
  *       das regras ativas no momento — (ativas sem alerta / total de ativas) × 100. null quando não há
  *       operação ativa no escopo filtrado. Não depende de histórico (ao contrário de counters.resolvidos).
- *       counts.semTermoAditivo: sempre 0 (standby — não há campo no schema pra "termo aditivo").
+ *       counts.semTermoAditivo: vendas pesadas (contrato recalculado) sem registro de termo aditivo (SaleAddendum) —
+ *       contador informativo, não entra em criticos/medios nem na lista.
  *       evolucaoMensal: últimos 6 meses corridos (fixo, independente de startDate/endDate) — mesma
  *       aproximação de resolvidos, mais criticos/medios bucketados pela data em que cada alerta ainda
  *       aberto começou (não é um histórico exato de quantos estavam abertos EM cada mês passado).
@@ -408,7 +409,7 @@ router.get("/pipeline", controller.getPipelineOverview as RequestHandler);
  *                     documentosPendentes: { type: integer, example: 3 }
  *                     entregaAtrasada: { type: integer, example: 2 }
  *                     bloqueadas: { type: integer, example: 6 }
- *                     semTermoAditivo: { type: integer, example: 0, description: "Sempre 0 — standby, ver descrição do endpoint" }
+ *                     semTermoAditivo: { type: integer, example: 0, description: "Vendas pesadas sem registro de termo aditivo" }
  *                 porCategoria:
  *                   type: array
  *                   items:
@@ -526,8 +527,10 @@ router.get("/logistics", controller.getLogisticsOverview as RequestHandler);
  *       vencida há mais de regras.diasParaVencimento dias) ou pendente (resto).
  *       operacoesBloqueadas/gargalos.bloqueadas/gargalos.pagamentoVencido usam a mesma regra de pagamento vencido
  *       do Pipeline e dos Alertas. vencimento é aproximado (criação da cobrança + diasParaVencimento) até existir
- *       Payment.dueDate; variacaoMesAnterior é sempre null até existir Payment.confirmedAt. semTermoAditivo é sempre 0
- *       (sem campo no schema). evolucao: sempre os últimos 12 meses (previsto = valor contratado por plannedDeliveryDate;
+ *       Payment.dueDate; variacaoMesAnterior é sempre null até existir Payment.confirmedAt.
+ *       aditivos: termos aditivos registrados na pesagem (diferença do contrato com sinal: acréscimo > 0, redução < 0);
+ *       gargalos.semTermoAditivo = aditivos.semRegistro (vendas pesadas sem registro — legado anterior ao SaleAddendum).
+ *       evolucao: sempre os últimos 12 meses (previsto = valor contratado por plannedDeliveryDate;
  *       realizado = recebido por mês de confirmação), ignora startDate/endDate. performancePorParceiro: vendedores,
  *       com faturamento/recebido rateados pela participação de cada vendedor nos produtos da venda (top 5 + Outros).
  *       resumoPagamento: regra única 30/70 — porFase separa entrada (down_payment), saldo (final_payment) e integral (full).
@@ -602,6 +605,14 @@ router.get("/logistics", controller.getLogisticsOverview as RequestHandler);
  *                     semTermoAditivo: { type: integer, example: 0 }
  *                     bloqueadas: { type: integer, example: 6 }
  *                     pagamentoVencido: { type: integer, example: 6 }
+ *                 aditivos:
+ *                   type: object
+ *                   properties:
+ *                     quantidade: { type: integer, example: 4 }
+ *                     acrescimo: { type: number, example: 3200 }
+ *                     reducao: { type: number, example: -1200, description: Soma das diferenças negativas, com sinal }
+ *                     saldoLiquido: { type: number, example: 2000 }
+ *                     semRegistro: { type: integer, example: 0 }
  *                 evolucao:
  *                   type: array
  *                   items:
