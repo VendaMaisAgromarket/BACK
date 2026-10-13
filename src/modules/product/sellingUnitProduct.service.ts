@@ -1,4 +1,5 @@
 import { PrismaClient } from "@prisma/client";
+import { ProductError, ProductRequester } from "./product.errors";
 
 const prisma = new PrismaClient({
   log: ['query', 'info', 'warn', 'error'],
@@ -17,7 +18,14 @@ export interface UpdateSellingUnitProductDto {
 
 export class SellingUnitProductService {
 
-  async create(data: CreateSellingUnitProductDto) {
+  // Só o vendedor dono do produto (ou um admin) pode mexer nas unidades de venda dele.
+  private assertCanManage(sellerId: string, requester: ProductRequester) {
+    if (requester.role !== "admin" && requester.userId !== sellerId) {
+      throw new ProductError(403, "Você não tem permissão para alterar este produto.");
+    }
+  }
+
+  async create(data: CreateSellingUnitProductDto, requester: ProductRequester) {
     try {
       const product = await prisma.product.findUnique({
         where: { id: data.productId },
@@ -26,6 +34,7 @@ export class SellingUnitProductService {
       if (!product) {
         throw new Error(`Produto com ID ${data.productId} não encontrado`);
       }
+      this.assertCanManage(product.sellerId, requester);
 
       const unit = await prisma.sellingUnit.findUnique({
         where: { id: data.unitId },
@@ -136,12 +145,13 @@ export class SellingUnitProductService {
     });
   }
 
-  async update(id: string, data: UpdateSellingUnitProductDto) {
+  async update(id: string, data: UpdateSellingUnitProductDto, requester: ProductRequester) {
     try {
       const existing = await this.getById(id);
       if (!existing) {
         throw new Error(`Unidade de venda do produto com ID ${id} não encontrada`);
       }
+      this.assertCanManage(existing.product.seller.id, requester);
 
       if (data.unitId && data.unitId !== existing.unitId) {
         const unit = await prisma.sellingUnit.findUnique({
@@ -188,19 +198,21 @@ export class SellingUnitProductService {
     }
   }
 
-  async delete(id: string) {
+  async delete(id: string, requester: ProductRequester) {
     try {
       const existing = await prisma.sellingUnitProduct.findUnique({
         where: { id },
         include: {
           boughtProducts: true,
           CartItem: true,
+          product: { select: { sellerId: true } },
         },
       });
 
       if (!existing) {
         throw new Error(`Unidade de venda do produto com ID ${id} não encontrada`);
       }
+      this.assertCanManage(existing.product.sellerId, requester);
 
       if (existing.boughtProducts.length > 0) {
         throw new Error('Não é possível deletar esta unidade de venda pois existem produtos comprados relacionados');
@@ -316,7 +328,7 @@ export class SellingUnitProductService {
     return prisma.sellingUnit.delete({ where: { id } });
   }
 
-  async deleteByProductId(productId: string) {
+  async deleteByProductId(productId: string, requester: ProductRequester) {
     try {
       const product = await prisma.product.findUnique({
         where: { id: productId },
@@ -325,6 +337,7 @@ export class SellingUnitProductService {
       if (!product) {
         throw new Error(`Produto com ID ${productId} não encontrado`);
       }
+      this.assertCanManage(product.sellerId, requester);
 
       const sellingUnits = await prisma.sellingUnitProduct.findMany({
         where: { productId },

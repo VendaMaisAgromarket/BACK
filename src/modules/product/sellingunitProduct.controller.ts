@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { SellingUnitProductService } from "./sellingUnitProduct.service";
+import { ProductError } from "./product.errors";
 
 const service = new SellingUnitProductService();
 
@@ -7,9 +8,12 @@ export class SellingUnitProductController {
 
   async create(req: Request, res: Response) {
     try {
-      const result = await service.create(req.body);
+      const result = await service.create(req.body, { userId: req.user!.userId, role: req.user!.role });
       res.status(201).json(result);
     } catch (error: any) {
+      if (error instanceof ProductError) {
+        return res.status(error.status).json({ error: error.message });
+      }
       console.error(error);
 
       if (error.message && (
@@ -96,9 +100,12 @@ export class SellingUnitProductController {
         return res.status(400).json({ error: "ID deve ser um número válido" });
       }
 
-      const result = await service.update(id.toString(), req.body);
+      const result = await service.update(id.toString(), req.body, { userId: req.user!.userId, role: req.user!.role });
       res.json(result);
     } catch (error: any) {
+      if (error instanceof ProductError) {
+        return res.status(error.status).json({ error: error.message });
+      }
       console.error(error);
 
       if (error.message && (
@@ -133,9 +140,12 @@ export class SellingUnitProductController {
         return res.status(400).json({ error: "ID deve ser um número válido" });
       }
 
-      await service.delete(id.toString());
+      await service.delete(id.toString(), { userId: req.user!.userId, role: req.user!.role });
       res.status(204).send();
     } catch (error: any) {
+      if (error instanceof ProductError) {
+        return res.status(error.status).json({ error: error.message });
+      }
       console.error(error);
 
       if (error.message && error.message.includes('não encontrada')) {
@@ -164,12 +174,15 @@ export class SellingUnitProductController {
         return res.status(400).json({ error: "ID do produto deve ser um número válido" });
       }
 
-      const result = await service.deleteByProductId(productId.toString());
+      const result = await service.deleteByProductId(productId.toString(), { userId: req.user!.userId, role: req.user!.role });
       res.json({
         message: "Unidades de venda do produto deletadas com sucesso",
         deletedCount: result.count
       });
     } catch (error: any) {
+      if (error instanceof ProductError) {
+        return res.status(error.status).json({ error: error.message });
+      }
       console.error(error);
 
       if (error.message && error.message.includes('não encontrado')) {
