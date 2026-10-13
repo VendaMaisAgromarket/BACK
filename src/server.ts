@@ -1,6 +1,7 @@
 import app from './app';
 import { PrismaClient } from '@prisma/client';
 import './modules/price-recommendation/syncPricesJob';
+import './modules/product/deactivateExpiredProductsJob';
 
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 5000;
