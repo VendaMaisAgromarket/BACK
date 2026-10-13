@@ -143,6 +143,15 @@ router.post('/', upload.array("images", 10), controller.create as express.Reques
  *         schema:
  *           type: string
  *         description: Categoria do produto
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [active, inactive, all]
+ *           default: active
+ *         description: >
+ *           active = status true e colheita até hoje (Brasília); inactive = desativados ou com
+ *           colheita encerrada; all = todos
  *     responses:
  *       200:
  *         description: Lista de produtos
@@ -169,6 +178,32 @@ router.get('/selling-units', controller.getSellingUnits as express.RequestHandle
 
 /**
  * @swagger
+ * /products/best-sellers:
+ *   get:
+ *     summary: Produtos mais vendidos do market
+ *     description: >
+ *       Ordena por número de vendas efetivadas (entrada ou pagamento confirmado, exceto
+ *       canceladas/recusadas). Exclui os produtos do próprio usuário e os de colheita vencida.
+ *       Cada item traz o campo extra salesCount.
+ *     tags: [Product]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 20
+ *           minimum: 1
+ *           maximum: 100
+ *     responses:
+ *       200:
+ *         description: Lista de produtos ordenada por vendas
+ */
+router.get('/best-sellers', controller.getBestSellers as express.RequestHandler);
+
+/**
+ * @swagger
  * /products/{id}:
  *   get:
  *     summary: Busca produto por ID
@@ -180,6 +215,15 @@ router.get('/selling-units', controller.getSellingUnits as express.RequestHandle
  *           type: integer
  *         required: true
  *         description: ID do produto
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [active, inactive, all]
+ *           default: active
+ *         description: >
+ *           active = status true e colheita até hoje (Brasília); inactive = desativados ou com
+ *           colheita encerrada; all = todos
  *     responses:
  *       200:
  *         description: Produto encontrado
@@ -217,6 +261,15 @@ router.get('/:id', controller.getById as express.RequestHandler);
  *           type: string
  *         required: false
  *         description: Categoria parcial do produto (filtro opcional)
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [active, inactive, all]
+ *           default: active
+ *         description: >
+ *           active = status true e colheita até hoje (Brasília); inactive = desativados ou com
+ *           colheita encerrada; all = todos
  *     responses:
  *       200:
  *         description: Lista de produtos do usuário
