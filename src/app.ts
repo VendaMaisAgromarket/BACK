@@ -19,6 +19,7 @@ import paymentMethodsRoutes from './modules/payment-methods/payment-methods.rout
 import paymentRoutes from './modules/payment/payment.route';
 import { PaymentService } from './modules/payment/payment.service';
 import dashboardRoutes from './modules/dashboard/dashboard.route';
+import notificationRoutes from './modules/notification/notification.route';
 
 import 'dotenv/config';
 
@@ -26,7 +27,7 @@ const app = express();
 
 app.use(cors({
   origin: `${process.env.URL_FRONTEND}`,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 }));
@@ -47,6 +48,7 @@ app.use('/transport-types', transportTypesRoutes);
 app.use('/payment-methods', paymentMethodsRoutes);
 app.use('/payment', paymentRoutes);
 app.use('/dashboard', dashboardRoutes);
+app.use('/notifications', notificationRoutes);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.use('/upload-s3', uploadS3Router);
 

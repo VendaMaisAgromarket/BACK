@@ -11,6 +11,14 @@ jest.mock('axios', () => ({
   },
 }));
 
+// Notificações têm testes próprios (notification.service.test.ts); aqui só verificamos a chamada.
+const mockNotifyPaymentCompleted = jest.fn();
+jest.mock('../../notification/notification.service', () => ({
+  NotificationService: jest.fn().mockImplementation(() => ({
+    notifyPaymentCompleted: mockNotifyPaymentCompleted,
+  })),
+}));
+
 process.env.ASAAS_WEBHOOK_TOKEN = 'webhook-secret-token';
 process.env.URL_BACKEND = 'https://api.vendamaisagro.com.br';
 
@@ -656,6 +664,14 @@ describe('PaymentService', () => {
       expect(prisma.saleData.update).toHaveBeenCalledWith({
         where: { id: 'sale-1' },
         data: expect.objectContaining({ downPaymentCompleted: true, status: 'Entrada confirmada' }),
+      });
+      // Vendedor é avisado da entrada (30%) na mesma transação da confirmação.
+      expect(mockNotifyPaymentCompleted).toHaveBeenCalledWith(prisma, {
+        paymentId: 'payment-1',
+        saleId: 'sale-1',
+        phase: 'down_payment',
+        amount: 100,
+        status: 'Entrada confirmada',
       });
     });
 

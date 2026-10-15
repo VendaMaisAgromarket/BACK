@@ -2,12 +2,15 @@ import { PrismaClient } from "@prisma/client";
 import { CreateSaleDataDto, SellerDecisionDto, UpdateSaleDataDto } from "./dto/create-sales.dto";
 import { addBusinessDays, isWithinBusinessDays, lessThanHoursRemaining } from "../../lib/businessDays";
 import { calculatePipelineStage, PipelineStageResult } from "../../lib/pipelineStage";
+import { NotificationService } from "../notification/notification.service";
 
 export class SaleService {
   private readonly prisma: PrismaClient;
+  private readonly notifications: NotificationService;
 
   constructor(prisma?: PrismaClient) {
     this.prisma = prisma || new PrismaClient();
+    this.notifications = new NotificationService(this.prisma);
   }
 
   async create(data: CreateSaleDataDto) {
@@ -69,7 +72,7 @@ export class SaleService {
         })
       );
 
-      return this.prisma.saleData.create({
+      const sale = await this.prisma.saleData.create({
         data: {
           transportTypeId: data.transportTypeId,
           createdAt: data.createdAt ?? new Date(),
@@ -111,6 +114,9 @@ export class SaleService {
           transportType: true,
         },
       });
+
+      await this.notifications.notifyNewOrder(sale.id);
+      return sale;
     } catch (error) {
       console.error("Erro ao criar venda:", error);
       throw error;
@@ -476,11 +482,21 @@ export class SaleService {
       };
     }
 
-    return this.prisma.saleData.update({
+    const updated = await this.prisma.saleData.update({
       where: { id },
       data: updateData,
       include: { boughtProducts: true },
     });
+
+    if (updateData.statusChangedAt) {
+      if (data.sellerApproved !== undefined && data.sellerApproved !== null) {
+        await this.notifications.notifySellerDecision(id, data.sellerApproved, updated.status);
+      } else {
+        await this.notifications.notifyStatusChanged(id, updated.status);
+      }
+    }
+
+    return updated;
   }
 
   async delete(id: string) {
@@ -563,11 +579,18 @@ export class SaleService {
         }
       : {};
 
-    return this.prisma.saleData.update({
+    const updated = await this.prisma.saleData.update({
       where: { id: saleId },
       data: { sellerApproved: dto.approved, status: newStatus, statusChangedAt: new Date(), ...dateFields },
       include: { boughtProducts: true },
     });
+
+    // Reenviar a mesma decisão (ex.: só para preencher datas) não notifica o comprador de novo.
+    if (sale.status !== newStatus) {
+      await this.notifications.notifySellerDecision(saleId, dto.approved, newStatus);
+    }
+
+    return updated;
   }
 
   /**
@@ -587,7 +610,8 @@ export class SaleService {
     });
     if (!sale) throw new Error(`Venda (id=${params.saleId}) não encontrada`);
 
-    return this.prisma.$transaction(async (tx) => {
+    let deliveredNow = false;
+    const doc = await this.prisma.$transaction(async (tx) => {
       const doc = await tx.operationDocument.create({
         data: {
           saleId: params.saleId,
@@ -608,11 +632,15 @@ export class SaleService {
             where: { id: params.saleId },
             data: { actualDeliveryDate: now, status: 'Entregue', statusChangedAt: now },
           });
+          deliveredNow = true;
         }
       }
 
       return doc;
     });
+
+    if (deliveredNow) await this.notifications.notifyStatusChanged(params.saleId, 'Entregue');
+    return doc;
   }
 
   /**
@@ -653,6 +681,7 @@ export class SaleService {
       },
     });
 
+    if (sale.status !== 'Concluído') await this.notifications.notifyStatusChanged(saleId, 'Concluído');
     return { applied: true, actualDeliveryDate: tacitDeadline };
   }
 
@@ -670,11 +699,16 @@ export class SaleService {
     if (!sale.downPaymentCompleted) throw new Error('HARVEST_BLOCKED_NO_DOWN_PAYMENT');
     if (!sale.sellerApproved) throw new Error('HARVEST_BLOCKED_SELLER_NOT_APPROVED');
 
-    return this.prisma.saleData.update({
+    const updated = await this.prisma.saleData.update({
       where: { id: saleId },
       data: { status: 'Colheita autorizada', statusChangedAt: new Date() },
       include: { boughtProducts: true },
     });
+
+    if (sale.status !== 'Colheita autorizada') {
+      await this.notifications.notifyStatusChanged(saleId, 'Colheita autorizada');
+    }
+    return updated;
   }
 
   /**
@@ -753,7 +787,7 @@ export class SaleService {
       (boughtProducts.reduce((sum, bp) => sum + bp.value, 0) + Number(sale.transportValue)).toFixed(2)
     );
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const doc = await tx.operationDocument.create({
         data: {
           saleId: params.saleId,
@@ -824,6 +858,13 @@ export class SaleService {
         addendum,
       };
     });
+
+    await this.notifications.notifyWeightRegistered(params.saleId, {
+      weightKg: params.weightKg,
+      adjustedContractTotal,
+      status: result.sale.status,
+    });
+    return result;
   }
 
   /**
@@ -885,7 +926,7 @@ export class SaleService {
     if (sale.paymentCompleted) throw new Error('PENALTY_BLOCKED:Pagamento final já confirmado, multa não aplicável');
     if (sale.penaltyApplied) throw new Error('PENALTY_ALREADY_APPLIED');
 
-    return this.prisma.saleData.update({
+    const updated = await this.prisma.saleData.update({
       where: { id: saleId },
       data: {
         penaltyApplied: true,
@@ -896,6 +937,9 @@ export class SaleService {
       },
       include: { boughtProducts: true },
     });
+
+    if (sale.status !== 'Cancelado') await this.notifications.notifyStatusChanged(saleId, 'Cancelado');
+    return updated;
   }
 
   /**

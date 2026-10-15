@@ -1,6 +1,7 @@
 import { Payment, PrismaClient } from '@prisma/client';
 import axios, { AxiosInstance } from 'axios';
 import 'dotenv/config';
+import { NotificationService } from '../notification/notification.service';
 
 type PaymentPhase = 'down_payment' | 'final_payment' | 'full';
 
@@ -46,8 +47,10 @@ const REVERSAL_STATUSES = ['refunded', 'cancelled'];
 
 export class PaymentService {
     private readonly prisma: PrismaClient;
+    private readonly notifications: NotificationService;
     constructor(prisma?: PrismaClient) {
         this.prisma = prisma || new PrismaClient();
+        this.notifications = new NotificationService(this.prisma);
     }
 
     /**
@@ -964,27 +967,42 @@ export class PaymentService {
 
         if (newStatus === 'completed') {
             const statusChangedAt = new Date();
+            let saleStatus: string;
             if (paymentRecord.phase === 'down_payment') {
                 console.info(`[applyPaymentCompletion] Entrada confirmada para venda ${paymentRecord.saleId}`);
+                saleStatus = 'Entrada confirmada';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { downPaymentCompleted: true, status: 'Entrada confirmada', statusChangedAt },
+                    data: { downPaymentCompleted: true, status: saleStatus, statusChangedAt },
                 });
             } else if (paymentRecord.phase === 'full') {
                 // Pagamento único: quita entrada e total ao mesmo tempo
                 console.info(`[applyPaymentCompletion] Pagamento único (full) confirmado para venda ${paymentRecord.saleId}`);
+                saleStatus = 'Concluído';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { downPaymentCompleted: true, paymentCompleted: true, status: 'Concluído', statusChangedAt },
+                    data: { downPaymentCompleted: true, paymentCompleted: true, status: saleStatus, statusChangedAt },
                 });
             } else {
                 // final_payment
                 console.info(`[applyPaymentCompletion] Pagamento final confirmado para venda ${paymentRecord.saleId}`);
+                saleStatus = 'Concluído';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { paymentCompleted: true, status: 'Concluído', statusChangedAt },
+                    data: { paymentCompleted: true, status: saleStatus, statusChangedAt },
                 });
             }
+
+            // Na mesma transação: se falhar, o webhook/poller reprocessa. Esta função pode rodar
+            // mais de uma vez para o mesmo pagamento (webhook + poller + sync manual) — a dedupeKey
+            // por paymentId garante uma única notificação.
+            await this.notifications.notifyPaymentCompleted(tx, {
+                paymentId: paymentRecord.id,
+                saleId: paymentRecord.saleId,
+                phase: paymentRecord.phase,
+                amount: paymentRecord.amount,
+                status: saleStatus,
+            });
         } else if (REVERSAL_STATUSES.includes(newStatus) && paymentRecord.status === 'completed') {
             // Reembolso/estorno de um pagamento que já estava confirmado: sem isso, a venda
             // continuaria marcada como paga mesmo com o dinheiro devolvido, e verificações de
