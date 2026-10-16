@@ -123,21 +123,27 @@ export class NotificationService {
     });
   }
 
-  /** Comprador: vendedor aceitou ou recusou o pedido. */
+  /**
+   * Comprador: vendedor aceitou ou recusou o pedido. A checagem de status em setSellerDecision é
+   * feita antes do update, então decisões simultâneas/repetidas podem chegar aqui mais de uma vez —
+   * a dedupeKey estável por venda + decisão garante uma única notificação de cada tipo.
+   */
   async notifySellerDecision(saleId: string, approved: boolean, status: string): Promise<void> {
-    await this.safely(approved ? "ORDER_ACCEPTED" : "ORDER_REJECTED", async () => {
+    const type = approved ? NotificationType.ORDER_ACCEPTED : NotificationType.ORDER_REJECTED;
+    await this.safely(type, async () => {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
       await this.createMany([
         {
           userId: ctx.buyerId,
-          type: approved ? NotificationType.ORDER_ACCEPTED : NotificationType.ORDER_REJECTED,
+          type,
           title: approved ? "Pedido aceito pelo vendedor" : "Pedido recusado pelo vendedor",
           message: approved
             ? `O vendedor aceitou o seu pedido #${ctx.orderNumber}.`
             : `O vendedor recusou o seu pedido #${ctx.orderNumber}.`,
           saleId,
           data: { role: "buyer", orderNumber: ctx.orderNumber, status },
+          dedupeKey: `${type}:${saleId}`,
         },
       ]);
     });

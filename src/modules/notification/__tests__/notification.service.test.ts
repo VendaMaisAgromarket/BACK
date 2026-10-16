@@ -64,8 +64,26 @@ describe('NotificationService', () => {
       await service.notifySellerDecision(SALE_ID, approved, 'status');
 
       expect(createdInputs(prisma)).toEqual([
-        expect.objectContaining({ userId: 'buyer-1', type, data: { role: 'buyer', orderNumber: 42, status: 'status' } }),
+        expect.objectContaining({
+          userId: 'buyer-1',
+          type,
+          data: { role: 'buyer', orderNumber: 42, status: 'status' },
+          dedupeKey: `${type}:${SALE_ID}`,
+        }),
       ]);
+    });
+
+    it('decisões repetidas/simultâneas usam a mesma dedupeKey (o banco descarta a duplicata)', async () => {
+      prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
+
+      await Promise.all([
+        service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor'),
+        service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor'),
+      ]);
+
+      const keys = createdInputs(prisma).map((n) => n.dedupeKey);
+      expect(keys).toEqual([`ORDER_ACCEPTED:${SALE_ID}`, `ORDER_ACCEPTED:${SALE_ID}`]);
+      expect(prisma.notification.createMany).toHaveBeenCalledWith(expect.objectContaining({ skipDuplicates: true }));
     });
   });
 
