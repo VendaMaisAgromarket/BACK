@@ -76,7 +76,12 @@ Com React Query ou SWR: `refetchInterval: 30000` com `refetchIntervalInBackgroun
 
 - **Datas**: `createdAt` e `harvestAt` vêm em UTC (ISO). Exiba em `America/Sao_Paulo`.
 - **CORS**: o back agora inclui `PATCH` em `Access-Control-Allow-Methods`. Antes não incluía, e chamadas `PATCH` feitas do navegador eram bloqueadas no preflight.
-- **Sem duplicatas**: o back deduplica eventos de pagamento e lembretes de colheita. O front não precisa deduplicar.
+- **Sem duplicatas**: o back deduplica todas as notificações (cada transição de status, pagamento ou lembrete gera no máximo uma por destinatário). O front não precisa deduplicar.
+- **Novos `409` em endpoints de venda**: para garantir uma única transição por mudança de status, requisições simultâneas sobre o mesmo pedido agora podem responder `409`. Ao receber, recarregue a venda e mostre a mensagem do campo `error`:
+  - `PATCH /sales/:id/seller-decision` → `code: SELLER_DECISION_CONFLICT`
+  - `PATCH /sales/:id/authorize-harvest` e `PUT /sales/:id` → `code: SALE_STATUS_CONFLICT`
+  - `PATCH /sales/:id/authorize-harvest` numa venda já autorizada agora responde `200` sem alterar nada (idempotente).
+- **Pagamento com resultado incerto** (`409`, `code: PAYMENT_GATEWAY_UNCERTAIN`) nos endpoints de criação de cobrança: o gateway pode ter criado a cobrança, mas a resposta se perdeu. **Não ofereça "tentar de novo" na hora.** Mostre "estamos confirmando seu pagamento" e recarregue a venda em alguns minutos. Uma nova tentativa nesse intervalo devolve `DUPLICATE_PAYMENT_ATTEMPT`. Depois disso, o back reaproveita a cobrança se ela existir ou libera uma nova tentativa se não existir.
 - **Momento do `NEW_ORDER`**: é gerado na criação da venda (`POST /sales`), não no aceite do contrato no checkout (decisão do negócio).
 - **Venda ou anúncio excluído**: as notificações ligadas a eles também são apagadas (cascade). Se um `saleId`/`productId` retornar 404, mostre uma mensagem amigável.
 

@@ -150,11 +150,18 @@ export class NotificationService {
     });
   }
 
-  /** Comprador: qualquer outra mudança de status do pedido. Vendedor(es): só entrega e conclusão. */
-  async notifyStatusChanged(saleId: string, status: string): Promise<void> {
+  /**
+   * Comprador: qualquer outra mudança de status do pedido. Vendedor(es): só entrega e conclusão.
+   * `transitionAt` é o statusChangedAt gravado na transição (identidade persistente dela): cada
+   * linha gerada leva uma dedupeKey com essa identidade + destinatário, então reprocessar a mesma
+   * transição não duplica, e uma nova transição para o mesmo status (ex.: admin volta e avança)
+   * ainda é entregue.
+   */
+  async notifyStatusChanged(saleId: string, status: string, transitionAt: Date): Promise<void> {
     await this.safely("ORDER_STATUS_CHANGED", async () => {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
+      const transitionKey = `ORDER_STATUS_CHANGED:${saleId}:${transitionAt.toISOString()}`;
       const sellerNotifications: NotificationInput[] = SELLER_NOTIFIED_STATUSES.includes(status)
         ? ctx.sellerIds.map((sellerId) => ({
             userId: sellerId,
@@ -163,9 +170,13 @@ export class NotificationService {
             message: `O pedido #${ctx.orderNumber} agora está: ${status}.`,
             saleId,
             data: { role: "seller", orderNumber: ctx.orderNumber, status },
+            dedupeKey: `${transitionKey}:${sellerId}`,
           }))
         : [];
-      await this.createMany([this.buildStatusChanged(ctx, status), ...sellerNotifications]);
+      await this.createMany([
+        this.buildStatusChanged(ctx, status, `${transitionKey}:${ctx.buyerId}`),
+        ...sellerNotifications,
+      ]);
     });
   }
 
@@ -242,13 +253,13 @@ export class NotificationService {
     await this.createMany(
       [
         ...sellerNotifications,
-        { ...this.buildStatusChanged(ctx, params.status), dedupeKey: `ORDER_STATUS_CHANGED:payment:${params.paymentId}` },
+        this.buildStatusChanged(ctx, params.status, `ORDER_STATUS_CHANGED:payment:${params.paymentId}`),
       ],
       tx
     );
   }
 
-  private buildStatusChanged(ctx: SaleNotificationContext, status: string): NotificationInput {
+  private buildStatusChanged(ctx: SaleNotificationContext, status: string, dedupeKey: string): NotificationInput {
     return {
       userId: ctx.buyerId,
       type: NotificationType.ORDER_STATUS_CHANGED,
@@ -256,6 +267,7 @@ export class NotificationService {
       message: `O seu pedido #${ctx.orderNumber} agora está: ${status}.`,
       saleId: ctx.saleId,
       data: { role: "buyer", orderNumber: ctx.orderNumber, status },
+      dedupeKey,
     };
   }
 

@@ -5,13 +5,36 @@ import { NotificationService } from '../notification/notification.service';
 
 type PaymentPhase = 'down_payment' | 'final_payment' | 'full';
 
+/**
+ * Timeout das chamadas ao Asaas. Também delimita quanto tempo uma requisição de criação pode
+ * ficar "em voo": depois de STALE_RESERVATION_MS sem asaas_payment_id, a reserva com certeza não
+ * tem mais requisição em andamento e pode ser conciliada (ver reconcileReservation).
+ */
+const ASAAS_TIMEOUT_MS = 30_000;
+const STALE_RESERVATION_MS = 2 * 60_000;
+
 const asaasClient: AxiosInstance = axios.create({
     baseURL: process.env.ASAAS_BASE_URL || 'https://api-sandbox.asaas.com/v3',
+    timeout: ASAAS_TIMEOUT_MS,
     headers: {
         'Content-Type': 'application/json',
         access_token: process.env.ASAAS_API_KEY || ''
     }
 });
+
+/** Erros de rede em que a conexão nem chegou a ser estabelecida — a requisição não alcançou o Asaas. */
+const PRE_CONNECTION_ERROR_CODES = ['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'];
+
+/**
+ * true SÓ quando há certeza de que o Asaas não criou a cobrança: recusa explícita (4xx, exceto 408
+ * Request Timeout) ou falha antes de conectar. Timeout, conexão resetada, 5xx ou qualquer erro sem
+ * resposta são ambíguos — o Asaas pode ter aceitado a cobrança antes de a resposta se perder.
+ */
+function isDefinitiveGatewayRejection(error: any): boolean {
+    const status: number | undefined = error?.response?.status;
+    if (status !== undefined) return status >= 400 && status < 500 && status !== 408;
+    return PRE_CONNECTION_ERROR_CODES.includes(error?.code);
+}
 
 /** Extrai a mensagem de erro da resposta da API do Asaas, com fallback para o erro genérico. */
 function extractAsaasErrorMessage(error: any, fallback: string): string {
@@ -29,6 +52,7 @@ export const KNOWN_PAYMENT_ERROR_PREFIXES = [
     'FINAL_BOLETO_BLOCKED:',
     'DUPLICATE_PAYMENT_ATTEMPT:',
     'PAYMENT_ALREADY_COMPLETED:',
+    'PAYMENT_GATEWAY_UNCERTAIN:',
 ] as const;
 
 export function findKnownPaymentErrorPrefix(error: unknown): string | undefined {
@@ -189,9 +213,37 @@ export class PaymentService {
             throw new Error('PAYMENT_ALREADY_COMPLETED:Esta parcela já foi paga (pagamento anterior à migração para o Asaas).');
         }
         if (!existing.asaas_payment_id) {
+            // Reserva sem referência: requisição ainda em voo, ou falha ambígua do gateway. Passado o
+            // tempo máximo de voo, concilia com o Asaas: se a cobrança existe, reaproveita.
+            const reconciled = await this.reconcileReservation(existing);
+            if (reconciled) return this.buildReuseResponse(reconciled, phase);
             throw new Error('DUPLICATE_PAYMENT_ATTEMPT:Uma cobrança para esta venda/fase já está sendo criada. Tente novamente em alguns segundos.');
         }
         return this.buildReuseResponse(existing, phase);
+    }
+
+    /**
+     * Concilia uma reserva sem asaas_payment_id com o Asaas, pelo externalReference (= id da reserva,
+     * único por tentativa — ver chargeReservation). Só age em reservas mais antigas que
+     * STALE_RESERVATION_MS, quando já não há requisição em andamento:
+     * - cobrança encontrada → vincula (e conclui, se já confirmada) e devolve o Payment;
+     * - não encontrada → o Asaas comprovadamente não criou a cobrança: libera a reserva e devolve null.
+     * Reservas recentes não são tocadas (null). Chamado no retry do comprador, no poller e no webhook.
+     */
+    private async reconcileReservation(reservation: Payment, now: Date = new Date()): Promise<Payment | null> {
+        if (reservation.asaas_payment_id || reservation.status !== 'pending') return null;
+        if (now.getTime() - reservation.createdAt.getTime() < STALE_RESERVATION_MS) return null;
+
+        const { data } = await asaasClient.get('/payments', { params: { externalReference: reservation.id } });
+        const asaasPayment = data?.data?.[0];
+        if (!asaasPayment) {
+            console.info(`[reconcileReservation] Nenhuma cobrança no Asaas para a reserva ${reservation.id} — liberando`);
+            await this.releaseReservation(reservation.id);
+            return null;
+        }
+
+        console.info(`[reconcileReservation] Cobrança ${asaasPayment.id} encontrada para a reserva ${reservation.id} — vinculando`);
+        return this.attachGatewayCharge(reservation.id, asaasPayment.customer, asaasPayment);
     }
 
     /**
@@ -271,11 +323,15 @@ export class PaymentService {
     /**
      * Cria a cobrança no Asaas para uma reserva já gravada e vincula a referência à linha local.
      *
-     * Fronteira de segurança: só uma falha ANTES de o Asaas aceitar a cobrança libera a reserva.
-     * Depois disso existe cobrança real no gateway, e a tentativa nunca pode virar 'cancelled' —
-     * findExistingAttempt e o poller ignoram linhas canceladas, então uma nova tentativa cobraria
-     * o comprador de novo. Por isso, quem chama não deve envolver o restante do fluxo (QR Code,
-     * montagem da resposta) num catch que libere a reserva.
+     * A reserva só é liberada ('cancelled') quando há CERTEZA de que o Asaas não criou a cobrança:
+     * falha ao obter o cliente (antes do POST /payments) ou recusa definitiva do POST
+     * (isDefinitiveGatewayRejection). Em falha ambígua (timeout, conexão resetada, 5xx) a reserva
+     * fica 'pending' sem referência — bloqueando novas tentativas pelo índice único — até ser
+     * conciliada por reconcileReservation. Liberar nesse caso permitiria uma segunda cobrança, já que
+     * findExistingAttempt ignora tentativas canceladas.
+     *
+     * O externalReference é o id da reserva (único por tentativa), o que torna a conciliação exata.
+     * Quem chama não deve envolver o restante do fluxo (QR Code, resposta) num catch que libere a reserva.
      */
     private async chargeReservation(
         reservedId: string,
@@ -283,19 +339,40 @@ export class PaymentService {
         buildBody: (customerId: string) => Record<string, unknown>
     ): Promise<{ payment: Payment; asaasPayment: any }> {
         let customerId: string;
-        let asaasPayment: any;
         try {
             customerId = await this.ensureAsaasCustomer(buyerId);
-            ({ data: asaasPayment } = await asaasClient.post('/payments', buildBody(customerId)));
         } catch (error) {
             await this.releaseReservation(reservedId);
             throw error;
         }
 
-        // A conclusão ('completed') NÃO é gravada aqui: se fosse, e a transação de conclusão abaixo
-        // falhasse, o Payment ficaria 'completed' com a venda sem a baixa — o webhook pularia (status
-        // igual) e o poller (só 'pending') nunca reprocessaria. Mantendo 'pending' + asaas_payment_id,
-        // webhook/poller reaplicam a conclusão, e retries reaproveitam esta cobrança.
+        let asaasPayment: any;
+        try {
+            ({ data: asaasPayment } = await asaasClient.post('/payments', {
+                ...buildBody(customerId),
+                externalReference: reservedId,
+            }));
+        } catch (error) {
+            if (isDefinitiveGatewayRejection(error)) {
+                await this.releaseReservation(reservedId);
+                throw error;
+            }
+            console.error(`[chargeReservation] Resultado incerto ao criar a cobrança da reserva ${reservedId} (${(error as any)?.code ?? (error as any)?.response?.status ?? (error as Error)?.message}) — reserva mantida para conciliação`);
+            throw new Error('PAYMENT_GATEWAY_UNCERTAIN:Não foi possível confirmar a criação da cobrança junto ao gateway. Aguarde alguns minutos e consulte o pedido antes de tentar novamente.');
+        }
+
+        const payment = await this.attachGatewayCharge(reservedId, customerId, asaasPayment);
+        return { payment, asaasPayment };
+    }
+
+    /**
+     * Vincula uma cobrança existente no Asaas à reserva local e, se já confirmada, aplica a conclusão.
+     * A conclusão ('completed') NÃO é gravada aqui: se fosse, e a transação de conclusão falhasse, o
+     * Payment ficaria 'completed' com a venda sem a baixa — o webhook pularia (status igual) e o
+     * poller (só 'pending') nunca reprocessaria. Mantendo 'pending' + asaas_payment_id, webhook/poller
+     * reaplicam a conclusão, e retries reaproveitam esta cobrança.
+     */
+    private async attachGatewayCharge(reservedId: string, customerId: string, asaasPayment: any): Promise<Payment> {
         const gatewayStatus = this.mapAsaasStatus(asaasPayment.status);
         let payment: Payment;
         try {
@@ -308,14 +385,13 @@ export class PaymentService {
                 },
             });
         } catch (error) {
-            // Cobrança existe no Asaas mas a linha local ficou sem a referência: a reserva continua
-            // 'pending' e bloqueia novas tentativas (DUPLICATE_PAYMENT_ATTEMPT) — sem risco de
-            // cobrança dupla, mas exige conciliação manual com este id.
-            console.error(`[chargeReservation] Cobrança Asaas ${asaasPayment.id} criada, mas falhou ao vinculá-la ao pagamento ${reservedId} — conciliar manualmente`);
+            // A reserva continua 'pending' sem referência: bloqueia novas tentativas e será
+            // conciliada pelo externalReference (retry/poller/webhook) — sem risco de cobrança dupla.
+            console.error(`[attachGatewayCharge] Cobrança Asaas ${asaasPayment.id} criada, mas falhou ao vinculá-la ao pagamento ${reservedId} — será conciliada pelo externalReference`);
             throw error;
         }
 
-        return { payment: await this.settleIfConfirmed(payment, gatewayStatus), asaasPayment };
+        return this.settleIfConfirmed(payment, gatewayStatus);
     }
 
     /**
@@ -429,7 +505,6 @@ export class PaymentService {
                 billingType: 'UNDEFINED',
                 value: amount,
                 dueDate: new Date().toISOString().split('T')[0],
-                externalReference: params.saleId,
                 description: params.title
             }));
 
@@ -573,7 +648,6 @@ export class PaymentService {
                 billingType: 'PIX',
                 value: amount,
                 dueDate,
-                externalReference: params.saleId,
                 description: this.buildPaymentDescription(sale.orderNumber, phase)
             }));
 
@@ -640,7 +714,6 @@ export class PaymentService {
             billingType: 'BOLETO',
             value: params.amount,
             dueDate,
-            externalReference: params.saleId,
             description: this.buildPaymentDescription(sale.orderNumber, params.phase)
         }));
 
@@ -767,7 +840,6 @@ export class PaymentService {
                 billingType: 'CREDIT_CARD',
                 value: amount,
                 dueDate: new Date().toISOString().split('T')[0], // captura imediata; dueDate não agenda a cobrança
-                externalReference: params.saleId,
                 description: this.buildPaymentDescription(sale.orderNumber, phase),
                 remoteIp: params.remoteIp,
                 creditCard: params.creditCard,
@@ -1063,10 +1135,23 @@ export class PaymentService {
         // Correlação SEMPRE pelo asaas_payment_id exato — nunca por saleId isolado: uma
         // venda pode ter várias tentativas/fases, e um webhook atrasado de uma cobrança
         // antiga poderia, por esse fallback, confirmar a tentativa mais recente errada.
-        const paymentRecord = await this.prisma.payment.findFirst({
+        let paymentRecord = await this.prisma.payment.findFirst({
             where: { asaas_payment_id: asaasPaymentId },
             orderBy: { createdAt: 'desc' },
         });
+
+        // Cobrança criada numa falha ambígua (a resposta do POST se perdeu): a reserva local existe,
+        // mas sem asaas_payment_id. O externalReference é o id da reserva — correlação exata, uma
+        // tentativa específica (nunca por saleId) — então dá para vincular aqui mesmo.
+        if (!paymentRecord && paymentPayload?.externalReference) {
+            const reservation = await this.prisma.payment.findFirst({
+                where: { id: String(paymentPayload.externalReference), asaas_payment_id: null, status: 'pending' },
+            });
+            if (reservation) {
+                console.info(`[Webhook] Vinculando cobrança ${asaasPaymentId} à reserva ${reservation.id} (resposta da criação havia se perdido)`);
+                paymentRecord = await this.attachGatewayCharge(reservation.id, paymentPayload.customer, { ...paymentPayload, status: 'PENDING' });
+            }
+        }
 
         if (!paymentRecord) {
             // Pode ser uma corrida real: o Asaas notifica quase na hora em que cria a cobrança,
@@ -1212,7 +1297,27 @@ export class PaymentService {
             }
         }
 
-        console.info(`[syncPendingOrderPayments] Verificados: ${pending.length} | Confirmados: ${confirmed} | Erros: ${errors}`);
+        // Reservas que ficaram sem referência após uma falha ambígua do gateway: concilia com o Asaas
+        // (vincula se a cobrança existe, libera se comprovadamente não existe). Cobre o comprador que
+        // não tenta de novo e o webhook perdido.
+        const staleReservations = await this.prisma.payment.findMany({
+            where: {
+                status: 'pending',
+                asaas_payment_id: null,
+                billingType: { not: null },
+                createdAt: { lt: new Date(Date.now() - STALE_RESERVATION_MS) },
+            },
+        });
+        for (const reservation of staleReservations) {
+            try {
+                await this.reconcileReservation(reservation);
+            } catch (err: any) {
+                console.warn(`[syncPendingOrderPayments] Erro ao conciliar reserva ${reservation.id}: ${err.message}`);
+                errors++;
+            }
+        }
+
+        console.info(`[syncPendingOrderPayments] Verificados: ${pending.length} | Confirmados: ${confirmed} | Reservas conciliadas: ${staleReservations.length} | Erros: ${errors}`);
         return { checked: pending.length, confirmed, errors };
     }
 

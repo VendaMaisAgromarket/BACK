@@ -4,6 +4,11 @@ import { addBusinessDays, isWithinBusinessDays, lessThanHoursRemaining } from ".
 import { calculatePipelineStage, PipelineStageResult } from "../../lib/pipelineStage";
 import { NotificationService } from "../notification/notification.service";
 
+/** P2025: o update com filtro além do id (compare-and-set) não encontrou a linha no estado esperado. */
+function isRecordNotFound(error: unknown): boolean {
+  return (error as { code?: string } | null)?.code === "P2025";
+}
+
 export class SaleService {
   private readonly prisma: PrismaClient;
   private readonly notifications: NotificationService;
@@ -482,17 +487,26 @@ export class SaleService {
       };
     }
 
-    const updated = await this.prisma.saleData.update({
-      where: { id },
-      data: updateData,
-      include: { boughtProducts: true },
-    });
+    // Mudança de status = compare-and-set no status lido: entre updates simultâneos, só um efetiva
+    // a transição (o outro recebe SALE_STATUS_CONFLICT), então cada transição tem um único
+    // statusChangedAt — a identidade usada nas notificações.
+    let updated;
+    try {
+      updated = await this.prisma.saleData.update({
+        where: updateData.statusChangedAt ? { id, status: currentStatus } : { id },
+        data: updateData,
+        include: { boughtProducts: true },
+      });
+    } catch (error) {
+      if (updateData.statusChangedAt && isRecordNotFound(error)) throw new Error("SALE_STATUS_CONFLICT");
+      throw error;
+    }
 
     if (updateData.statusChangedAt) {
       if (data.sellerApproved !== undefined && data.sellerApproved !== null) {
         await this.notifications.notifySellerDecision(id, data.sellerApproved, updated.status, updateData.statusChangedAt);
       } else {
-        await this.notifications.notifyStatusChanged(id, updated.status);
+        await this.notifications.notifyStatusChanged(id, updated.status, updateData.statusChangedAt);
       }
     }
 
@@ -622,7 +636,7 @@ export class SaleService {
     });
     if (!sale) throw new Error(`Venda (id=${params.saleId}) não encontrada`);
 
-    let deliveredNow = false;
+    let deliveredAt: Date | null = null;
     const doc = await this.prisma.$transaction(async (tx) => {
       const doc = await tx.operationDocument.create({
         data: {
@@ -640,18 +654,20 @@ export class SaleService {
         const afterDeliveryDate = !sale.plannedDeliveryDate || now >= sale.plannedDeliveryDate;
 
         if (afterDeliveryDate) {
-          await tx.saleData.update({
-            where: { id: params.saleId },
+          // Compare-and-set em actualDeliveryDate: dois canhotos simultâneos não registram (nem
+          // notificam) a entrega duas vezes — só o primeiro efetiva a transição.
+          const { count } = await tx.saleData.updateMany({
+            where: { id: params.saleId, actualDeliveryDate: null },
             data: { actualDeliveryDate: now, status: 'Entregue', statusChangedAt: now },
           });
-          deliveredNow = true;
+          if (count === 1) deliveredAt = now;
         }
       }
 
       return doc;
     });
 
-    if (deliveredNow) await this.notifications.notifyStatusChanged(params.saleId, 'Entregue');
+    if (deliveredAt) await this.notifications.notifyStatusChanged(params.saleId, 'Entregue', deliveredAt);
     return doc;
   }
 
@@ -684,16 +700,19 @@ export class SaleService {
       return { applied: false, reason: 'Prazo de aceite tácito ainda não venceu' };
     }
 
-    await this.prisma.saleData.update({
-      where: { id: saleId },
+    // Compare-and-set em actualDeliveryDate: duas execuções simultâneas (endpoint manual + lote)
+    // leem a venda sem entrega, mas só uma aplica o aceite tácito e notifica.
+    const { count } = await this.prisma.saleData.updateMany({
+      where: { id: saleId, actualDeliveryDate: null },
       data: {
         actualDeliveryDate: tacitDeadline,
         status: 'Concluído',
         statusChangedAt: tacitDeadline,
       },
     });
+    if (count === 0) return { applied: false, reason: 'Entrega já registrada' };
 
-    if (sale.status !== 'Concluído') await this.notifications.notifyStatusChanged(saleId, 'Concluído');
+    if (sale.status !== 'Concluído') await this.notifications.notifyStatusChanged(saleId, 'Concluído', tacitDeadline);
     return { applied: true, actualDeliveryDate: tacitDeadline };
   }
 
@@ -711,15 +730,26 @@ export class SaleService {
     if (!sale.downPaymentCompleted) throw new Error('HARVEST_BLOCKED_NO_DOWN_PAYMENT');
     if (!sale.sellerApproved) throw new Error('HARVEST_BLOCKED_SELLER_NOT_APPROVED');
 
-    const updated = await this.prisma.saleData.update({
-      where: { id: saleId },
-      data: { status: 'Colheita autorizada', statusChangedAt: new Date() },
-      include: { boughtProducts: true },
-    });
-
-    if (sale.status !== 'Colheita autorizada') {
-      await this.notifications.notifyStatusChanged(saleId, 'Colheita autorizada');
+    // Já autorizada: idempotente — não é uma nova transição (não reseta statusChangedAt nem notifica).
+    if (sale.status === 'Colheita autorizada') {
+      return this.prisma.saleData.findUnique({ where: { id: saleId }, include: { boughtProducts: true } });
     }
+
+    // Compare-and-set no status lido: entre autorizações simultâneas, só uma efetiva a transição.
+    const statusChangedAt = new Date();
+    let updated;
+    try {
+      updated = await this.prisma.saleData.update({
+        where: { id: saleId, status: sale.status },
+        data: { status: 'Colheita autorizada', statusChangedAt },
+        include: { boughtProducts: true },
+      });
+    } catch (error) {
+      if (isRecordNotFound(error)) throw new Error('SALE_STATUS_CONFLICT');
+      throw error;
+    }
+
+    await this.notifications.notifyStatusChanged(saleId, 'Colheita autorizada', statusChangedAt);
     return updated;
   }
 
@@ -938,19 +968,27 @@ export class SaleService {
     if (sale.paymentCompleted) throw new Error('PENALTY_BLOCKED:Pagamento final já confirmado, multa não aplicável');
     if (sale.penaltyApplied) throw new Error('PENALTY_ALREADY_APPLIED');
 
-    const updated = await this.prisma.saleData.update({
-      where: { id: saleId },
-      data: {
-        penaltyApplied: true,
-        penaltyAmount: params.penaltyAmount ?? null,
-        penaltyReason: params.reason,
-        status: 'Cancelado',
-        statusChangedAt: new Date(),
-      },
-      include: { boughtProducts: true },
-    });
+    // Compare-and-set em penaltyApplied: duas aplicações simultâneas não cancelam/notificam duas vezes.
+    const statusChangedAt = new Date();
+    let updated;
+    try {
+      updated = await this.prisma.saleData.update({
+        where: { id: saleId, penaltyApplied: false },
+        data: {
+          penaltyApplied: true,
+          penaltyAmount: params.penaltyAmount ?? null,
+          penaltyReason: params.reason,
+          status: 'Cancelado',
+          statusChangedAt,
+        },
+        include: { boughtProducts: true },
+      });
+    } catch (error) {
+      if (isRecordNotFound(error)) throw new Error('PENALTY_ALREADY_APPLIED');
+      throw error;
+    }
 
-    if (sale.status !== 'Cancelado') await this.notifications.notifyStatusChanged(saleId, 'Cancelado');
+    if (sale.status !== 'Cancelado') await this.notifications.notifyStatusChanged(saleId, 'Cancelado', statusChangedAt);
     return updated;
   }
 

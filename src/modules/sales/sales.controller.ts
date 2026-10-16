@@ -192,6 +192,13 @@ export class SaleController {
       res.json(result);
     } catch (error: any) {
       console.error(error);
+      if (error.message === "SALE_STATUS_CONFLICT") {
+        res.status(409).json({
+          error: "O status do pedido foi alterado por outra requisição. Atualize a página e tente novamente.",
+          code: "SALE_STATUS_CONFLICT",
+        });
+        return;
+      }
       if (error.message?.startsWith("RESCHEDULE_BLOCKED_24H:")) {
         const field = error.message.split(":")[1];
         res.status(409).json({
@@ -377,6 +384,13 @@ export class SaleController {
         res.status(409).json({
           error: 'A colheita só pode ser autorizada após a confirmação do pagamento da entrada (30%).',
           code: 'HARVEST_BLOCKED_NO_DOWN_PAYMENT',
+        });
+        return;
+      }
+      if (error.message === 'SALE_STATUS_CONFLICT') {
+        res.status(409).json({
+          error: 'O status do pedido foi alterado por outra requisição. Atualize a página e tente novamente.',
+          code: 'SALE_STATUS_CONFLICT',
         });
         return;
       }

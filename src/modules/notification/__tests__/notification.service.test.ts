@@ -104,24 +104,40 @@ describe('NotificationService', () => {
   });
 
   describe('notifyStatusChanged', () => {
-    it.each(['Entregue', 'Concluído'])('status %s avisa o comprador e também o vendedor', async (status) => {
+    const T1 = new Date('2026-10-16T12:00:00.000Z');
+    const T2 = new Date('2026-10-16T13:00:00.000Z');
+    const key = (t: Date, userId: string) => `ORDER_STATUS_CHANGED:${SALE_ID}:${t.toISOString()}:${userId}`;
+
+    it.each(['Entregue', 'Concluído'])('status %s avisa o comprador e também o vendedor, cada linha com a dedupeKey da transição', async (status) => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext(['seller-1', 'seller-2']) as never);
 
-      await service.notifyStatusChanged(SALE_ID, status);
+      await service.notifyStatusChanged(SALE_ID, status, T1);
 
       expect(createdInputs(prisma)).toEqual([
-        expect.objectContaining({ userId: 'buyer-1', data: { role: 'buyer', orderNumber: 42, status } }),
-        expect.objectContaining({ userId: 'seller-1', data: { role: 'seller', orderNumber: 42, status } }),
-        expect.objectContaining({ userId: 'seller-2', data: { role: 'seller', orderNumber: 42, status } }),
+        expect.objectContaining({ userId: 'buyer-1', data: { role: 'buyer', orderNumber: 42, status }, dedupeKey: key(T1, 'buyer-1') }),
+        expect.objectContaining({ userId: 'seller-1', data: { role: 'seller', orderNumber: 42, status }, dedupeKey: key(T1, 'seller-1') }),
+        expect.objectContaining({ userId: 'seller-2', data: { role: 'seller', orderNumber: 42, status }, dedupeKey: key(T1, 'seller-2') }),
       ]);
     });
 
     it.each(['Cancelado', 'Colheita autorizada'])('status %s avisa só o comprador', async (status) => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
-      await service.notifyStatusChanged(SALE_ID, status);
+      await service.notifyStatusChanged(SALE_ID, status, T1);
 
       expect(createdInputs(prisma).map((n) => n.userId)).toEqual(['buyer-1']);
+    });
+
+    it('reprocessar a mesma transição repete as chaves (duplicata descartada); uma nova transição gera chaves novas', async () => {
+      prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
+
+      await service.notifyStatusChanged(SALE_ID, 'Entregue', T1);
+      await service.notifyStatusChanged(SALE_ID, 'Entregue', T1);
+      await service.notifyStatusChanged(SALE_ID, 'Entregue', T2);
+
+      const buyerKeys = createdInputs(prisma).filter((n) => n.userId === 'buyer-1').map((n) => n.dedupeKey);
+      expect(buyerKeys).toEqual([key(T1, 'buyer-1'), key(T1, 'buyer-1'), key(T2, 'buyer-1')]);
+      expect(createdInputs(prisma).every((n) => typeof n.dedupeKey === 'string')).toBe(true);
     });
   });
 
