@@ -481,8 +481,12 @@ export class SaleService {
     if (data.sellerApproved === true) updateData.status = "Aprovado pelo vendedor";
     if (data.sellerApproved === false) updateData.status = "Recusado pelo vendedor";
 
+    if (needsStatusCheck && !current) throw new Error(`Venda (id=${id}) não encontrada`);
     const readVersion = current?.statusVersion;
-    const isStatusTransition = needsStatusCheck && current !== null && updateData.status !== undefined && updateData.status !== currentStatus;
+    // Escrita de status (mesmo repetindo o valor lido) sempre passa pelo compare-and-set; só a
+    // transição real incrementa a versão e reseta statusChangedAt.
+    const writesStatus = needsStatusCheck && updateData.status !== undefined;
+    const isStatusTransition = writesStatus && updateData.status !== currentStatus;
     if (isStatusTransition) {
       updateData.statusChangedAt = new Date();
       updateData.statusVersion = readVersion! + 1;
@@ -513,18 +517,20 @@ export class SaleService {
       };
     }
 
-    // Mudança de status = compare-and-set na VERSÃO lida (não no valor do status): qualquer escrita
+    // Escrita de status = compare-and-set na VERSÃO lida (não no valor do status): qualquer escrita
     // de status no meio do caminho — inclusive A→B→A — muda a versão e faz esta requisição obsoleta
-    // receber SALE_STATUS_CONFLICT. A versão nova (lida + 1) é a identidade da transição.
+    // receber SALE_STATUS_CONFLICT. Vale também quando o valor enviado é igual ao lido: sem o CAS,
+    // "ler A, outro muda para B, eu gravo A" sobrescreveria B silenciosamente. A versão nova
+    // (lida + 1) é a identidade da transição.
     let updated;
     try {
       updated = await this.prisma.saleData.update({
-        where: isStatusTransition ? { id, statusVersion: readVersion } : { id },
+        where: writesStatus ? { id, statusVersion: readVersion } : { id },
         data: updateData,
         include: { boughtProducts: true },
       });
     } catch (error) {
-      if (isStatusTransition && isRecordNotFound(error)) throw new Error("SALE_STATUS_CONFLICT");
+      if (writesStatus && isRecordNotFound(error)) throw new Error("SALE_STATUS_CONFLICT");
       throw error;
     }
 
@@ -829,6 +835,7 @@ export class SaleService {
       select: {
         id: true,
         status: true,
+        statusVersion: true,
         weightDocumentId: true,
         sellerApproved: true,
         transportValue: true,
@@ -866,14 +873,17 @@ export class SaleService {
         },
       });
 
+      // Compare-and-set na VERSÃO lida: as pré-condições acima (vendedor aprovou, entrada paga, sem
+      // pesagem) foram checadas nessa leitura; se o status mudou desde então (ex.: estorno da entrada,
+      // cancelamento), esta pesagem está obsoleta e a transação inteira (documento incluso) é desfeita.
       const updatedSale = await tx.saleData.update({
-        where: { id: params.saleId },
+        where: { id: params.saleId, statusVersion: sale.statusVersion, weightDocumentId: null },
         data: {
           cargoWeightKg: params.weightKg,
           weightDocumentId: doc.id,
           status: 'Aguardando pagamento final',
           statusChangedAt: new Date(),
-          statusVersion: { increment: 1 },
+          statusVersion: sale.statusVersion + 1,
           ...(adjustedContractTotal !== null && { adjustedContractTotal }),
         },
         include: { boughtProducts: true },
@@ -927,6 +937,10 @@ export class SaleService {
         weightCalculated: adjustedContractTotal !== null,
         addendum,
       };
+    }).catch(async (error: unknown) => {
+      if (!isRecordNotFound(error)) throw error;
+      const latest = await this.prisma.saleData.findUnique({ where: { id: params.saleId }, select: { weightDocumentId: true } });
+      throw new Error(latest?.weightDocumentId ? 'WEIGHT_ALREADY_REGISTERED' : 'SALE_STATUS_CONFLICT');
     });
 
     await this.notifications.notifyWeightRegistered(params.saleId, {

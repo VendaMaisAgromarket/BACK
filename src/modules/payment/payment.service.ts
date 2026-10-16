@@ -1025,15 +1025,32 @@ export class PaymentService {
         paymentRecord: Payment,
         newStatus: string,
         asaasPaymentId?: string
-    ) {
-        await tx.payment.update({
-            where: { id: paymentRecord.id },
-            data: {
-                status: newStatus,
-                ...(asaasPaymentId && { asaas_payment_id: asaasPaymentId }),
-                updatedAt: new Date()
+    ): Promise<boolean> {
+        const paymentData = {
+            status: newStatus,
+            ...(asaasPaymentId && { asaas_payment_id: asaasPaymentId }),
+            updatedAt: new Date()
+        };
+
+        if (newStatus === 'completed') {
+            // A conclusão é aplicada UMA vez por pagamento: o UPDATE condicional (dentro da transação)
+            // só casa se o pagamento ainda não está 'completed'. Webhook duplicado, poller e sync manual
+            // que chegam depois perdem a corrida e não tocam na venda — sem reescrever status, sem
+            // avançar statusVersion (o que geraria conflitos espúrios no compare-and-set das vendas) e
+            // sem resetar statusChangedAt. A condição é "não concluído", e não "pendente": uma cobrança
+            // cancelada localmente (ex.: troca de forma de pagamento) ainda pode ser paga no Asaas, e
+            // esse dinheiro recebido precisa refletir na venda.
+            const { count } = await tx.payment.updateMany({
+                where: { id: paymentRecord.id, status: { not: 'completed' } },
+                data: paymentData,
+            });
+            if (count === 0) {
+                console.info(`[applyPaymentCompletion] Pagamento ${paymentRecord.id} já estava concluído — nenhuma alteração na venda ${paymentRecord.saleId}`);
+                return false;
             }
-        });
+        } else {
+            await tx.payment.update({ where: { id: paymentRecord.id }, data: paymentData });
+        }
 
         if (newStatus === 'completed') {
             const statusChangedAt = new Date();
@@ -1081,6 +1098,7 @@ export class PaymentService {
             console.info(`[applyPaymentCompletion] Pagamento ${paymentRecord.id} revertido (completed -> ${newStatus}) — recalculando status de pagamento da venda ${paymentRecord.saleId}`);
             await this.reverseSalePaymentFlags(tx, paymentRecord.saleId, paymentRecord.phase);
         }
+        return true;
     }
 
     /**
@@ -1298,9 +1316,10 @@ export class PaymentService {
                 const newStatus = this.mapAsaasStatus(asaasPayment.status);
                 if (newStatus !== 'completed') continue;
 
-                await this.prisma.$transaction(async (tx) => {
-                    await this.applyPaymentCompletion(tx, paymentRecord, newStatus, asaasPayment.id);
-                });
+                const applied = await this.prisma.$transaction((tx) =>
+                    this.applyPaymentCompletion(tx, paymentRecord, newStatus, asaasPayment.id)
+                );
+                if (!applied) continue; // webhook concluiu no meio do caminho
 
                 console.info(`[syncPendingOrderPayments] Pagamento ${paymentRecord.id} confirmado (Asaas: ${paymentRecord.asaas_payment_id})`);
                 confirmed++;

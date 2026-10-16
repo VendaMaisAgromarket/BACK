@@ -7,6 +7,7 @@ jest.mock('../../notification/notification.service', () => ({
   NotificationService: jest.fn().mockImplementation(() => ({
     notifySellerDecision: mockNotifySellerDecision,
     notifyStatusChanged: mockNotifyStatusChanged,
+    notifyWeightRegistered: jest.fn(),
   })),
 }));
 
@@ -115,6 +116,26 @@ describe('SaleService.update (admin)', () => {
     expect(mockNotifyStatusChanged).not.toHaveBeenCalled();
   });
 
+  it('gravar o MESMO status lido ainda passa pelo CAS (sem incrementar versão nem notificar)', async () => {
+    prisma.saleData.findUnique.mockResolvedValue({ status: 'Em trânsito', statusVersion: 9 } as never);
+    prisma.saleData.update.mockResolvedValue({ id: SALE_ID, status: 'Em trânsito', statusVersion: 9 } as never);
+
+    await service.update(SALE_ID, { status: 'Em trânsito' } as never);
+
+    const { where, data } = prisma.saleData.update.mock.calls[0][0]!;
+    expect(where).toEqual({ id: SALE_ID, statusVersion: 9 });
+    expect(data).not.toHaveProperty('statusVersion');
+    expect(data).not.toHaveProperty('statusChangedAt');
+    expect(mockNotifyStatusChanged).not.toHaveBeenCalled();
+  });
+
+  it('leu A, outro mudou A→B, esta requisição grava A: CAS falha (SALE_STATUS_CONFLICT) em vez de sobrescrever B', async () => {
+    prisma.saleData.findUnique.mockResolvedValue({ status: 'Em trânsito', statusVersion: 9 } as never);
+    prisma.saleData.update.mockRejectedValue(P2025); // no banco a versão já é 10 (status B)
+
+    await expect(service.update(SALE_ID, { status: 'Em trânsito' } as never)).rejects.toThrow('SALE_STATUS_CONFLICT');
+  });
+
   it('update sem mudança de status não usa CAS nem mexe na versão', async () => {
     prisma.saleData.update.mockResolvedValue({ id: SALE_ID } as never);
 
@@ -156,6 +177,48 @@ describe('SaleService.authorizeHarvest', () => {
 
     await expect(service.authorizeHarvest(SALE_ID)).rejects.toThrow('SALE_STATUS_CONFLICT');
     expect(mockNotifyStatusChanged).not.toHaveBeenCalled();
+  });
+});
+
+describe('SaleService.registerManualWeight', () => {
+  const sale = {
+    id: SALE_ID, status: 'Colheita autorizada', statusVersion: 8, weightDocumentId: null,
+    sellerApproved: true, transportValue: 10, downPaymentCompleted: true,
+  };
+  const params = { saleId: SALE_ID, uploadedById: 'seller-1', weightKg: 100, fileUrl: 'https://x/ticket.pdf' };
+
+  beforeEach(() => {
+    prisma.boughtProduct.findMany.mockResolvedValue([] as never);
+    prisma.operationDocument.create.mockResolvedValue({ id: 'doc-1' } as never);
+  });
+
+  it('CAS na versão lida (e sem pesagem anterior), gravando versão + 1', async () => {
+    prisma.saleData.findUnique.mockResolvedValue(sale as never);
+    prisma.saleData.update.mockResolvedValue({ id: SALE_ID, status: 'Aguardando pagamento final' } as never);
+
+    await service.registerManualWeight(params);
+
+    const { where, data } = prisma.saleData.update.mock.calls[0][0]!;
+    expect(where).toEqual({ id: SALE_ID, statusVersion: 8, weightDocumentId: null });
+    expect(data).toMatchObject({ status: 'Aguardando pagamento final', statusVersion: 9 });
+  });
+
+  it('status mudou desde a leitura das pré-condições (ex.: estorno da entrada): SALE_STATUS_CONFLICT', async () => {
+    prisma.saleData.findUnique
+      .mockResolvedValueOnce(sale as never)
+      .mockResolvedValueOnce({ weightDocumentId: null } as never);
+    prisma.saleData.update.mockRejectedValue(P2025);
+
+    await expect(service.registerManualWeight(params)).rejects.toThrow('SALE_STATUS_CONFLICT');
+  });
+
+  it('pesagem simultânea que perdeu a corrida: WEIGHT_ALREADY_REGISTERED', async () => {
+    prisma.saleData.findUnique
+      .mockResolvedValueOnce(sale as never)
+      .mockResolvedValueOnce({ weightDocumentId: 'doc-other' } as never);
+    prisma.saleData.update.mockRejectedValue(P2025);
+
+    await expect(service.registerManualWeight(params)).rejects.toThrow('WEIGHT_ALREADY_REGISTERED');
   });
 });
 

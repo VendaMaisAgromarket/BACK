@@ -508,6 +508,13 @@ export class SaleController {
         sale: result.sale,
       });
     } catch (error: any) {
+      if (error.message === 'SALE_STATUS_CONFLICT') {
+        res.status(409).json({
+          error: 'O status do pedido foi alterado por outra requisição. Atualize a página e tente novamente.',
+          code: 'SALE_STATUS_CONFLICT',
+        });
+        return;
+      }
       if (error.message === 'WEIGHT_ALREADY_REGISTERED') {
         res.status(409).json({
           error: 'O peso desta venda já foi registrado. Para corrigir, entre em contato com o suporte.',

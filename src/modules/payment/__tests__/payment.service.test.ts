@@ -122,6 +122,8 @@ describe('PaymentService', () => {
     mockAsaasGet.mockClear();
     prisma = mockDeep<PrismaClient>();
     prisma.$transaction.mockImplementation((cb: any) => cb(prisma));
+    // Padrão: o UPDATE condicional da conclusão casa (pagamento ainda não concluído no banco).
+    prisma.payment.updateMany.mockResolvedValue({ count: 1 });
     service = new PaymentService(prisma);
   });
 
@@ -968,14 +970,46 @@ describe('PaymentService', () => {
       );
 
       expect(result).toMatchObject({ success: true, status: 'completed' });
-      expect(prisma.payment.update).toHaveBeenCalledWith(expect.objectContaining({
-        where: { id: 'payment-1' },
+      // Conclusão condicional: só casa se o pagamento ainda não está 'completed' no banco.
+      expect(prisma.payment.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: 'payment-1', status: { not: 'completed' } },
         data: expect.objectContaining({ status: 'completed' }),
       }));
       expect(prisma.saleData.update).toHaveBeenCalledWith({
         where: { id: 'sale-1' },
-        data: expect.objectContaining({ downPaymentCompleted: true, status: 'Entrada confirmada' }),
+        data: expect.objectContaining({ downPaymentCompleted: true, status: 'Entrada confirmada', statusVersion: { increment: 1 } }),
       });
+      expect(mockNotifyPaymentCompleted).toHaveBeenCalledTimes(1);
+    });
+
+    it('conclusão duplicada que perde a corrida (pagamento já concluído no banco): NÃO toca na venda — sem reescrever status, sem avançar statusVersion, sem notificar', async () => {
+      // O registro lido ainda está 'pending', mas outra entrega (poller/webhook duplicado) concluiu antes.
+      prisma.payment.findFirst.mockResolvedValue(buildPayment({ phase: 'down_payment', status: 'pending', asaas_payment_id: 'pay_1' }));
+      prisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await service.processWebhook(
+        { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_1', status: 'RECEIVED', externalReference: 'sale-1' } },
+        'webhook-secret-token'
+      );
+
+      expect(result).toMatchObject({ success: true });
+      expect(prisma.saleData.update).not.toHaveBeenCalled();
+      expect(mockNotifyPaymentCompleted).not.toHaveBeenCalled();
+    });
+
+    it('cobrança cancelada localmente (troca de forma de pagamento) e paga depois no Asaas: a conclusão AINDA é aplicada à venda', async () => {
+      prisma.payment.findFirst.mockResolvedValue(buildPayment({ phase: 'down_payment', status: 'cancelled', asaas_payment_id: 'pay_1' }));
+
+      await service.processWebhook(
+        { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_1', status: 'RECEIVED', externalReference: 'sale-1' } },
+        'webhook-secret-token'
+      );
+
+      // A condição é "não concluído" (não "pendente"): dinheiro recebido precisa refletir na venda.
+      expect(prisma.payment.updateMany.mock.calls[0][0]!.where).toEqual({ id: 'payment-1', status: { not: 'completed' } });
+      expect(prisma.saleData.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ downPaymentCompleted: true }),
+      }));
     });
 
     it('confirma pagamento full e marca downPaymentCompleted + paymentCompleted', async () => {
