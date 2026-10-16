@@ -11,6 +11,14 @@ jest.mock('axios', () => ({
   },
 }));
 
+// Notificações têm testes próprios (notification.service.test.ts); aqui só verificamos a chamada.
+const mockNotifyPaymentCompleted = jest.fn();
+jest.mock('../../notification/notification.service', () => ({
+  NotificationService: jest.fn().mockImplementation(() => ({
+    notifyPaymentCompleted: mockNotifyPaymentCompleted,
+  })),
+}));
+
 process.env.ASAAS_WEBHOOK_TOKEN = 'webhook-secret-token';
 process.env.URL_BACKEND = 'https://api.vendamaisagro.com.br';
 
@@ -114,6 +122,8 @@ describe('PaymentService', () => {
     mockAsaasGet.mockClear();
     prisma = mockDeep<PrismaClient>();
     prisma.$transaction.mockImplementation((cb: any) => cb(prisma));
+    // Padrão: o UPDATE condicional da conclusão casa (pagamento ainda não concluído no banco).
+    prisma.payment.updateMany.mockResolvedValue({ count: 1 });
     service = new PaymentService(prisma);
   });
 
@@ -344,11 +354,15 @@ describe('PaymentService', () => {
       expect(prisma.saleData.findUnique).not.toHaveBeenCalled();
     });
 
-    it('libera a reserva (cancelled) quando a chamada ao Asaas falha após a reserva local, para não bloquear tentativas futuras', async () => {
+    it.each([
+      ['recusa explícita do Asaas (400)', Object.assign(new Error('Request failed'), { response: { status: 400, data: { errors: [{ description: 'CPF inválido' }] } } })],
+      ['conexão nunca estabelecida (ECONNREFUSED)', Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })],
+      ['chave de API inválida (401)', Object.assign(new Error('Request failed'), { response: { status: 401 } })],
+    ])('libera a reserva (cancelled) quando há certeza de que a cobrança não foi criada: %s', async (_label, error) => {
       prisma.saleData.findUnique.mockResolvedValue(buildSale());
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
       prisma.payment.create.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null }));
-      mockAsaasPost.mockRejectedValueOnce(new Error('timeout na Asaas'));
+      mockAsaasPost.mockRejectedValueOnce(error);
 
       await expect(
         service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' })
@@ -358,6 +372,112 @@ describe('PaymentService', () => {
         where: { id: 'reserved-1' },
         data: expect.objectContaining({ status: 'cancelled' }),
       });
+    });
+
+    it.each([
+      ['timeout', Object.assign(new Error('timeout of 30000ms exceeded'), { code: 'ECONNABORTED' })],
+      ['conexão resetada', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })],
+      ['erro 5xx do Asaas', Object.assign(new Error('Request failed'), { response: { status: 502 } })],
+      ['429 rate limit', Object.assign(new Error('Request failed'), { response: { status: 429 } })],
+      ['409 conflito', Object.assign(new Error('Request failed'), { response: { status: 409, data: { errors: [{ description: 'conflito' }] } } })],
+      ['404', Object.assign(new Error('Request failed'), { response: { status: 404 } })],
+      ['400 sem o corpo de erro do Asaas (ex.: proxy no caminho)', Object.assign(new Error('Request failed'), { response: { status: 400, data: '<html>Bad Request</html>' } })],
+    ])('falha ambígua (%s): MANTÉM a reserva para conciliação, sem liberar para uma segunda cobrança', async (_label, error) => {
+      prisma.saleData.findUnique.mockResolvedValue(buildSale());
+      prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
+      prisma.payment.create.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null }));
+      mockAsaasPost.mockRejectedValueOnce(error);
+
+      await expect(
+        service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' })
+      ).rejects.toThrow('PAYMENT_GATEWAY_UNCERTAIN:');
+
+      expect(prisma.payment.update).not.toHaveBeenCalled();
+    });
+
+    it('envia o id da reserva como externalReference (identidade única da tentativa, usada na conciliação)', async () => {
+      prisma.saleData.findUnique.mockResolvedValue(buildSale());
+      prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
+      prisma.payment.create.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: 'pay_new' }));
+      mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_new', status: 'PENDING' } });
+      mockAsaasGet.mockResolvedValueOnce({ data: { payload: 'pix', encodedImage: 'img', expirationDate: '2026-10-17' } });
+
+      await service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' });
+
+      expect(mockAsaasPost).toHaveBeenCalledWith('/payments', expect.objectContaining({ externalReference: 'reserved-1' }));
+    });
+
+    describe('retry sobre reserva sem referência (conciliação)', () => {
+      const STALE = new Date(Date.now() - 5 * 60_000);
+
+      it('reserva recente (requisição possivelmente em voo): não consulta o Asaas e pede para tentar de novo', async () => {
+        prisma.payment.findFirst
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null, createdAt: new Date() }));
+
+        await expect(
+          service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' })
+        ).rejects.toThrow('DUPLICATE_PAYMENT_ATTEMPT:');
+        expect(mockAsaasGet).not.toHaveBeenCalled();
+        expect(mockAsaasPost).not.toHaveBeenCalled();
+      });
+
+      it('reserva antiga cuja cobrança EXISTE no Asaas: vincula e reaproveita, sem criar outra', async () => {
+        prisma.payment.findFirst
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null, createdAt: STALE }));
+        mockAsaasGet
+          .mockResolvedValueOnce({ data: { data: [{ id: 'pay_lost', status: 'PENDING', customer: 'cus_1' }] } }) // GET /payments?externalReference
+          .mockResolvedValueOnce({ data: { id: 'pay_lost', status: 'PENDING' } }) // reuse: GET /payments/:id
+          .mockResolvedValueOnce({ data: { payload: 'pix' } }); // reuse: QR Code
+        prisma.payment.update.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: 'pay_lost' }));
+
+        const result = await service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' });
+
+        expect(mockAsaasGet).toHaveBeenNthCalledWith(1, '/payments', { params: { externalReference: 'reserved-1' } });
+        expect(mockAsaasPost).not.toHaveBeenCalled();
+        expect(result).toMatchObject({ paymentId: 'reserved-1', asaas_payment_id: 'pay_lost' });
+      });
+
+      it('reserva antiga sem cobrança no Asaas: libera a reserva (comprovadamente não cobrada)', async () => {
+        prisma.payment.findFirst
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null, createdAt: STALE }));
+        mockAsaasGet.mockResolvedValueOnce({ data: { data: [] } });
+        prisma.payment.update.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'cancelled' }));
+
+        await expect(
+          service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' })
+        ).rejects.toThrow('DUPLICATE_PAYMENT_ATTEMPT:');
+        expect(prisma.payment.update).toHaveBeenCalledWith({
+          where: { id: 'reserved-1' },
+          data: expect.objectContaining({ status: 'cancelled' }),
+        });
+        expect(mockAsaasPost).not.toHaveBeenCalled();
+      });
+    });
+
+    it('NÃO libera a reserva quando a cobrança já foi criada no Asaas e só a busca do QR Code falha (retry reaproveita a cobrança)', async () => {
+      prisma.saleData.findUnique.mockResolvedValue(buildSale());
+      prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
+      prisma.payment.create.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: 'pay_new' }));
+      mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_new', status: 'PENDING' } });
+      mockAsaasGet.mockRejectedValueOnce(new Error('timeout no QR Code'));
+
+      await expect(
+        service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' })
+      ).rejects.toThrow();
+
+      // A referência da cobrança é gravada antes do QR Code, e a linha nunca vira 'cancelled'.
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'reserved-1' },
+        data: expect.objectContaining({ asaas_payment_id: 'pay_new', status: 'pending' }),
+      });
+      expect(prisma.payment.update).not.toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ status: 'cancelled' }),
+      }));
     });
 
     it('converte uma violação de constraint única (P2002 — corrida concorrente) num erro claro, SEM chegar a chamar o Asaas', async () => {
@@ -657,6 +777,42 @@ describe('PaymentService', () => {
         where: { id: 'sale-1' },
         data: expect.objectContaining({ downPaymentCompleted: true, status: 'Entrada confirmada' }),
       });
+      // Vendedor é avisado da entrada (30%) na mesma transação da confirmação.
+      expect(mockNotifyPaymentCompleted).toHaveBeenCalledWith(prisma, {
+        paymentId: 'payment-1',
+        saleId: 'sale-1',
+        phase: 'down_payment',
+        amount: 100,
+        status: 'Entrada confirmada',
+      });
+    });
+
+    it('cartão cobrado (CONFIRMED) com falha na conclusão local: NÃO cancela a tentativa — fica pending com a referência do Asaas para webhook/poller concluírem', async () => {
+      prisma.saleData.findUnique.mockResolvedValue({ ...buildSale(), boughtProducts: [{ value: 1000 }] } as any);
+      prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
+      mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_charged', status: 'CONFIRMED' } });
+      prisma.payment.create.mockResolvedValue(buildPayment({ id: 'reserved-cc', phase: 'down_payment', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ id: 'reserved-cc', phase: 'down_payment', status: 'pending', asaas_payment_id: 'pay_charged', billingType: 'CREDIT_CARD' }));
+      // Transação de conclusão (Payment + SaleData + notificações) falha — ex.: insert da notificação.
+      prisma.$transaction.mockRejectedValueOnce(new Error('falha ao gravar notificação'));
+
+      const result = await service.createCreditCardPayment({
+        saleId: 'sale-1',
+        paymentMethodId: 'pm-1',
+        amount: 300,
+        remoteIp: '127.0.0.1',
+        phase: 'down_payment',
+        creditCard: { holderName: 'Fulano', number: '4111111111111111', expiryMonth: '12', expiryYear: '2030', ccv: '123' },
+        creditCardHolderInfo: { name: 'Fulano', email: 'f@f.com', cpfCnpj: '12345678900', postalCode: '00000000', addressNumber: '10', phone: '11999999999' },
+      });
+
+      expect(result).toMatchObject({ paymentId: 'reserved-cc', asaas_payment_id: 'pay_charged', status: 'pending' });
+      // 'completed' não é gravado fora da transação de conclusão: o poller (só 'pending') reprocessa.
+      expect(prisma.payment.update).toHaveBeenCalledTimes(1);
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'reserved-cc' },
+        data: expect.objectContaining({ asaas_payment_id: 'pay_charged', status: 'pending' }),
+      });
     });
 
     it('reaproveita uma cobrança em cartão já existente (pendente/concluída) em vez de criar outra para a mesma venda/fase', async () => {
@@ -739,12 +895,42 @@ describe('PaymentService', () => {
         )
       ).rejects.toThrow('WEBHOOK_PAYMENT_NOT_FOUND:');
 
-      // Uma única consulta, só pelo asaas_payment_id — sem fallback por saleId que poderia
-      // confirmar a tentativa de pagamento errada de uma venda com múltiplas fases/tentativas.
-      expect(prisma.payment.findFirst).toHaveBeenCalledTimes(1);
-      expect(prisma.payment.findFirst).toHaveBeenCalledWith(
+      // Sem fallback por saleId, que poderia confirmar a tentativa errada de uma venda com múltiplas
+      // fases/tentativas. A única segunda consulta é pela reserva EXATA (externalReference = id da
+      // tentativa), e só se ela ainda estiver sem cobrança vinculada.
+      expect(prisma.payment.findFirst).toHaveBeenCalledTimes(2);
+      expect(prisma.payment.findFirst).toHaveBeenNthCalledWith(1,
         expect.objectContaining({ where: { asaas_payment_id: 'pay_desconhecido' } })
       );
+      expect(prisma.payment.findFirst).toHaveBeenNthCalledWith(2,
+        { where: { id: 'sale-1', asaas_payment_id: null, status: 'pending' } }
+      );
+      expect(prisma.payment.findFirst).not.toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ saleId: expect.anything() }) })
+      );
+    });
+
+    it('vincula uma cobrança cuja resposta de criação se perdeu: externalReference aponta a reserva sem referência', async () => {
+      const reservation = buildPayment({ id: 'reserved-1', phase: 'down_payment', status: 'pending', asaas_payment_id: null });
+      prisma.payment.findFirst
+        .mockResolvedValueOnce(null) // por asaas_payment_id
+        .mockResolvedValueOnce(reservation); // pela reserva (externalReference)
+      prisma.payment.update.mockResolvedValue({ ...reservation, asaas_payment_id: 'pay_lost', status: 'pending' });
+
+      const result = await service.processWebhook(
+        { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_lost', status: 'RECEIVED', customer: 'cus_1', externalReference: 'reserved-1' } },
+        'webhook-secret-token'
+      );
+
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'reserved-1' },
+        data: expect.objectContaining({ asaas_payment_id: 'pay_lost', status: 'pending' }),
+      });
+      // Depois de vinculada, segue o fluxo normal e confirma a entrada.
+      expect(result).toMatchObject({ paymentId: 'reserved-1', status: 'completed' });
+      expect(prisma.saleData.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ downPaymentCompleted: true }),
+      }));
     });
 
     it('ignora um evento atrasado que regrediria um pagamento completed para pending', async () => {
@@ -784,14 +970,46 @@ describe('PaymentService', () => {
       );
 
       expect(result).toMatchObject({ success: true, status: 'completed' });
-      expect(prisma.payment.update).toHaveBeenCalledWith(expect.objectContaining({
-        where: { id: 'payment-1' },
+      // Conclusão condicional: só casa se o pagamento ainda não está 'completed' no banco.
+      expect(prisma.payment.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: 'payment-1', status: { not: 'completed' } },
         data: expect.objectContaining({ status: 'completed' }),
       }));
       expect(prisma.saleData.update).toHaveBeenCalledWith({
         where: { id: 'sale-1' },
-        data: expect.objectContaining({ downPaymentCompleted: true, status: 'Entrada confirmada' }),
+        data: expect.objectContaining({ downPaymentCompleted: true, status: 'Entrada confirmada', statusVersion: { increment: 1 } }),
       });
+      expect(mockNotifyPaymentCompleted).toHaveBeenCalledTimes(1);
+    });
+
+    it('conclusão duplicada que perde a corrida (pagamento já concluído no banco): NÃO toca na venda — sem reescrever status, sem avançar statusVersion, sem notificar', async () => {
+      // O registro lido ainda está 'pending', mas outra entrega (poller/webhook duplicado) concluiu antes.
+      prisma.payment.findFirst.mockResolvedValue(buildPayment({ phase: 'down_payment', status: 'pending', asaas_payment_id: 'pay_1' }));
+      prisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await service.processWebhook(
+        { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_1', status: 'RECEIVED', externalReference: 'sale-1' } },
+        'webhook-secret-token'
+      );
+
+      expect(result).toMatchObject({ success: true });
+      expect(prisma.saleData.update).not.toHaveBeenCalled();
+      expect(mockNotifyPaymentCompleted).not.toHaveBeenCalled();
+    });
+
+    it('cobrança cancelada localmente (troca de forma de pagamento) e paga depois no Asaas: a conclusão AINDA é aplicada à venda', async () => {
+      prisma.payment.findFirst.mockResolvedValue(buildPayment({ phase: 'down_payment', status: 'cancelled', asaas_payment_id: 'pay_1' }));
+
+      await service.processWebhook(
+        { event: 'PAYMENT_RECEIVED', payment: { id: 'pay_1', status: 'RECEIVED', externalReference: 'sale-1' } },
+        'webhook-secret-token'
+      );
+
+      // A condição é "não concluído" (não "pendente"): dinheiro recebido precisa refletir na venda.
+      expect(prisma.payment.updateMany.mock.calls[0][0]!.where).toEqual({ id: 'payment-1', status: { not: 'completed' } });
+      expect(prisma.saleData.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ downPaymentCompleted: true }),
+      }));
     });
 
     it('confirma pagamento full e marca downPaymentCompleted + paymentCompleted', async () => {
@@ -967,6 +1185,26 @@ describe('PaymentService', () => {
       const result = await service.syncPendingOrderPayments();
 
       expect(result).toEqual({ checked: 2, confirmed: 1, errors: 0 });
+    });
+
+    it('concilia reservas paradas sem referência (falha ambígua): vincula a cobrança encontrada pelo externalReference', async () => {
+      const stale = buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null, createdAt: new Date(Date.now() - 10 * 60_000) });
+      prisma.payment.findMany
+        .mockResolvedValueOnce([]) // pendentes com referência
+        .mockResolvedValueOnce([stale]); // reservas paradas
+      mockAsaasGet.mockResolvedValueOnce({ data: { data: [{ id: 'pay_lost', status: 'PENDING', customer: 'cus_1' }] } });
+      prisma.payment.update.mockResolvedValue({ ...stale, asaas_payment_id: 'pay_lost' });
+
+      await service.syncPendingOrderPayments();
+
+      expect(prisma.payment.findMany).toHaveBeenNthCalledWith(2, {
+        where: expect.objectContaining({ status: 'pending', asaas_payment_id: null, billingType: { not: null } }),
+      });
+      expect(mockAsaasGet).toHaveBeenCalledWith('/payments', { params: { externalReference: 'reserved-1' } });
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'reserved-1' },
+        data: expect.objectContaining({ asaas_payment_id: 'pay_lost', status: 'pending' }),
+      });
     });
 
     it('conta como erro quando a consulta ao Asaas falha, sem interromper o loop', async () => {

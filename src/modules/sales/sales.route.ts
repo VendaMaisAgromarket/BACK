@@ -217,6 +217,8 @@ router.get("/:id", controller.getById as RequestHandler);
  *     responses:
  *       200:
  *         description: Venda atualizada
+ *       409:
+ *         description: SALE_STATUS_CONFLICT — o status foi alterado por outra requisição simultânea; recarregar e tentar de novo
  */
 router.put("/:id", controller.update as RequestHandler);
 
@@ -306,6 +308,7 @@ router.get("/buyer/:userId", controller.getPurchasesForBuyer);
  *       200: { description: Decisão registrada }
  *       400: { description: Payload inválido }
  *       404: { description: Venda não encontrada }
+ *       409: { description: "SELLER_DECISION_CONFLICT — o status mudou por outra requisição simultânea; recarregar a venda e tentar de novo" }
  */
 router.patch("/:id/seller-decision", controller.setSellerDecision as RequestHandler);
 
@@ -386,7 +389,7 @@ router.post("/batch-tacit-acceptance", requireAdmin as RequestHandler, controlle
  *         schema: { type: string, format: uuid }
  *     responses:
  *       200: { description: Colheita autorizada }
- *       409: { description: Entrada não confirmada ou vendedor não aprovou }
+ *       409: { description: "Entrada não confirmada, vendedor não aprovou, ou SALE_STATUS_CONFLICT (status alterado por requisição simultânea)" }
  */
 router.patch("/:id/authorize-harvest", controller.authorizeHarvest as RequestHandler);
 
