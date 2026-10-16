@@ -199,6 +199,10 @@ model SaleData {
   sellerRating     Float?    @default(0.0)
   status           String    @default("Pedido realizado!")
   statusChangedAt  DateTime? @map("status_changed_at")
+  /// Versão monotônica do status: incrementada em TODA escrita de `status`. É o token de
+  /// compare-and-set das transições (imune a ABA: A→B→A muda a versão duas vezes) e a identidade
+  /// de cada transição nas dedupeKeys de notificação (ver NotificationService).
+  statusVersion    Int       @default(0) @map("status_version")
   addressId        String?
   paymentMethodId  String
   buyerId          String

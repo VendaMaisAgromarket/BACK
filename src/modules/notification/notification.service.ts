@@ -124,12 +124,12 @@ export class NotificationService {
   }
 
   /**
-   * Comprador: vendedor aceitou ou recusou o pedido. `transitionAt` é o statusChangedAt gravado
-   * na transição — a identidade persistente dela. A dedupeKey (decisão + venda + transição) deixa
-   * passar mudanças reais de decisão (aceitar → recusar → aceitar gera 3 avisos) e descarta o
-   * reprocessamento da mesma transição.
+   * Comprador: vendedor aceitou ou recusou o pedido. `statusVersion` é a versão gravada pela
+   * transição (SaleData.statusVersion, monotônica e única por venda) — a identidade persistente
+   * dela. A dedupeKey (decisão + venda + versão) deixa passar mudanças reais de decisão
+   * (aceitar → recusar → aceitar gera 3 avisos) e descarta o reprocessamento da mesma transição.
    */
-  async notifySellerDecision(saleId: string, approved: boolean, status: string, transitionAt: Date): Promise<void> {
+  async notifySellerDecision(saleId: string, approved: boolean, status: string, statusVersion: number): Promise<void> {
     const type = approved ? NotificationType.ORDER_ACCEPTED : NotificationType.ORDER_REJECTED;
     await this.safely(type, async () => {
       const ctx = await this.getSaleContext(saleId);
@@ -144,7 +144,7 @@ export class NotificationService {
             : `O vendedor recusou o seu pedido #${ctx.orderNumber}.`,
           saleId,
           data: { role: "buyer", orderNumber: ctx.orderNumber, status },
-          dedupeKey: `${type}:${saleId}:${transitionAt.toISOString()}`,
+          dedupeKey: `${type}:${saleId}:v${statusVersion}`,
         },
       ]);
     });
@@ -152,16 +152,16 @@ export class NotificationService {
 
   /**
    * Comprador: qualquer outra mudança de status do pedido. Vendedor(es): só entrega e conclusão.
-   * `transitionAt` é o statusChangedAt gravado na transição (identidade persistente dela): cada
-   * linha gerada leva uma dedupeKey com essa identidade + destinatário, então reprocessar a mesma
-   * transição não duplica, e uma nova transição para o mesmo status (ex.: admin volta e avança)
-   * ainda é entregue.
+   * `statusVersion` é a versão gravada pela transição (SaleData.statusVersion): cada linha gerada
+   * leva uma dedupeKey com essa versão + destinatário. Reprocessar a mesma transição não duplica;
+   * duas transições distintas nunca compartilham chave (a versão é monotônica, ao contrário de um
+   * timestamp, que pode empatar no mesmo milissegundo).
    */
-  async notifyStatusChanged(saleId: string, status: string, transitionAt: Date): Promise<void> {
+  async notifyStatusChanged(saleId: string, status: string, statusVersion: number): Promise<void> {
     await this.safely("ORDER_STATUS_CHANGED", async () => {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
-      const transitionKey = `ORDER_STATUS_CHANGED:${saleId}:${transitionAt.toISOString()}`;
+      const transitionKey = `ORDER_STATUS_CHANGED:${saleId}:v${statusVersion}`;
       const sellerNotifications: NotificationInput[] = SELLER_NOTIFIED_STATUSES.includes(status)
         ? ctx.sellerIds.map((sellerId) => ({
             userId: sellerId,

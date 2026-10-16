@@ -355,6 +355,7 @@ describe('PaymentService', () => {
     it.each([
       ['recusa explícita do Asaas (400)', Object.assign(new Error('Request failed'), { response: { status: 400, data: { errors: [{ description: 'CPF inválido' }] } } })],
       ['conexão nunca estabelecida (ECONNREFUSED)', Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })],
+      ['chave de API inválida (401)', Object.assign(new Error('Request failed'), { response: { status: 401 } })],
     ])('libera a reserva (cancelled) quando há certeza de que a cobrança não foi criada: %s', async (_label, error) => {
       prisma.saleData.findUnique.mockResolvedValue(buildSale());
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
@@ -375,6 +376,10 @@ describe('PaymentService', () => {
       ['timeout', Object.assign(new Error('timeout of 30000ms exceeded'), { code: 'ECONNABORTED' })],
       ['conexão resetada', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })],
       ['erro 5xx do Asaas', Object.assign(new Error('Request failed'), { response: { status: 502 } })],
+      ['429 rate limit', Object.assign(new Error('Request failed'), { response: { status: 429 } })],
+      ['409 conflito', Object.assign(new Error('Request failed'), { response: { status: 409, data: { errors: [{ description: 'conflito' }] } } })],
+      ['404', Object.assign(new Error('Request failed'), { response: { status: 404 } })],
+      ['400 sem o corpo de erro do Asaas (ex.: proxy no caminho)', Object.assign(new Error('Request failed'), { response: { status: 400, data: '<html>Bad Request</html>' } })],
     ])('falha ambígua (%s): MANTÉM a reserva para conciliação, sem liberar para uma segunda cobrança', async (_label, error) => {
       prisma.saleData.findUnique.mockResolvedValue(buildSale());
       prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);

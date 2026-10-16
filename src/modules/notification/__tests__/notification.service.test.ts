@@ -55,9 +55,9 @@ describe('NotificationService', () => {
   });
 
   describe('notifySellerDecision', () => {
-    const T1 = new Date('2026-10-16T12:00:00.000Z');
-    const T2 = new Date('2026-10-16T13:00:00.000Z');
-    const T3 = new Date('2026-10-16T14:00:00.000Z');
+    const V1 = 3; // versões de status consecutivas gravadas por transições reais
+    const V2 = 4;
+    const V3 = 5;
 
     it.each([
       [true, NotificationType.ORDER_ACCEPTED],
@@ -65,14 +65,14 @@ describe('NotificationService', () => {
     ])('approved=%s notifica o comprador com %s, chaveado pela transição', async (approved, type) => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
-      await service.notifySellerDecision(SALE_ID, approved, 'status', T1);
+      await service.notifySellerDecision(SALE_ID, approved, 'status', V1);
 
       expect(createdInputs(prisma)).toEqual([
         expect.objectContaining({
           userId: 'buyer-1',
           type,
           data: { role: 'buyer', orderNumber: 42, status: 'status' },
-          dedupeKey: `${type}:${SALE_ID}:${T1.toISOString()}`,
+          dedupeKey: `${type}:${SALE_ID}:v${V1}`,
         }),
       ]);
     });
@@ -80,8 +80,8 @@ describe('NotificationService', () => {
     it('reprocessar a MESMA transição gera a mesma dedupeKey (o banco descarta a duplicata)', async () => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
-      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', T1);
-      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', T1);
+      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', V1);
+      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', V1);
 
       const keys = createdInputs(prisma).map((n) => n.dedupeKey);
       expect(new Set(keys).size).toBe(1);
@@ -91,39 +91,39 @@ describe('NotificationService', () => {
     it('aceitar → recusar → aceitar entrega as três notificações (chaves distintas por transição)', async () => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
-      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', T1);
-      await service.notifySellerDecision(SALE_ID, false, 'Recusado pelo vendedor', T2);
-      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', T3);
+      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', V1);
+      await service.notifySellerDecision(SALE_ID, false, 'Recusado pelo vendedor', V2);
+      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', V3);
 
       expect(createdInputs(prisma).map((n) => n.dedupeKey)).toEqual([
-        `ORDER_ACCEPTED:${SALE_ID}:${T1.toISOString()}`,
-        `ORDER_REJECTED:${SALE_ID}:${T2.toISOString()}`,
-        `ORDER_ACCEPTED:${SALE_ID}:${T3.toISOString()}`,
+        `ORDER_ACCEPTED:${SALE_ID}:v${V1}`,
+        `ORDER_REJECTED:${SALE_ID}:v${V2}`,
+        `ORDER_ACCEPTED:${SALE_ID}:v${V3}`,
       ]);
     });
   });
 
   describe('notifyStatusChanged', () => {
-    const T1 = new Date('2026-10-16T12:00:00.000Z');
-    const T2 = new Date('2026-10-16T13:00:00.000Z');
-    const key = (t: Date, userId: string) => `ORDER_STATUS_CHANGED:${SALE_ID}:${t.toISOString()}:${userId}`;
+    const V1 = 7;
+    const V2 = 8;
+    const key = (v: number, userId: string) => `ORDER_STATUS_CHANGED:${SALE_ID}:v${v}:${userId}`;
 
     it.each(['Entregue', 'Concluído'])('status %s avisa o comprador e também o vendedor, cada linha com a dedupeKey da transição', async (status) => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext(['seller-1', 'seller-2']) as never);
 
-      await service.notifyStatusChanged(SALE_ID, status, T1);
+      await service.notifyStatusChanged(SALE_ID, status, V1);
 
       expect(createdInputs(prisma)).toEqual([
-        expect.objectContaining({ userId: 'buyer-1', data: { role: 'buyer', orderNumber: 42, status }, dedupeKey: key(T1, 'buyer-1') }),
-        expect.objectContaining({ userId: 'seller-1', data: { role: 'seller', orderNumber: 42, status }, dedupeKey: key(T1, 'seller-1') }),
-        expect.objectContaining({ userId: 'seller-2', data: { role: 'seller', orderNumber: 42, status }, dedupeKey: key(T1, 'seller-2') }),
+        expect.objectContaining({ userId: 'buyer-1', data: { role: 'buyer', orderNumber: 42, status }, dedupeKey: key(V1, 'buyer-1') }),
+        expect.objectContaining({ userId: 'seller-1', data: { role: 'seller', orderNumber: 42, status }, dedupeKey: key(V1, 'seller-1') }),
+        expect.objectContaining({ userId: 'seller-2', data: { role: 'seller', orderNumber: 42, status }, dedupeKey: key(V1, 'seller-2') }),
       ]);
     });
 
     it.each(['Cancelado', 'Colheita autorizada'])('status %s avisa só o comprador', async (status) => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
-      await service.notifyStatusChanged(SALE_ID, status, T1);
+      await service.notifyStatusChanged(SALE_ID, status, V1);
 
       expect(createdInputs(prisma).map((n) => n.userId)).toEqual(['buyer-1']);
     });
@@ -131,12 +131,12 @@ describe('NotificationService', () => {
     it('reprocessar a mesma transição repete as chaves (duplicata descartada); uma nova transição gera chaves novas', async () => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
-      await service.notifyStatusChanged(SALE_ID, 'Entregue', T1);
-      await service.notifyStatusChanged(SALE_ID, 'Entregue', T1);
-      await service.notifyStatusChanged(SALE_ID, 'Entregue', T2);
+      await service.notifyStatusChanged(SALE_ID, 'Entregue', V1);
+      await service.notifyStatusChanged(SALE_ID, 'Entregue', V1);
+      await service.notifyStatusChanged(SALE_ID, 'Entregue', V2);
 
       const buyerKeys = createdInputs(prisma).filter((n) => n.userId === 'buyer-1').map((n) => n.dedupeKey);
-      expect(buyerKeys).toEqual([key(T1, 'buyer-1'), key(T1, 'buyer-1'), key(T2, 'buyer-1')]);
+      expect(buyerKeys).toEqual([key(V1, 'buyer-1'), key(V1, 'buyer-1'), key(V2, 'buyer-1')]);
       expect(createdInputs(prisma).every((n) => typeof n.dedupeKey === 'string')).toBe(true);
     });
   });

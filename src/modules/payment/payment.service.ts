@@ -26,13 +26,26 @@ const asaasClient: AxiosInstance = axios.create({
 const PRE_CONNECTION_ERROR_CODES = ['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'];
 
 /**
- * true SÓ quando há certeza de que o Asaas não criou a cobrança: recusa explícita (4xx, exceto 408
- * Request Timeout) ou falha antes de conectar. Timeout, conexão resetada, 5xx ou qualquer erro sem
- * resposta são ambíguos — o Asaas pode ter aceitado a cobrança antes de a resposta se perder.
+ * Allowlist de respostas que o Asaas devolve ANTES de criar a cobrança:
+ * - 400 com o corpo de erro do Asaas (`errors[]`): validação/recusa do pedido (dados inválidos,
+ *   cartão não autorizado). Sem esse corpo, o 400 pode vir de um proxy no caminho → ambíguo;
+ * - 401/403: chave de API inválida/sem permissão — barrado na autenticação, antes de processar.
+ */
+const PRE_CREATION_REJECTION_STATUSES = [400, 401, 403];
+
+/**
+ * true SÓ quando há certeza de que o Asaas não criou a cobrança: uma resposta da allowlist acima ou
+ * uma falha antes de conectar. Todo o resto é ambíguo e mantém a reserva para conciliação —
+ * timeout, conexão resetada, 5xx e também qualquer outro 4xx (429 rate limit, 404/409/422 ou
+ * respostas antecipadas de proxy/gateway), em que não há garantia de que a cobrança não exista.
  */
 function isDefinitiveGatewayRejection(error: any): boolean {
-    const status: number | undefined = error?.response?.status;
-    if (status !== undefined) return status >= 400 && status < 500 && status !== 408;
+    const response = error?.response;
+    if (response) {
+        if (!PRE_CREATION_REJECTION_STATUSES.includes(response.status)) return false;
+        if (response.status === 400) return Array.isArray(response.data?.errors) && response.data.errors.length > 0;
+        return true;
+    }
     return PRE_CONNECTION_ERROR_CODES.includes(error?.code);
 }
 
@@ -1030,7 +1043,7 @@ export class PaymentService {
                 saleStatus = 'Entrada confirmada';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { downPaymentCompleted: true, status: saleStatus, statusChangedAt },
+                    data: { downPaymentCompleted: true, status: saleStatus, statusChangedAt, statusVersion: { increment: 1 } },
                 });
             } else if (paymentRecord.phase === 'full') {
                 // Pagamento único: quita entrada e total ao mesmo tempo
@@ -1038,7 +1051,7 @@ export class PaymentService {
                 saleStatus = 'Concluído';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { downPaymentCompleted: true, paymentCompleted: true, status: saleStatus, statusChangedAt },
+                    data: { downPaymentCompleted: true, paymentCompleted: true, status: saleStatus, statusChangedAt, statusVersion: { increment: 1 } },
                 });
             } else {
                 // final_payment
@@ -1046,7 +1059,7 @@ export class PaymentService {
                 saleStatus = 'Concluído';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { paymentCompleted: true, status: saleStatus, statusChangedAt },
+                    data: { paymentCompleted: true, status: saleStatus, statusChangedAt, statusVersion: { increment: 1 } },
                 });
             }
 
