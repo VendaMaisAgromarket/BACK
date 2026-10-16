@@ -288,6 +288,13 @@ export class SaleController {
       res.status(200).json(result);
     } catch (error: any) {
       console.error(error);
+      if (error.message === "SELLER_DECISION_CONFLICT") {
+        res.status(409).json({
+          error: "O status do pedido foi alterado por outra requisição. Atualize a página e tente novamente.",
+          code: "SELLER_DECISION_CONFLICT",
+        });
+        return;
+      }
       if (error.message === "PLANNED_HARVEST_DATE_REQUIRED") {
         res.status(400).json({ error: "plannedHarvestDate é obrigatório ao aprovar o pedido." });
         return;

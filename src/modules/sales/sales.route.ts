@@ -306,6 +306,7 @@ router.get("/buyer/:userId", controller.getPurchasesForBuyer);
  *       200: { description: Decisão registrada }
  *       400: { description: Payload inválido }
  *       404: { description: Venda não encontrada }
+ *       409: { description: "SELLER_DECISION_CONFLICT — o status mudou por outra requisição simultânea; recarregar a venda e tentar de novo" }
  */
 router.patch("/:id/seller-decision", controller.setSellerDecision as RequestHandler);
 

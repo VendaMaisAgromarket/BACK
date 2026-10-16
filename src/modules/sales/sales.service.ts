@@ -490,7 +490,7 @@ export class SaleService {
 
     if (updateData.statusChangedAt) {
       if (data.sellerApproved !== undefined && data.sellerApproved !== null) {
-        await this.notifications.notifySellerDecision(id, data.sellerApproved, updated.status);
+        await this.notifications.notifySellerDecision(id, data.sellerApproved, updated.status, updateData.statusChangedAt);
       } else {
         await this.notifications.notifyStatusChanged(id, updated.status);
       }
@@ -579,18 +579,30 @@ export class SaleService {
         }
       : {};
 
-    const updated = await this.prisma.saleData.update({
-      where: { id: saleId },
-      data: { sellerApproved: dto.approved, status: newStatus, statusChangedAt: new Date(), ...dateFields },
-      include: { boughtProducts: true },
-    });
+    // Reenviar a mesma decisão (ex.: só para preencher datas) não é uma transição: não reseta
+    // statusChangedAt nem notifica o comprador de novo.
+    const isTransition = sale.status !== newStatus;
+    const statusChangedAt = new Date();
 
-    // Reenviar a mesma decisão (ex.: só para preencher datas) não notifica o comprador de novo.
-    if (sale.status !== newStatus) {
-      await this.notifications.notifySellerDecision(saleId, dto.approved, newStatus);
+    // Compare-and-set no status lido acima: entre duas decisões simultâneas, só uma efetiva a
+    // transição (a outra encontra o status já alterado e recebe SELLER_DECISION_CONFLICT). Assim
+    // cada transição real tem um único statusChangedAt, usado como identidade na notificação.
+    const { count } = await this.prisma.saleData.updateMany({
+      where: { id: saleId, status: sale.status },
+      data: {
+        sellerApproved: dto.approved,
+        status: newStatus,
+        ...(isTransition && { statusChangedAt }),
+        ...dateFields,
+      },
+    });
+    if (count === 0) throw new Error("SELLER_DECISION_CONFLICT");
+
+    if (isTransition) {
+      await this.notifications.notifySellerDecision(saleId, dto.approved, newStatus, statusChangedAt);
     }
 
-    return updated;
+    return this.prisma.saleData.findUnique({ where: { id: saleId }, include: { boughtProducts: true } });
   }
 
   /**

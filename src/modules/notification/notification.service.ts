@@ -124,11 +124,12 @@ export class NotificationService {
   }
 
   /**
-   * Comprador: vendedor aceitou ou recusou o pedido. A checagem de status em setSellerDecision é
-   * feita antes do update, então decisões simultâneas/repetidas podem chegar aqui mais de uma vez —
-   * a dedupeKey estável por venda + decisão garante uma única notificação de cada tipo.
+   * Comprador: vendedor aceitou ou recusou o pedido. `transitionAt` é o statusChangedAt gravado
+   * na transição — a identidade persistente dela. A dedupeKey (decisão + venda + transição) deixa
+   * passar mudanças reais de decisão (aceitar → recusar → aceitar gera 3 avisos) e descarta o
+   * reprocessamento da mesma transição.
    */
-  async notifySellerDecision(saleId: string, approved: boolean, status: string): Promise<void> {
+  async notifySellerDecision(saleId: string, approved: boolean, status: string, transitionAt: Date): Promise<void> {
     const type = approved ? NotificationType.ORDER_ACCEPTED : NotificationType.ORDER_REJECTED;
     await this.safely(type, async () => {
       const ctx = await this.getSaleContext(saleId);
@@ -143,7 +144,7 @@ export class NotificationService {
             : `O vendedor recusou o seu pedido #${ctx.orderNumber}.`,
           saleId,
           data: { role: "buyer", orderNumber: ctx.orderNumber, status },
-          dedupeKey: `${type}:${saleId}`,
+          dedupeKey: `${type}:${saleId}:${transitionAt.toISOString()}`,
         },
       ]);
     });

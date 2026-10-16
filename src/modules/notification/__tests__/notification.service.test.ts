@@ -55,35 +55,51 @@ describe('NotificationService', () => {
   });
 
   describe('notifySellerDecision', () => {
+    const T1 = new Date('2026-10-16T12:00:00.000Z');
+    const T2 = new Date('2026-10-16T13:00:00.000Z');
+    const T3 = new Date('2026-10-16T14:00:00.000Z');
+
     it.each([
       [true, NotificationType.ORDER_ACCEPTED],
       [false, NotificationType.ORDER_REJECTED],
-    ])('approved=%s notifica o comprador com %s', async (approved, type) => {
+    ])('approved=%s notifica o comprador com %s, chaveado pela transição', async (approved, type) => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
-      await service.notifySellerDecision(SALE_ID, approved, 'status');
+      await service.notifySellerDecision(SALE_ID, approved, 'status', T1);
 
       expect(createdInputs(prisma)).toEqual([
         expect.objectContaining({
           userId: 'buyer-1',
           type,
           data: { role: 'buyer', orderNumber: 42, status: 'status' },
-          dedupeKey: `${type}:${SALE_ID}`,
+          dedupeKey: `${type}:${SALE_ID}:${T1.toISOString()}`,
         }),
       ]);
     });
 
-    it('decisões repetidas/simultâneas usam a mesma dedupeKey (o banco descarta a duplicata)', async () => {
+    it('reprocessar a MESMA transição gera a mesma dedupeKey (o banco descarta a duplicata)', async () => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
-      await Promise.all([
-        service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor'),
-        service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor'),
-      ]);
+      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', T1);
+      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', T1);
 
       const keys = createdInputs(prisma).map((n) => n.dedupeKey);
-      expect(keys).toEqual([`ORDER_ACCEPTED:${SALE_ID}`, `ORDER_ACCEPTED:${SALE_ID}`]);
+      expect(new Set(keys).size).toBe(1);
       expect(prisma.notification.createMany).toHaveBeenCalledWith(expect.objectContaining({ skipDuplicates: true }));
+    });
+
+    it('aceitar → recusar → aceitar entrega as três notificações (chaves distintas por transição)', async () => {
+      prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
+
+      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', T1);
+      await service.notifySellerDecision(SALE_ID, false, 'Recusado pelo vendedor', T2);
+      await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', T3);
+
+      expect(createdInputs(prisma).map((n) => n.dedupeKey)).toEqual([
+        `ORDER_ACCEPTED:${SALE_ID}:${T1.toISOString()}`,
+        `ORDER_REJECTED:${SALE_ID}:${T2.toISOString()}`,
+        `ORDER_ACCEPTED:${SALE_ID}:${T3.toISOString()}`,
+      ]);
     });
   });
 

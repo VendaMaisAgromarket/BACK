@@ -368,6 +368,28 @@ describe('PaymentService', () => {
       });
     });
 
+    it('NÃO libera a reserva quando a cobrança já foi criada no Asaas e só a busca do QR Code falha (retry reaproveita a cobrança)', async () => {
+      prisma.saleData.findUnique.mockResolvedValue(buildSale());
+      prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
+      prisma.payment.create.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ id: 'reserved-1', status: 'pending', asaas_payment_id: 'pay_new' }));
+      mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_new', status: 'PENDING' } });
+      mockAsaasGet.mockRejectedValueOnce(new Error('timeout no QR Code'));
+
+      await expect(
+        service.createPixPayment({ saleId: 'sale-1', paymentMethodId: 'pm-1', amount: 100, email: 'comprador@teste.com' })
+      ).rejects.toThrow();
+
+      // A referência da cobrança é gravada antes do QR Code, e a linha nunca vira 'cancelled'.
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'reserved-1' },
+        data: expect.objectContaining({ asaas_payment_id: 'pay_new', status: 'pending' }),
+      });
+      expect(prisma.payment.update).not.toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ status: 'cancelled' }),
+      }));
+    });
+
     it('converte uma violação de constraint única (P2002 — corrida concorrente) num erro claro, SEM chegar a chamar o Asaas', async () => {
       // A reserva (prisma.payment.create) agora acontece ANTES de qualquer chamada ao Asaas —
       // se ela falhar por P2002, a cobrança remota nunca deve ser criada (fecha o risco de
@@ -672,6 +694,34 @@ describe('PaymentService', () => {
         phase: 'down_payment',
         amount: 100,
         status: 'Entrada confirmada',
+      });
+    });
+
+    it('cartão cobrado (CONFIRMED) com falha na conclusão local: NÃO cancela a tentativa — fica pending com a referência do Asaas para webhook/poller concluírem', async () => {
+      prisma.saleData.findUnique.mockResolvedValue({ ...buildSale(), boughtProducts: [{ value: 1000 }] } as any);
+      prisma.user.findUnique.mockResolvedValue({ ...buildUser({ asaas_customer_id: 'cus_1' }), addresses: [] } as any);
+      mockAsaasPost.mockResolvedValueOnce({ data: { id: 'pay_charged', status: 'CONFIRMED' } });
+      prisma.payment.create.mockResolvedValue(buildPayment({ id: 'reserved-cc', phase: 'down_payment', status: 'pending', asaas_payment_id: null }));
+      prisma.payment.update.mockResolvedValue(buildPayment({ id: 'reserved-cc', phase: 'down_payment', status: 'pending', asaas_payment_id: 'pay_charged', billingType: 'CREDIT_CARD' }));
+      // Transação de conclusão (Payment + SaleData + notificações) falha — ex.: insert da notificação.
+      prisma.$transaction.mockRejectedValueOnce(new Error('falha ao gravar notificação'));
+
+      const result = await service.createCreditCardPayment({
+        saleId: 'sale-1',
+        paymentMethodId: 'pm-1',
+        amount: 300,
+        remoteIp: '127.0.0.1',
+        phase: 'down_payment',
+        creditCard: { holderName: 'Fulano', number: '4111111111111111', expiryMonth: '12', expiryYear: '2030', ccv: '123' },
+        creditCardHolderInfo: { name: 'Fulano', email: 'f@f.com', cpfCnpj: '12345678900', postalCode: '00000000', addressNumber: '10', phone: '11999999999' },
+      });
+
+      expect(result).toMatchObject({ paymentId: 'reserved-cc', asaas_payment_id: 'pay_charged', status: 'pending' });
+      // 'completed' não é gravado fora da transação de conclusão: o poller (só 'pending') reprocessa.
+      expect(prisma.payment.update).toHaveBeenCalledTimes(1);
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'reserved-cc' },
+        data: expect.objectContaining({ asaas_payment_id: 'pay_charged', status: 'pending' }),
       });
     });
 
