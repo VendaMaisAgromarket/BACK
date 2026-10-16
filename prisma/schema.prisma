@@ -20,6 +20,17 @@ enum SaleStatus {
   REJECTED
 }
 
+enum NotificationType {
+  NEW_ORDER // vendedor: chegou um pedido
+  ORDER_ACCEPTED // comprador: vendedor aceitou o pedido
+  ORDER_REJECTED // comprador: vendedor recusou o pedido
+  DOWN_PAYMENT_RECEIVED // vendedor: comprador pagou a entrada (30%)
+  WEIGHT_REGISTERED // comprador: vendedor registrou a pesagem
+  FINAL_PAYMENT_RECEIVED // vendedor: comprador pagou a parcela final (70%) ou o valor integral
+  ORDER_STATUS_CHANGED // comprador: demais mudanças de status; vendedor: só Entregue/Concluído
+  PRODUCT_HARVEST_REMINDER // vendedor: anúncio ativo com colheita em até 5 dias (será desativado na data)
+}
+
 enum ContractKind {
   sale_tos
   terms_of_use
@@ -57,6 +68,7 @@ model User {
 
   acceptances        ContractAcceptance[]
   operationDocuments OperationDocument[]
+  notifications      Notification[]
 }
 
 model Address {
@@ -113,6 +125,7 @@ model Product {
   boughtProducts     BoughtProduct[]
   questions          Question[]
   CartItem           CartItem[]
+  notifications      Notification[]
 }
 
 model SellerStats {
@@ -186,6 +199,10 @@ model SaleData {
   sellerRating     Float?    @default(0.0)
   status           String    @default("Pedido realizado!")
   statusChangedAt  DateTime? @map("status_changed_at")
+  /// Versão monotônica do status: incrementada em TODA escrita de `status`. É o token de
+  /// compare-and-set das transições (imune a ABA: A→B→A muda a versão duas vezes) e a identidade
+  /// de cada transição nas dedupeKeys de notificação (ver NotificationService).
+  statusVersion    Int       @default(0) @map("status_version")
   addressId        String?
   paymentMethodId  String
   buyerId          String
@@ -227,6 +244,7 @@ model SaleData {
   operationDocuments  OperationDocument[]
   saleContract        SaleContract?
   addenda             SaleAddendum[]
+  notifications       Notification[]
 }
 
 model BoughtProduct {
@@ -406,4 +424,30 @@ model ContractAcceptance {
 
   @@unique([userId, contractId, saleId, role])
   @@index([saleId, role])
+}
+
+/// Notificação in-app de um usuário, gerada pelo backend nos pontos que mudam o estado de uma venda
+/// (ver NotificationService). `dedupeKey` é único: a mesma transição processada duas vezes
+/// (webhook + poller, retry, job reiniciado) não gera notificação duplicada.
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String           @map("user_id")
+  type      NotificationType
+  title     String
+  message   String
+  saleId    String?          @map("sale_id")
+  productId String?          @map("product_id")
+  data      Json?
+  dedupeKey String?          @unique @map("dedupe_key")
+  readAt    DateTime?        @map("read_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  user    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sale    SaleData? @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product?  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+  @@index([saleId])
+  @@index([productId])
 }

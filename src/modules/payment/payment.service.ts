@@ -1,16 +1,53 @@
 import { Payment, PrismaClient } from '@prisma/client';
 import axios, { AxiosInstance } from 'axios';
 import 'dotenv/config';
+import { NotificationService } from '../notification/notification.service';
 
 type PaymentPhase = 'down_payment' | 'final_payment' | 'full';
 
+/**
+ * Timeout das chamadas ao Asaas. Também delimita quanto tempo uma requisição de criação pode
+ * ficar "em voo": depois de STALE_RESERVATION_MS sem asaas_payment_id, a reserva com certeza não
+ * tem mais requisição em andamento e pode ser conciliada (ver reconcileReservation).
+ */
+const ASAAS_TIMEOUT_MS = 30_000;
+const STALE_RESERVATION_MS = 2 * 60_000;
+
 const asaasClient: AxiosInstance = axios.create({
     baseURL: process.env.ASAAS_BASE_URL || 'https://api-sandbox.asaas.com/v3',
+    timeout: ASAAS_TIMEOUT_MS,
     headers: {
         'Content-Type': 'application/json',
         access_token: process.env.ASAAS_API_KEY || ''
     }
 });
+
+/** Erros de rede em que a conexão nem chegou a ser estabelecida — a requisição não alcançou o Asaas. */
+const PRE_CONNECTION_ERROR_CODES = ['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'];
+
+/**
+ * Allowlist de respostas que o Asaas devolve ANTES de criar a cobrança:
+ * - 400 com o corpo de erro do Asaas (`errors[]`): validação/recusa do pedido (dados inválidos,
+ *   cartão não autorizado). Sem esse corpo, o 400 pode vir de um proxy no caminho → ambíguo;
+ * - 401/403: chave de API inválida/sem permissão — barrado na autenticação, antes de processar.
+ */
+const PRE_CREATION_REJECTION_STATUSES = [400, 401, 403];
+
+/**
+ * true SÓ quando há certeza de que o Asaas não criou a cobrança: uma resposta da allowlist acima ou
+ * uma falha antes de conectar. Todo o resto é ambíguo e mantém a reserva para conciliação —
+ * timeout, conexão resetada, 5xx e também qualquer outro 4xx (429 rate limit, 404/409/422 ou
+ * respostas antecipadas de proxy/gateway), em que não há garantia de que a cobrança não exista.
+ */
+function isDefinitiveGatewayRejection(error: any): boolean {
+    const response = error?.response;
+    if (response) {
+        if (!PRE_CREATION_REJECTION_STATUSES.includes(response.status)) return false;
+        if (response.status === 400) return Array.isArray(response.data?.errors) && response.data.errors.length > 0;
+        return true;
+    }
+    return PRE_CONNECTION_ERROR_CODES.includes(error?.code);
+}
 
 /** Extrai a mensagem de erro da resposta da API do Asaas, com fallback para o erro genérico. */
 function extractAsaasErrorMessage(error: any, fallback: string): string {
@@ -28,6 +65,7 @@ export const KNOWN_PAYMENT_ERROR_PREFIXES = [
     'FINAL_BOLETO_BLOCKED:',
     'DUPLICATE_PAYMENT_ATTEMPT:',
     'PAYMENT_ALREADY_COMPLETED:',
+    'PAYMENT_GATEWAY_UNCERTAIN:',
 ] as const;
 
 export function findKnownPaymentErrorPrefix(error: unknown): string | undefined {
@@ -46,8 +84,10 @@ const REVERSAL_STATUSES = ['refunded', 'cancelled'];
 
 export class PaymentService {
     private readonly prisma: PrismaClient;
+    private readonly notifications: NotificationService;
     constructor(prisma?: PrismaClient) {
         this.prisma = prisma || new PrismaClient();
+        this.notifications = new NotificationService(this.prisma);
     }
 
     /**
@@ -186,9 +226,37 @@ export class PaymentService {
             throw new Error('PAYMENT_ALREADY_COMPLETED:Esta parcela já foi paga (pagamento anterior à migração para o Asaas).');
         }
         if (!existing.asaas_payment_id) {
+            // Reserva sem referência: requisição ainda em voo, ou falha ambígua do gateway. Passado o
+            // tempo máximo de voo, concilia com o Asaas: se a cobrança existe, reaproveita.
+            const reconciled = await this.reconcileReservation(existing);
+            if (reconciled) return this.buildReuseResponse(reconciled, phase);
             throw new Error('DUPLICATE_PAYMENT_ATTEMPT:Uma cobrança para esta venda/fase já está sendo criada. Tente novamente em alguns segundos.');
         }
         return this.buildReuseResponse(existing, phase);
+    }
+
+    /**
+     * Concilia uma reserva sem asaas_payment_id com o Asaas, pelo externalReference (= id da reserva,
+     * único por tentativa — ver chargeReservation). Só age em reservas mais antigas que
+     * STALE_RESERVATION_MS, quando já não há requisição em andamento:
+     * - cobrança encontrada → vincula (e conclui, se já confirmada) e devolve o Payment;
+     * - não encontrada → o Asaas comprovadamente não criou a cobrança: libera a reserva e devolve null.
+     * Reservas recentes não são tocadas (null). Chamado no retry do comprador, no poller e no webhook.
+     */
+    private async reconcileReservation(reservation: Payment, now: Date = new Date()): Promise<Payment | null> {
+        if (reservation.asaas_payment_id || reservation.status !== 'pending') return null;
+        if (now.getTime() - reservation.createdAt.getTime() < STALE_RESERVATION_MS) return null;
+
+        const { data } = await asaasClient.get('/payments', { params: { externalReference: reservation.id } });
+        const asaasPayment = data?.data?.[0];
+        if (!asaasPayment) {
+            console.info(`[reconcileReservation] Nenhuma cobrança no Asaas para a reserva ${reservation.id} — liberando`);
+            await this.releaseReservation(reservation.id);
+            return null;
+        }
+
+        console.info(`[reconcileReservation] Cobrança ${asaasPayment.id} encontrada para a reserva ${reservation.id} — vinculando`);
+        return this.attachGatewayCharge(reservation.id, asaasPayment.customer, asaasPayment);
     }
 
     /**
@@ -266,17 +334,97 @@ export class PaymentService {
     }
 
     /**
-     * Alguns meios de pagamento confirmam de forma síncrona (ex.: cartão de crédito aprovado
-     * na hora da captura). Quando o Payment já nasce 'completed', aplica a mesma transição de
-     * SaleData que o webhook aplicaria — sem isso, a venda fica com downPaymentCompleted/
-     * paymentCompleted falsos mesmo com a cobrança já confirmada, e o webhook subsequente pula
-     * a atualização por já achar o status igual.
+     * Cria a cobrança no Asaas para uma reserva já gravada e vincula a referência à linha local.
+     *
+     * A reserva só é liberada ('cancelled') quando há CERTEZA de que o Asaas não criou a cobrança:
+     * falha ao obter o cliente (antes do POST /payments) ou recusa definitiva do POST
+     * (isDefinitiveGatewayRejection). Em falha ambígua (timeout, conexão resetada, 5xx) a reserva
+     * fica 'pending' sem referência — bloqueando novas tentativas pelo índice único — até ser
+     * conciliada por reconcileReservation. Liberar nesse caso permitiria uma segunda cobrança, já que
+     * findExistingAttempt ignora tentativas canceladas.
+     *
+     * O externalReference é o id da reserva (único por tentativa), o que torna a conciliação exata.
+     * Quem chama não deve envolver o restante do fluxo (QR Code, resposta) num catch que libere a reserva.
      */
-    private async applyCompletionIfAlreadySettled(payment: Payment): Promise<void> {
-        if (payment.status !== 'completed') return;
-        await this.prisma.$transaction(async (tx) => {
-            await this.applyPaymentCompletion(tx, payment, payment.status);
-        });
+    private async chargeReservation(
+        reservedId: string,
+        buyerId: string,
+        buildBody: (customerId: string) => Record<string, unknown>
+    ): Promise<{ payment: Payment; asaasPayment: any }> {
+        let customerId: string;
+        try {
+            customerId = await this.ensureAsaasCustomer(buyerId);
+        } catch (error) {
+            await this.releaseReservation(reservedId);
+            throw error;
+        }
+
+        let asaasPayment: any;
+        try {
+            ({ data: asaasPayment } = await asaasClient.post('/payments', {
+                ...buildBody(customerId),
+                externalReference: reservedId,
+            }));
+        } catch (error) {
+            if (isDefinitiveGatewayRejection(error)) {
+                await this.releaseReservation(reservedId);
+                throw error;
+            }
+            console.error(`[chargeReservation] Resultado incerto ao criar a cobrança da reserva ${reservedId} (${(error as any)?.code ?? (error as any)?.response?.status ?? (error as Error)?.message}) — reserva mantida para conciliação`);
+            throw new Error('PAYMENT_GATEWAY_UNCERTAIN:Não foi possível confirmar a criação da cobrança junto ao gateway. Aguarde alguns minutos e consulte o pedido antes de tentar novamente.');
+        }
+
+        const payment = await this.attachGatewayCharge(reservedId, customerId, asaasPayment);
+        return { payment, asaasPayment };
+    }
+
+    /**
+     * Vincula uma cobrança existente no Asaas à reserva local e, se já confirmada, aplica a conclusão.
+     * A conclusão ('completed') NÃO é gravada aqui: se fosse, e a transação de conclusão falhasse, o
+     * Payment ficaria 'completed' com a venda sem a baixa — o webhook pularia (status igual) e o
+     * poller (só 'pending') nunca reprocessaria. Mantendo 'pending' + asaas_payment_id, webhook/poller
+     * reaplicam a conclusão, e retries reaproveitam esta cobrança.
+     */
+    private async attachGatewayCharge(reservedId: string, customerId: string, asaasPayment: any): Promise<Payment> {
+        const gatewayStatus = this.mapAsaasStatus(asaasPayment.status);
+        let payment: Payment;
+        try {
+            payment = await this.prisma.payment.update({
+                where: { id: reservedId },
+                data: {
+                    asaas_customer_id: customerId,
+                    asaas_payment_id: asaasPayment.id,
+                    status: gatewayStatus === 'completed' ? 'pending' : gatewayStatus,
+                },
+            });
+        } catch (error) {
+            // A reserva continua 'pending' sem referência: bloqueia novas tentativas e será
+            // conciliada pelo externalReference (retry/poller/webhook) — sem risco de cobrança dupla.
+            console.error(`[attachGatewayCharge] Cobrança Asaas ${asaasPayment.id} criada, mas falhou ao vinculá-la ao pagamento ${reservedId} — será conciliada pelo externalReference`);
+            throw error;
+        }
+
+        return this.settleIfConfirmed(payment, gatewayStatus);
+    }
+
+    /**
+     * Alguns meios de pagamento confirmam de forma síncrona (ex.: cartão aprovado na captura).
+     * Aplica a mesma conclusão que o webhook aplicaria (Payment + SaleData + notificações, numa
+     * transação). Uma falha aqui não é propagada: a cobrança já foi feita, o Payment continua
+     * 'pending' com asaas_payment_id, e webhook/poller (ou o sync manual) concluem depois —
+     * applyPaymentCompletion é repetível e as notificações são deduplicadas por paymentId.
+     */
+    private async settleIfConfirmed(payment: Payment, gatewayStatus: string): Promise<Payment> {
+        if (gatewayStatus !== 'completed') return payment;
+        try {
+            await this.prisma.$transaction(async (tx) => {
+                await this.applyPaymentCompletion(tx, payment, 'completed');
+            });
+            return { ...payment, status: 'completed' };
+        } catch (error: any) {
+            console.error(`[settleIfConfirmed] Cobrança ${payment.asaas_payment_id} confirmada no Asaas, mas a conclusão local do pagamento ${payment.id} falhou (${error?.message}) — mantido 'pending' para o webhook/poller reaplicar`);
+            return payment;
+        }
     }
 
     /**
@@ -309,6 +457,7 @@ export class PaymentService {
      * Libera uma reserva que não chegou a se tornar uma cobrança real no Asaas (ex.: a chamada
      * à API falhou após a reserva) — sem isso, a linha reservada ficaria 'pending' para sempre
      * e bloquearia qualquer nova tentativa para a mesma venda/fase/meio de pagamento.
+     * Só pode ser chamada antes de o Asaas aceitar a cobrança (ver chargeReservation).
      */
     private async releaseReservation(reservedId: string): Promise<void> {
         await this.prisma.payment.update({
@@ -364,41 +513,21 @@ export class PaymentService {
                 billingType: 'UNDEFINED'
             });
 
-            try {
-                const customerId = await this.ensureAsaasCustomer(sale.buyerId);
-                const dueDate = new Date().toISOString().split('T')[0];
+            const { payment, asaasPayment } = await this.chargeReservation(reserved.id, sale.buyerId, (customerId) => ({
+                customer: customerId,
+                billingType: 'UNDEFINED',
+                value: amount,
+                dueDate: new Date().toISOString().split('T')[0],
+                description: params.title
+            }));
 
-                const { data: asaasPayment } = await asaasClient.post('/payments', {
-                    customer: customerId,
-                    billingType: 'UNDEFINED',
-                    value: amount,
-                    dueDate,
-                    externalReference: params.saleId,
-                    description: params.title
-                });
+            console.info(`[createPreference] Fatura criada com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
 
-                const payment = await this.prisma.payment.update({
-                    where: { id: reserved.id },
-                    data: {
-                        asaas_customer_id: customerId,
-                        asaas_payment_id: asaasPayment.id,
-                        status: this.mapAsaasStatus(asaasPayment.status)
-                    }
-                });
-
-                await this.applyCompletionIfAlreadySettled(payment);
-
-                console.info(`[createPreference] Fatura criada com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
-
-                return {
-                    paymentId: payment.id,
-                    asaas_payment_id: asaasPayment.id,
-                    init_point: asaasPayment.invoiceUrl
-                };
-            } catch (innerError) {
-                await this.releaseReservation(reserved.id);
-                throw innerError;
-            }
+            return {
+                paymentId: payment.id,
+                asaas_payment_id: asaasPayment.id,
+                init_point: asaasPayment.invoiceUrl
+            };
         } catch (error: any) {
             if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar fatura do Asaas');
@@ -521,56 +650,39 @@ export class PaymentService {
                 billingType: 'PIX'
             });
 
-            try {
-                const customerId = await this.ensureAsaasCustomer(sale.buyerId);
+            // PIX é liquidado instantaneamente, mas o Asaas ainda exige um dueDate;
+            // expirationMinutes (herdado da API antiga) é aproximado em dias corridos.
+            const dueDateObj = new Date();
+            if (params.expirationMinutes) dueDateObj.setMinutes(dueDateObj.getMinutes() + params.expirationMinutes);
+            const dueDate = dueDateObj.toISOString().split('T')[0];
 
-                // PIX é liquidado instantaneamente, mas o Asaas ainda exige um dueDate;
-                // expirationMinutes (herdado da API antiga) é aproximado em dias corridos.
-                const dueDateObj = new Date();
-                if (params.expirationMinutes) dueDateObj.setMinutes(dueDateObj.getMinutes() + params.expirationMinutes);
-                const dueDate = dueDateObj.toISOString().split('T')[0];
+            const { payment, asaasPayment } = await this.chargeReservation(reserved.id, sale.buyerId, (customerId) => ({
+                customer: customerId,
+                billingType: 'PIX',
+                value: amount,
+                dueDate,
+                description: this.buildPaymentDescription(sale.orderNumber, phase)
+            }));
 
-                const { data: asaasPayment } = await asaasClient.post('/payments', {
-                    customer: customerId,
-                    billingType: 'PIX',
-                    value: amount,
-                    dueDate,
-                    externalReference: params.saleId,
-                    description: this.buildPaymentDescription(sale.orderNumber, phase)
-                });
+            // Buscado DEPOIS de vincular a cobrança: se falhar, a cobrança fica preservada e um retry
+            // a reaproveita (buildReuseResponse busca o QR Code de novo) em vez de criar outra.
+            const { data: qrCode } = await asaasClient.get(`/payments/${asaasPayment.id}/pixQrCode`);
 
-                const { data: qrCode } = await asaasClient.get(`/payments/${asaasPayment.id}/pixQrCode`);
+            console.info(`[createPixPayment] Pagamento PIX criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
 
-                const payment = await this.prisma.payment.update({
-                    where: { id: reserved.id },
-                    data: {
-                        asaas_customer_id: customerId,
-                        asaas_payment_id: asaasPayment.id,
-                        status: this.mapAsaasStatus(asaasPayment.status)
-                    }
-                });
-
-                await this.applyCompletionIfAlreadySettled(payment);
-
-                console.info(`[createPixPayment] Pagamento PIX criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
-
-                return {
-                    paymentId: payment.id,
-                    asaas_payment_id: asaasPayment.id,
-                    status: payment.status,
-                    phase,
-                    payment: {
-                        id: asaasPayment.id,
-                        status: asaasPayment.status,
-                        qr_code: qrCode.payload,
-                        qr_code_base64: qrCode.encodedImage,
-                        expiration_date: qrCode.expirationDate
-                    }
-                };
-            } catch (innerError) {
-                await this.releaseReservation(reserved.id);
-                throw innerError;
-            }
+            return {
+                paymentId: payment.id,
+                asaas_payment_id: asaasPayment.id,
+                status: payment.status,
+                phase,
+                payment: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    qr_code: qrCode.payload,
+                    qr_code_base64: qrCode.encodedImage,
+                    expiration_date: qrCode.expirationDate
+                }
+            };
         } catch (error: any) {
             if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao criar pagamento PIX');
@@ -603,55 +715,36 @@ export class PaymentService {
             billingType: 'BOLETO'
         });
 
-        try {
-            const customerId = await this.ensureAsaasCustomer(sale.buyerId);
+        // ?? (não ||): expirationDays: 0 é um valor explícito válido ("vence hoje"), não deve
+        // cair no default de 3 dias.
+        const expirationDays = params.expirationDays ?? 3;
+        const dueDateObj = new Date();
+        dueDateObj.setDate(dueDateObj.getDate() + expirationDays);
+        const dueDate = dueDateObj.toISOString().split('T')[0];
 
-            // ?? (não ||): expirationDays: 0 é um valor explícito válido ("vence hoje"), não deve
-            // cair no default de 3 dias.
-            const expirationDays = params.expirationDays ?? 3;
-            const dueDateObj = new Date();
-            dueDateObj.setDate(dueDateObj.getDate() + expirationDays);
-            const dueDate = dueDateObj.toISOString().split('T')[0];
+        const { payment, asaasPayment } = await this.chargeReservation(reserved.id, sale.buyerId, (customerId) => ({
+            customer: customerId,
+            billingType: 'BOLETO',
+            value: params.amount,
+            dueDate,
+            description: this.buildPaymentDescription(sale.orderNumber, params.phase)
+        }));
 
-            const { data: asaasPayment } = await asaasClient.post('/payments', {
-                customer: customerId,
-                billingType: 'BOLETO',
-                value: params.amount,
-                dueDate,
-                externalReference: params.saleId,
-                description: this.buildPaymentDescription(sale.orderNumber, params.phase)
-            });
+        console.info(`[createBoletoCharge] Boleto criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
 
-            const payment = await this.prisma.payment.update({
-                where: { id: reserved.id },
-                data: {
-                    asaas_customer_id: customerId,
-                    asaas_payment_id: asaasPayment.id,
-                    status: this.mapAsaasStatus(asaasPayment.status)
-                }
-            });
-
-            await this.applyCompletionIfAlreadySettled(payment);
-
-            console.info(`[createBoletoCharge] Boleto criado com sucesso - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}`);
-
-            return {
-                paymentId: payment.id,
-                asaas_payment_id: asaasPayment.id,
-                status: payment.status,
-                phase: params.phase,
-                payment: {
-                    id: asaasPayment.id,
-                    status: asaasPayment.status,
-                    ticket_url: asaasPayment.bankSlipUrl,
-                    invoice_url: asaasPayment.invoiceUrl,
-                    expiration_date: dueDate
-                }
-            };
-        } catch (innerError) {
-            await this.releaseReservation(reserved.id);
-            throw innerError;
-        }
+        return {
+            paymentId: payment.id,
+            asaas_payment_id: asaasPayment.id,
+            status: payment.status,
+            phase: params.phase,
+            payment: {
+                id: asaasPayment.id,
+                status: asaasPayment.status,
+                ticket_url: asaasPayment.bankSlipUrl,
+                invoice_url: asaasPayment.invoiceUrl,
+                expiration_date: dueDate
+            }
+        };
     }
 
     async createBoletoPayment(params: {
@@ -753,57 +846,37 @@ export class PaymentService {
                 billingType: 'CREDIT_CARD'
             });
 
-            try {
-                const customerId = await this.ensureAsaasCustomer(sale.buyerId);
-                const dueDate = new Date().toISOString().split('T')[0]; // captura imediata; dueDate não agenda a cobrança
+            const installmentCount = params.installmentCount && params.installmentCount > 1 ? params.installmentCount : undefined;
 
-                const installmentCount = params.installmentCount && params.installmentCount > 1 ? params.installmentCount : undefined;
+            const { payment, asaasPayment } = await this.chargeReservation(reserved.id, sale.buyerId, (customerId) => ({
+                customer: customerId,
+                billingType: 'CREDIT_CARD',
+                value: amount,
+                dueDate: new Date().toISOString().split('T')[0], // captura imediata; dueDate não agenda a cobrança
+                description: this.buildPaymentDescription(sale.orderNumber, phase),
+                remoteIp: params.remoteIp,
+                creditCard: params.creditCard,
+                creditCardHolderInfo: params.creditCardHolderInfo,
+                ...(installmentCount && {
+                    installmentCount,
+                    installmentValue: parseFloat((amount / installmentCount).toFixed(2))
+                })
+            }));
 
-                const { data: asaasPayment } = await asaasClient.post('/payments', {
-                    customer: customerId,
-                    billingType: 'CREDIT_CARD',
-                    value: amount,
-                    dueDate,
-                    externalReference: params.saleId,
-                    description: this.buildPaymentDescription(sale.orderNumber, phase),
-                    remoteIp: params.remoteIp,
-                    creditCard: params.creditCard,
-                    creditCardHolderInfo: params.creditCardHolderInfo,
-                    ...(installmentCount && {
-                        installmentCount,
-                        installmentValue: parseFloat((amount / installmentCount).toFixed(2))
-                    })
-                });
+            console.info(`[createCreditCardPayment] Pagamento em cartão criado - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}, Status: ${asaasPayment.status}`);
 
-                const payment = await this.prisma.payment.update({
-                    where: { id: reserved.id },
-                    data: {
-                        asaas_customer_id: customerId,
-                        asaas_payment_id: asaasPayment.id,
-                        status: this.mapAsaasStatus(asaasPayment.status)
-                    }
-                });
-
-                await this.applyCompletionIfAlreadySettled(payment);
-
-                console.info(`[createCreditCardPayment] Pagamento em cartão criado - PaymentId: ${payment.id}, Asaas PaymentId: ${asaasPayment.id}, Status: ${asaasPayment.status}`);
-
-                return {
-                    paymentId: payment.id,
-                    asaas_payment_id: asaasPayment.id,
-                    status: payment.status,
-                    phase,
-                    payment: {
-                        id: asaasPayment.id,
-                        status: asaasPayment.status,
-                        brand: asaasPayment.creditCard?.creditCardBrand,
-                        lastDigits: asaasPayment.creditCard?.creditCardNumber
-                    }
-                };
-            } catch (innerError) {
-                await this.releaseReservation(reserved.id);
-                throw innerError;
-            }
+            return {
+                paymentId: payment.id,
+                asaas_payment_id: asaasPayment.id,
+                status: payment.status,
+                phase,
+                payment: {
+                    id: asaasPayment.id,
+                    status: asaasPayment.status,
+                    brand: asaasPayment.creditCard?.creditCardBrand,
+                    lastDigits: asaasPayment.creditCard?.creditCardNumber
+                }
+            };
         } catch (error: any) {
             if (findKnownPaymentErrorPrefix(error)) throw error;
             const message = extractAsaasErrorMessage(error, 'Erro ao processar pagamento com cartão de crédito');
@@ -952,39 +1025,71 @@ export class PaymentService {
         paymentRecord: Payment,
         newStatus: string,
         asaasPaymentId?: string
-    ) {
-        await tx.payment.update({
-            where: { id: paymentRecord.id },
-            data: {
-                status: newStatus,
-                ...(asaasPaymentId && { asaas_payment_id: asaasPaymentId }),
-                updatedAt: new Date()
+    ): Promise<boolean> {
+        const paymentData = {
+            status: newStatus,
+            ...(asaasPaymentId && { asaas_payment_id: asaasPaymentId }),
+            updatedAt: new Date()
+        };
+
+        if (newStatus === 'completed') {
+            // A conclusão é aplicada UMA vez por pagamento: o UPDATE condicional (dentro da transação)
+            // só casa se o pagamento ainda não está 'completed'. Webhook duplicado, poller e sync manual
+            // que chegam depois perdem a corrida e não tocam na venda — sem reescrever status, sem
+            // avançar statusVersion (o que geraria conflitos espúrios no compare-and-set das vendas) e
+            // sem resetar statusChangedAt. A condição é "não concluído", e não "pendente": uma cobrança
+            // cancelada localmente (ex.: troca de forma de pagamento) ainda pode ser paga no Asaas, e
+            // esse dinheiro recebido precisa refletir na venda.
+            const { count } = await tx.payment.updateMany({
+                where: { id: paymentRecord.id, status: { not: 'completed' } },
+                data: paymentData,
+            });
+            if (count === 0) {
+                console.info(`[applyPaymentCompletion] Pagamento ${paymentRecord.id} já estava concluído — nenhuma alteração na venda ${paymentRecord.saleId}`);
+                return false;
             }
-        });
+        } else {
+            await tx.payment.update({ where: { id: paymentRecord.id }, data: paymentData });
+        }
 
         if (newStatus === 'completed') {
             const statusChangedAt = new Date();
+            let saleStatus: string;
             if (paymentRecord.phase === 'down_payment') {
                 console.info(`[applyPaymentCompletion] Entrada confirmada para venda ${paymentRecord.saleId}`);
+                saleStatus = 'Entrada confirmada';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { downPaymentCompleted: true, status: 'Entrada confirmada', statusChangedAt },
+                    data: { downPaymentCompleted: true, status: saleStatus, statusChangedAt, statusVersion: { increment: 1 } },
                 });
             } else if (paymentRecord.phase === 'full') {
                 // Pagamento único: quita entrada e total ao mesmo tempo
                 console.info(`[applyPaymentCompletion] Pagamento único (full) confirmado para venda ${paymentRecord.saleId}`);
+                saleStatus = 'Concluído';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { downPaymentCompleted: true, paymentCompleted: true, status: 'Concluído', statusChangedAt },
+                    data: { downPaymentCompleted: true, paymentCompleted: true, status: saleStatus, statusChangedAt, statusVersion: { increment: 1 } },
                 });
             } else {
                 // final_payment
                 console.info(`[applyPaymentCompletion] Pagamento final confirmado para venda ${paymentRecord.saleId}`);
+                saleStatus = 'Concluído';
                 await tx.saleData.update({
                     where: { id: paymentRecord.saleId },
-                    data: { paymentCompleted: true, status: 'Concluído', statusChangedAt },
+                    data: { paymentCompleted: true, status: saleStatus, statusChangedAt, statusVersion: { increment: 1 } },
                 });
             }
+
+            // Na mesma transação: se falhar, o webhook/poller reprocessa. Esta função pode rodar
+            // mais de uma vez para o mesmo pagamento (webhook + poller + sync manual) — a dedupeKey
+            // por paymentId garante uma única notificação.
+            await this.notifications.notifyPaymentCompleted(tx, {
+                paymentId: paymentRecord.id,
+                saleId: paymentRecord.saleId,
+                phase: paymentRecord.phase,
+                amount: paymentRecord.amount,
+                status: saleStatus,
+            });
         } else if (REVERSAL_STATUSES.includes(newStatus) && paymentRecord.status === 'completed') {
             // Reembolso/estorno de um pagamento que já estava confirmado: sem isso, a venda
             // continuaria marcada como paga mesmo com o dinheiro devolvido, e verificações de
@@ -993,6 +1098,7 @@ export class PaymentService {
             console.info(`[applyPaymentCompletion] Pagamento ${paymentRecord.id} revertido (completed -> ${newStatus}) — recalculando status de pagamento da venda ${paymentRecord.saleId}`);
             await this.reverseSalePaymentFlags(tx, paymentRecord.saleId, paymentRecord.phase);
         }
+        return true;
     }
 
     /**
@@ -1060,10 +1166,23 @@ export class PaymentService {
         // Correlação SEMPRE pelo asaas_payment_id exato — nunca por saleId isolado: uma
         // venda pode ter várias tentativas/fases, e um webhook atrasado de uma cobrança
         // antiga poderia, por esse fallback, confirmar a tentativa mais recente errada.
-        const paymentRecord = await this.prisma.payment.findFirst({
+        let paymentRecord = await this.prisma.payment.findFirst({
             where: { asaas_payment_id: asaasPaymentId },
             orderBy: { createdAt: 'desc' },
         });
+
+        // Cobrança criada numa falha ambígua (a resposta do POST se perdeu): a reserva local existe,
+        // mas sem asaas_payment_id. O externalReference é o id da reserva — correlação exata, uma
+        // tentativa específica (nunca por saleId) — então dá para vincular aqui mesmo.
+        if (!paymentRecord && paymentPayload?.externalReference) {
+            const reservation = await this.prisma.payment.findFirst({
+                where: { id: String(paymentPayload.externalReference), asaas_payment_id: null, status: 'pending' },
+            });
+            if (reservation) {
+                console.info(`[Webhook] Vinculando cobrança ${asaasPaymentId} à reserva ${reservation.id} (resposta da criação havia se perdido)`);
+                paymentRecord = await this.attachGatewayCharge(reservation.id, paymentPayload.customer, { ...paymentPayload, status: 'PENDING' });
+            }
+        }
 
         if (!paymentRecord) {
             // Pode ser uma corrida real: o Asaas notifica quase na hora em que cria a cobrança,
@@ -1197,9 +1316,10 @@ export class PaymentService {
                 const newStatus = this.mapAsaasStatus(asaasPayment.status);
                 if (newStatus !== 'completed') continue;
 
-                await this.prisma.$transaction(async (tx) => {
-                    await this.applyPaymentCompletion(tx, paymentRecord, newStatus, asaasPayment.id);
-                });
+                const applied = await this.prisma.$transaction((tx) =>
+                    this.applyPaymentCompletion(tx, paymentRecord, newStatus, asaasPayment.id)
+                );
+                if (!applied) continue; // webhook concluiu no meio do caminho
 
                 console.info(`[syncPendingOrderPayments] Pagamento ${paymentRecord.id} confirmado (Asaas: ${paymentRecord.asaas_payment_id})`);
                 confirmed++;
@@ -1209,7 +1329,27 @@ export class PaymentService {
             }
         }
 
-        console.info(`[syncPendingOrderPayments] Verificados: ${pending.length} | Confirmados: ${confirmed} | Erros: ${errors}`);
+        // Reservas que ficaram sem referência após uma falha ambígua do gateway: concilia com o Asaas
+        // (vincula se a cobrança existe, libera se comprovadamente não existe). Cobre o comprador que
+        // não tenta de novo e o webhook perdido.
+        const staleReservations = await this.prisma.payment.findMany({
+            where: {
+                status: 'pending',
+                asaas_payment_id: null,
+                billingType: { not: null },
+                createdAt: { lt: new Date(Date.now() - STALE_RESERVATION_MS) },
+            },
+        });
+        for (const reservation of staleReservations) {
+            try {
+                await this.reconcileReservation(reservation);
+            } catch (err: any) {
+                console.warn(`[syncPendingOrderPayments] Erro ao conciliar reserva ${reservation.id}: ${err.message}`);
+                errors++;
+            }
+        }
+
+        console.info(`[syncPendingOrderPayments] Verificados: ${pending.length} | Confirmados: ${confirmed} | Reservas conciliadas: ${staleReservations.length} | Erros: ${errors}`);
         return { checked: pending.length, confirmed, errors };
     }
 
