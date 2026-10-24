@@ -1,6 +1,7 @@
 import { NotificationType, Prisma, PrismaClient } from "@prisma/client";
 import { BRASILIA_TIME_ZONE, brasiliaDateKey, startOfTodayInBrasilia } from "../../lib/brasiliaTime";
 import { logger } from "../../lib/logger";
+import { EmailService, emailService } from "../email/email.service";
 
 type DbClient = PrismaClient | Prisma.TransactionClient;
 
@@ -38,8 +39,36 @@ const DAY_MS = 86_400_000;
 const MAX_PAGE_SIZE = 50;
 const DEFAULT_PAGE_SIZE = 20;
 
+/** Tentativas de envio do e-mail de uma notificação antes de desistir (ex.: endereço inválido). */
+export const MAX_EMAIL_ATTEMPTS = 3;
+/** Notificações mais antigas que isso não geram e-mail (ex.: servidor ficou parado por dias). */
+const EMAIL_MAX_AGE_MS = DAY_MS;
+const EMAIL_BATCH_SIZE = 50;
+
 /** Status que o vendedor também é avisado (cancelamento não: é ele quem cancela). */
 const SELLER_NOTIFIED_STATUSES = ["Entregue", "Concluído", "Concluída"];
+
+/**
+ * Link do e-mail para a mesma tela que o clique no sino abre (getNotificationHref no front).
+ * Com venda: `data.role` decide entre a lista de vendas (vendedor) e a de compras (comprador) —
+ * ORDER_STATUS_CHANGED vai para os dois, então o tipo não basta. Sem venda: edição do anúncio.
+ */
+export function buildNotificationLink(
+  notification: { saleId: string | null; productId: string | null; data: Prisma.JsonValue },
+  frontendUrl: string
+): { label: string; url: string } | null {
+  const base = frontendUrl.replace(/\/+$/, "");
+  if (notification.saleId) {
+    const data = notification.data;
+    const role = data && typeof data === "object" && !Array.isArray(data) ? data.role : undefined;
+    const path = role === "seller" ? "/market/orders" : "/market/history";
+    return { label: "Acesse o pedido", url: `${base}${path}?saleId=${encodeURIComponent(notification.saleId)}` };
+  }
+  if (notification.productId) {
+    return { label: "Acesse o anúncio", url: `${base}/market/edit-product/${encodeURIComponent(notification.productId)}` };
+  }
+  return null;
+}
 
 function formatBRL(value: number): string {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -51,9 +80,11 @@ function formatBrasiliaDate(date: Date): string {
 
 export class NotificationService {
   private readonly prisma: PrismaClient;
+  private readonly email: EmailService;
 
-  constructor(prisma?: PrismaClient) {
+  constructor(prisma?: PrismaClient, email: EmailService = emailService) {
     this.prisma = prisma || new PrismaClient();
+    this.email = email;
   }
 
   // ─── Persistência ────────────────────────────────────────────────────────────
@@ -311,6 +342,69 @@ export class NotificationService {
     });
 
     return this.createMany(inputs);
+  }
+
+  // ─── E-mail das notificações (caixa de saída, notificationEmailJob) ──────────
+
+  /**
+   * Envia por e-mail (texto puro: assunto = título, corpo = mensagem + link para a tela do pedido/anúncio
+   * via buildNotificationLink) as notificações ainda não
+   * enviadas. Toda notificação gravada passa por aqui, então o e-mail segue exatamente as mesmas
+   * regras e a mesma deduplicação das notificações in-app. Como lê só o que já foi commitado, uma
+   * transação de pagamento revertida nunca gera e-mail.
+   * Cada linha é reservada antes do envio (emailSentAt preenchido condicionalmente): execuções
+   * concorrentes não reenviam. Em falha, a reserva é desfeita e o próximo ciclo tenta de novo,
+   * até MAX_EMAIL_ATTEMPTS. Se o processo cair entre a reserva e o envio, aquele e-mail se perde
+   * — preferimos isso a mandar duplicado.
+   */
+  async dispatchPendingEmails(now: Date = new Date()): Promise<number> {
+    const pending = await this.prisma.notification.findMany({
+      where: {
+        emailSentAt: null,
+        emailAttempts: { lt: MAX_EMAIL_ATTEMPTS },
+        createdAt: { gte: new Date(now.getTime() - EMAIL_MAX_AGE_MS) },
+      },
+      orderBy: { createdAt: "asc" },
+      take: EMAIL_BATCH_SIZE,
+      select: {
+        id: true,
+        title: true,
+        message: true,
+        saleId: true,
+        productId: true,
+        data: true,
+        emailAttempts: true,
+        user: { select: { email: true } },
+      },
+    });
+
+    // Sem URL_FRONTEND o e-mail sai só com o texto da notificação.
+    const frontendUrl = process.env.URL_FRONTEND;
+    let sent = 0;
+    for (const notification of pending) {
+      const claimed = await this.prisma.notification.updateMany({
+        where: { id: notification.id, emailSentAt: null, emailAttempts: notification.emailAttempts },
+        data: { emailSentAt: now, emailAttempts: { increment: 1 } },
+      });
+      if (claimed.count === 0) continue;
+
+      const link = frontendUrl ? buildNotificationLink(notification, frontendUrl) : null;
+      try {
+        await this.email.sendMail({
+          to: notification.user.email,
+          subject: notification.title,
+          text: link ? `${notification.message}\n\n${link.label}: ${link.url}` : notification.message,
+        });
+        sent++;
+      } catch (err: unknown) {
+        await this.prisma.notification.update({ where: { id: notification.id }, data: { emailSentAt: null } });
+        logger.error(
+          `[Notifications] falha ao enviar e-mail da notificação ${notification.id} (tentativa ${notification.emailAttempts + 1}/${MAX_EMAIL_ATTEMPTS}):`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+    return sent;
   }
 
   // ─── Consulta e leitura (endpoints) ──────────────────────────────────────────

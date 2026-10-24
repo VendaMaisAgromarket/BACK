@@ -1,6 +1,7 @@
 import { NotificationType, PrismaClient } from '@prisma/client';
 import { mockDeep, DeepMockProxy } from 'jest-mock-extended';
-import { NotificationService } from '../notification.service';
+import { buildNotificationLink, MAX_EMAIL_ATTEMPTS, NotificationService } from '../notification.service';
+import { EmailService } from '../../email/email.service';
 
 const SALE_ID = 'sale-1';
 
@@ -258,6 +259,134 @@ describe('NotificationService', () => {
 
       expect(prisma.notification.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 3 }));
       expect(result).toEqual({ items: [{ id: 'a' }, { id: 'b' }], nextCursor: 'b', unreadCount: 7 });
+    });
+  });
+
+  describe('dispatchPendingEmails', () => {
+    const NOW = new Date('2026-10-23T12:00:00Z');
+    let email: { sendMail: jest.Mock };
+
+    const originalFrontendUrl = process.env.URL_FRONTEND;
+
+    function pendingRow(id: string, emailAttempts = 0) {
+      return {
+        id,
+        title: 'Novo pedido recebido',
+        message: `Mensagem ${id}`,
+        saleId: SALE_ID,
+        productId: null,
+        data: { role: 'seller', orderNumber: 42 },
+        emailAttempts,
+        user: { email: `${id}@example.com` },
+      };
+    }
+
+    beforeEach(() => {
+      process.env.URL_FRONTEND = 'https://app.vendamaisagro.com.br/';
+      email = { sendMail: jest.fn().mockResolvedValue({ messageId: 'm', accepted: [], rejected: [] }) };
+      service = new NotificationService(prisma as unknown as PrismaClient, email as unknown as EmailService);
+      prisma.notification.updateMany.mockResolvedValue({ count: 1 });
+    });
+
+    afterAll(() => {
+      process.env.URL_FRONTEND = originalFrontendUrl;
+    });
+
+    it('envia texto puro com o mesmo título e mensagem da notificação, mais o link do pedido', async () => {
+      prisma.notification.findMany.mockResolvedValue([pendingRow('n-1')] as never);
+
+      await expect(service.dispatchPendingEmails(NOW)).resolves.toBe(1);
+
+      expect(email.sendMail).toHaveBeenCalledWith({
+        to: 'n-1@example.com',
+        subject: 'Novo pedido recebido',
+        text: 'Mensagem n-1\n\nAcesse o pedido: https://app.vendamaisagro.com.br/market/orders?saleId=sale-1',
+      });
+      expect(prisma.notification.update).not.toHaveBeenCalled();
+    });
+
+    it('sem URL_FRONTEND envia só o texto da notificação', async () => {
+      delete process.env.URL_FRONTEND;
+      prisma.notification.findMany.mockResolvedValue([pendingRow('n-1')] as never);
+
+      await service.dispatchPendingEmails(NOW);
+
+      expect(email.sendMail).toHaveBeenCalledWith(expect.objectContaining({ text: 'Mensagem n-1' }));
+    });
+
+    it('busca só pendentes recentes e abaixo do limite de tentativas', async () => {
+      prisma.notification.findMany.mockResolvedValue([]);
+
+      await service.dispatchPendingEmails(NOW);
+
+      expect(prisma.notification.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            emailSentAt: null,
+            emailAttempts: { lt: MAX_EMAIL_ATTEMPTS },
+            createdAt: { gte: new Date('2026-10-22T12:00:00Z') },
+          },
+        })
+      );
+      expect(email.sendMail).not.toHaveBeenCalled();
+    });
+
+    it('reserva a linha antes de enviar e pula se outra execução já reservou', async () => {
+      prisma.notification.findMany.mockResolvedValue([pendingRow('n-1', 1)] as never);
+      prisma.notification.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.dispatchPendingEmails(NOW)).resolves.toBe(0);
+
+      expect(prisma.notification.updateMany).toHaveBeenCalledWith({
+        where: { id: 'n-1', emailSentAt: null, emailAttempts: 1 },
+        data: { emailSentAt: NOW, emailAttempts: { increment: 1 } },
+      });
+      expect(email.sendMail).not.toHaveBeenCalled();
+    });
+
+    it('libera a reserva quando o envio falha e segue para as próximas', async () => {
+      prisma.notification.findMany.mockResolvedValue([pendingRow('n-1'), pendingRow('n-2')] as never);
+      email.sendMail.mockRejectedValueOnce(new Error('SMTP fora do ar'));
+
+      await expect(service.dispatchPendingEmails(NOW)).resolves.toBe(1);
+
+      expect(prisma.notification.update).toHaveBeenCalledWith({ where: { id: 'n-1' }, data: { emailSentAt: null } });
+      expect(email.sendMail).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('buildNotificationLink', () => {
+    const FRONT = 'https://app.vendamaisagro.com.br';
+
+    it('vendedor → lista de vendas com o pedido aberto', () => {
+      expect(buildNotificationLink({ saleId: SALE_ID, productId: null, data: { role: 'seller' } }, FRONT)).toEqual({
+        label: 'Acesse o pedido',
+        url: `${FRONT}/market/orders?saleId=sale-1`,
+      });
+    });
+
+    it('comprador → lista de compras com o pedido aberto', () => {
+      expect(buildNotificationLink({ saleId: SALE_ID, productId: null, data: { role: 'buyer' } }, FRONT)?.url).toBe(
+        `${FRONT}/market/history?saleId=sale-1`
+      );
+    });
+
+    it('ORDER_STATUS_CHANGED segue o role de cada destinatário, não o tipo', () => {
+      const buyer = buildNotificationLink({ saleId: SALE_ID, productId: null, data: { role: 'buyer', status: 'Entregue' } }, FRONT);
+      const seller = buildNotificationLink({ saleId: SALE_ID, productId: null, data: { role: 'seller', status: 'Entregue' } }, FRONT);
+      expect(buyer?.url).toContain('/market/history?');
+      expect(seller?.url).toContain('/market/orders?');
+    });
+
+    it('lembrete de colheita (sem venda) → edição do anúncio', () => {
+      expect(buildNotificationLink({ saleId: null, productId: 'product-1', data: { role: 'seller' } }, FRONT)).toEqual({
+        label: 'Acesse o anúncio',
+        url: `${FRONT}/market/edit-product/product-1`,
+      });
+    });
+
+    it('sem venda nem anúncio não gera link', () => {
+      expect(buildNotificationLink({ saleId: null, productId: null, data: null }, FRONT)).toBeNull();
     });
   });
 });
