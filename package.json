@@ -16,6 +16,7 @@
     "seed-sales": "ts-node scripts/seed-sales-data.ts",
     "seed-admin": "ts-node scripts/seed-admin.ts",
     "seed": "prisma db seed",
+    "send-test-email": "ts-node scripts/send-test-email.ts",
     "pretest": "node -e \"const fs=require('fs');if(!fs.existsSync('.env.test')){console.error('\\nERRO: Arquivo .env.test não encontrado.\\nTestes não podem rodar sem um banco de dados dedicado para testes.\\nCrie o .env.test com a DATABASE_URL do banco de testes antes de continuar.\\n');process.exit(1)}\"",
     "test": "jest --passWithNoTests"
   },
@@ -47,6 +48,7 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
+    "nodemailer": "^10.2.1",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "pdf-parse": "^1.1.1",
@@ -70,6 +72,7 @@
     "@types/jsonwebtoken": "^9.0.9",
     "@types/multer": "^2.0.0",
     "@types/node": "^22.15.14",
+    "@types/nodemailer": "^8.0.2",
     "@types/passport-jwt": "^4.0.1",
     "@types/pdf-parse": "^1.1.5",
     "@types/pdfkit": "^0.17.2",

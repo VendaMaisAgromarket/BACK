@@ -1,6 +1,7 @@
 import { Request, Response, RequestHandler } from 'express';
 import { PrismaClient } from '@prisma/client';
-import { UserService } from './user.service';
+import { INVALID_RESET_TOKEN_MESSAGE, UserService, WEAK_PASSWORD_MESSAGE } from './user.service';
+import { logger } from '../../lib/logger';
 
 const prisma = new PrismaClient();
 const service = new UserService(prisma);
@@ -137,6 +138,45 @@ export class UserController {
     } catch (error: any) {
       console.error(error);
       res.status(500).json({ error: 'Failed to delete user' });
+    }
+  };
+
+  public sendResetPasswordHandler: RequestHandler = async (req: Request, res: Response): Promise<void> => {
+    const email: unknown = req.body?.email;
+    if (typeof email !== 'string' || !email.trim()) {
+      res.status(400).json({ error: 'Informe o e-mail.' });
+      return;
+    }
+
+    try {
+      await service.sendResetPassword(email);
+      // Mesma resposta exista ou não a conta, para não permitir descobrir e-mails cadastrados.
+      res.status(200).json({ message: 'Se o e-mail estiver cadastrado, você receberá um link para redefinir a senha.' });
+    } catch (error: unknown) {
+      logger.error('[UserController] erro ao solicitar redefinição de senha:', error instanceof Error ? error.message : error);
+      res.status(500).json({ error: 'Erro ao solicitar redefinição de senha.' });
+    }
+  };
+
+  public changePasswordHandler: RequestHandler = async (req: Request, res: Response): Promise<void> => {
+    const token: unknown = req.body?.token;
+    const newPassword: unknown = req.body?.newPassword;
+    if (typeof token !== 'string' || typeof newPassword !== 'string' || !token || !newPassword) {
+      res.status(400).json({ error: 'Campos obrigatórios faltando.' });
+      return;
+    }
+
+    try {
+      await service.changePassword(token, newPassword);
+      res.status(200).json({ message: 'Senha alterada com sucesso.' });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : undefined;
+      if (message === INVALID_RESET_TOKEN_MESSAGE || message === WEAK_PASSWORD_MESSAGE) {
+        res.status(400).json({ error: message });
+        return;
+      }
+      logger.error('[UserController] erro ao alterar senha:', message ?? error);
+      res.status(500).json({ error: 'Erro ao alterar senha.' });
     }
   };
 }

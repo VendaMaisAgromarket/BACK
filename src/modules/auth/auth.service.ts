@@ -49,6 +49,7 @@ export class AuthService {
         role: user.role,
         name: user.name,
         email: user.email,
+        tv: user.tokenVersion,
       },
       JWT_SECRET,
       { expiresIn: '30d' }
@@ -92,6 +93,7 @@ export class AuthService {
       where: { id: user.id },
       data: {
         password: hashed,
+        tokenVersion: { increment: 1 },
       },
     });
 

@@ -1,18 +1,39 @@
 import { PrismaClient, User } from "@prisma/client";
 import bcrypt from "bcryptjs";
+import { createHash, randomBytes } from "crypto";
 import { isCPF, isCNPJ, formatToCPF, formatToCNPJ } from "brazilian-values";
 import { AddressService } from "../address/address.service";
 import { UploadS3Service } from "../upload-S3/uploadS3.service";
+import { EmailService, emailService } from "../email/email.service";
+import { logger } from "../../lib/logger";
+
+/** Validade do link de redefinição de senha. */
+export const PASSWORD_RESET_TTL_MINUTES = 30;
+/** Intervalo mínimo entre dois e-mails de redefinição para o mesmo usuário (anti-spam). */
+const PASSWORD_RESET_COOLDOWN_MS = 60_000;
+/** Página do front que recebe o `?token=` e chama POST /user/change-password. */
+const PASSWORD_RESET_FRONT_PATH = "/reset-password";
+
+export const INVALID_RESET_TOKEN_MESSAGE = "Link de redefinição inválido ou expirado.";
+export const WEAK_PASSWORD_MESSAGE =
+  "A senha deve conter pelo menos 8 caracteres, incluindo uma letra maiúscula, uma letra minúscula, um número e um caractere especial.";
+const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
+
+function hashResetToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
 
 export class UserService {
   private readonly prisma: PrismaClient;
   private readonly addressService: AddressService;
   private readonly uploadService: UploadS3Service;
+  private readonly email: EmailService;
 
-  constructor(prisma?: PrismaClient) {
+  constructor(prisma?: PrismaClient, email: EmailService = emailService) {
     this.prisma = prisma || new PrismaClient();
     this.addressService = new AddressService();
     this.uploadService = new UploadS3Service(this.prisma);
+    this.email = email;
   }
 
   public async create(data: any): Promise<User> {
@@ -175,7 +196,7 @@ export class UserService {
     return userWithoutPassword;
   }
 
-  public async getAll(): Promise<Omit<User, 'password'>[]> {
+  public async getAll(): Promise<Omit<User, 'password' | 'tokenVersion'>[]> {
     return this.prisma.user.findMany({
       select: {
         id: true,
@@ -233,6 +254,7 @@ export class UserService {
     const updateData: any = { ...data };
     delete updateData.role;
     delete updateData.valid;
+    delete updateData.tokenVersion;
 
     if (data.password) {
       const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
@@ -240,6 +262,8 @@ export class UserService {
         throw new Error("A nova senha não atende aos critérios de segurança.");
       }
       updateData.password = await bcrypt.hash(data.password, 10);
+      // Encerra todas as sessões abertas, inclusive a de quem fez a troca.
+      updateData.tokenVersion = { increment: 1 };
     }
 
     if (data.cpf && data.cpf !== user.cpf) {
@@ -361,5 +385,113 @@ export class UserService {
     if (!user) throw new Error("Usuário não encontrado.");
 
     await this.prisma.user.delete({ where: { id } });
+  }
+
+  // ─── Esqueci minha senha ─────────────────────────────────────────────────────
+
+  /**
+   * Gera um link de uso único e envia por e-mail. Nunca revela se o e-mail existe: quem chama
+   * responde sempre a mesma mensagem, e o envio do e-mail roda em segundo plano para que o tempo
+   * de resposta também não denuncie a existência da conta.
+   */
+  public async sendResetPassword(rawEmail: string, now: Date = new Date()): Promise<void> {
+    const email = rawEmail.trim();
+    if (!email) throw new Error("Campos obrigatórios faltando.");
+
+    const frontendUrl = process.env.URL_FRONTEND;
+    if (!frontendUrl) throw new Error("URL_FRONTEND não configurada.");
+
+    const user = await this.prisma.user.findFirst({
+      where: { email: { equals: email, mode: "insensitive" } },
+      select: { id: true, name: true, email: true },
+    });
+    if (!user) return;
+
+    const recent = await this.prisma.passwordResetToken.findFirst({
+      where: { userId: user.id, createdAt: { gt: new Date(now.getTime() - PASSWORD_RESET_COOLDOWN_MS) } },
+      select: { id: true },
+    });
+    if (recent) return;
+
+    const token = randomBytes(32).toString("base64url");
+    // Um novo pedido invalida os links anteriores ainda não usados.
+    await this.prisma.$transaction([
+      this.prisma.passwordResetToken.updateMany({
+        where: { userId: user.id, usedAt: null },
+        data: { usedAt: now },
+      }),
+      this.prisma.passwordResetToken.create({
+        data: {
+          userId: user.id,
+          tokenHash: hashResetToken(token),
+          expiresAt: new Date(now.getTime() + PASSWORD_RESET_TTL_MINUTES * 60_000),
+        },
+      }),
+    ]);
+
+    const link = `${frontendUrl.replace(/\/+$/, "")}${PASSWORD_RESET_FRONT_PATH}?token=${token}`;
+    this.email
+      .sendMail({
+        to: user.email,
+        subject: "Redefinição de senha — Venda+ Agromarket",
+        text:
+          `Olá, ${user.name}.\n\n` +
+          `Recebemos um pedido para redefinir a senha da sua conta. Para criar uma nova senha, acesse o link abaixo ` +
+          `(válido por ${PASSWORD_RESET_TTL_MINUTES} minutos e de uso único):\n\n${link}\n\n` +
+          `Se você não fez esse pedido, ignore este e-mail: sua senha continua a mesma.`,
+      })
+      .catch((err: unknown) => {
+        logger.error("[UserService] falha ao enviar e-mail de redefinição de senha:", err instanceof Error ? err.message : err);
+      });
+  }
+
+  /** Troca a senha a partir do token do link. O token é consumido na mesma transação da troca. */
+  public async changePassword(token: string, newPassword: string, now: Date = new Date()): Promise<void> {
+    if (!token || !newPassword) throw new Error("Campos obrigatórios faltando.");
+    if (!PASSWORD_REGEX.test(newPassword)) throw new Error(WEAK_PASSWORD_MESSAGE);
+
+    const tokenHash = hashResetToken(token);
+    const resetToken = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      select: { id: true, userId: true, usedAt: true, expiresAt: true },
+    });
+    if (!resetToken || resetToken.usedAt || resetToken.expiresAt <= now) {
+      throw new Error(INVALID_RESET_TOKEN_MESSAGE);
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    const user = await this.prisma.$transaction(async (tx) => {
+      // Reserva condicional: duas requisições simultâneas com o mesmo link não trocam a senha duas vezes.
+      const claimed = await tx.passwordResetToken.updateMany({
+        where: { id: resetToken.id, usedAt: null, expiresAt: { gt: now } },
+        data: { usedAt: now },
+      });
+      if (claimed.count === 0) throw new Error(INVALID_RESET_TOKEN_MESSAGE);
+
+      await tx.passwordResetToken.updateMany({
+        where: { userId: resetToken.userId, usedAt: null },
+        data: { usedAt: now },
+      });
+      return tx.user.update({
+        where: { id: resetToken.userId },
+        // tokenVersion++ derruba os JWTs emitidos antes da troca (ver protectRoute).
+        data: { password: hashedPassword, tokenVersion: { increment: 1 } },
+        select: { name: true, email: true },
+      });
+    });
+
+    this.email
+      .sendMail({
+        to: user.email,
+        subject: "Sua senha foi alterada — Venda+ Agromarket",
+        text:
+          `Olá, ${user.name}.\n\n` +
+          `A senha da sua conta foi alterada. Se não foi você, solicite uma nova redefinição de senha imediatamente ` +
+          `e entre em contato com o suporte.`,
+      })
+      .catch((err: unknown) => {
+        logger.error("[UserService] falha ao enviar e-mail de confirmação de troca de senha:", err instanceof Error ? err.message : err);
+      });
   }
 }
