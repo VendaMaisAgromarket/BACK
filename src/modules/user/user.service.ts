@@ -5,6 +5,7 @@ import { isCPF, isCNPJ, formatToCPF, formatToCNPJ } from "brazilian-values";
 import { AddressService } from "../address/address.service";
 import { UploadS3Service } from "../upload-S3/uploadS3.service";
 import { EmailService, emailService } from "../email/email.service";
+import { NotificationService } from "../notification/notification.service";
 import { logger } from "../../lib/logger";
 
 /** Validade do link de redefinição de senha. */
@@ -23,17 +24,45 @@ function hashResetToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
+/** Rótulos (na ordem em que aparecem na notificação) dos campos do perfil que o usuário altera. */
+const PROFILE_FIELD_LABELS = {
+  name: "nome",
+  phone_number: "telefone",
+  email: "e-mail",
+  cpf: "CPF",
+  cnpj: "CNPJ",
+  ccir: "CCIR",
+} as const;
+
+type ProfileSnapshot = { [K in keyof typeof PROFILE_FIELD_LABELS]: string | null };
+
+/**
+ * Compara o que vai ser gravado com o que estava salvo: só entra o que de fato muda de valor.
+ * Vazio ("") e null contam como iguais — o formulário reenvia campos opcionais em branco.
+ */
+function changedProfileFields(before: ProfileSnapshot, updateData: Record<string, unknown>, imageChanged: boolean): string[] {
+  const normalize = (value: unknown) => (value === null || value === undefined ? "" : String(value));
+  const fields: string[] = (Object.keys(PROFILE_FIELD_LABELS) as (keyof typeof PROFILE_FIELD_LABELS)[])
+    .filter((key) => updateData[key] !== undefined && normalize(updateData[key]) !== normalize(before[key]))
+    .map((key) => PROFILE_FIELD_LABELS[key]);
+  if (updateData.password !== undefined) fields.push("senha");
+  if (imageChanged) fields.push("foto de perfil");
+  return fields;
+}
+
 export class UserService {
   private readonly prisma: PrismaClient;
   private readonly addressService: AddressService;
   private readonly uploadService: UploadS3Service;
   private readonly email: EmailService;
+  private readonly notifications: NotificationService;
 
   constructor(prisma?: PrismaClient, email: EmailService = emailService) {
     this.prisma = prisma || new PrismaClient();
     this.addressService = new AddressService();
     this.uploadService = new UploadS3Service(this.prisma);
     this.email = email;
+    this.notifications = new NotificationService(this.prisma, email);
   }
 
   public async create(data: any): Promise<User> {
@@ -244,7 +273,7 @@ export class UserService {
   ): Promise<User> {
     const user = await this.prisma.user.findUnique({
       where: { id },
-      select: { id: true, email: true, cpf: true, cnpj: true, img: true }
+      select: { id: true, name: true, phone_number: true, email: true, cpf: true, cnpj: true, ccir: true, img: true }
     });
 
     if (!user) {
@@ -319,21 +348,45 @@ export class UserService {
       updateData.img = publicUrl;
     }
 
+    let updatedUser;
     try {
-      const updatedUser = await this.prisma.user.update({
+      updatedUser = await this.prisma.user.update({
         where: { id },
         data: updateData,
         include: {
           securityQuestions: true,
         },
       });
-
-      const { password: _, ...userWithoutPassword } = updatedUser;
-      return userWithoutPassword as unknown as User;
     } catch (error) {
       console.error("Erro ao atualizar usuário:", error);
       throw error;
     }
+
+    await this.notifications.notifyProfileUpdated(id, changedProfileFields(user, updateData, !!file));
+    if (updatedUser.email !== user.email) {
+      this.notifyPreviousEmail(user.email);
+    }
+
+    const { password: _, ...userWithoutPassword } = updatedUser;
+    return userWithoutPassword as unknown as User;
+  }
+
+  /**
+   * A notificação de perfil vai para o e-mail NOVO; o antigo também precisa saber da troca, senão
+   * quem invadiu a conta troca o e-mail e o dono nunca é avisado. Não revela o endereço novo.
+   */
+  private notifyPreviousEmail(previousEmail: string): void {
+    this.email
+      .sendMail({
+        to: previousEmail,
+        subject: "O e-mail da sua conta foi alterado — Venda+ Agromarket",
+        text:
+          `O e-mail de acesso da sua conta no Venda+ Agromarket foi alterado e este endereço não receberá mais nossos avisos.\n\n` +
+          `Se não foi você, entre em contato com o suporte imediatamente.`,
+      })
+      .catch((err: unknown) => {
+        logger.error("[UserService] falha ao avisar o e-mail anterior sobre a troca de e-mail:", err instanceof Error ? err.message : err);
+      });
   }
 
   private extractKeyFromUrl(url: string): string | null {

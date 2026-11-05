@@ -45,8 +45,23 @@ export const MAX_EMAIL_ATTEMPTS = 3;
 const EMAIL_MAX_AGE_MS = DAY_MS;
 const EMAIL_BATCH_SIZE = 50;
 
-/** Status que o vendedor também é avisado (cancelamento não: é ele quem cancela). */
-const SELLER_NOTIFIED_STATUSES = ["Entregue", "Concluído", "Concluída"];
+/** Fecho das notificações de conta: alteração que o usuário não reconhece pode ser invasão. */
+const NOT_YOU_NOTICE = "Se não foi você, redefina sua senha e entre em contato com o suporte.";
+
+export type AddressChange = "created" | "updated" | "default" | "deleted";
+
+const ADDRESS_CHANGE_TEXT: Record<AddressChange, { type: NotificationType; title: string; verb: string }> = {
+  created: { type: NotificationType.ADDRESS_CREATED, title: "Endereço adicionado", verb: "foi adicionado à sua conta" },
+  updated: { type: NotificationType.ADDRESS_UPDATED, title: "Endereço atualizado", verb: "foi atualizado" },
+  default: { type: NotificationType.ADDRESS_UPDATED, title: "Endereço padrão alterado", verb: "agora é o seu endereço padrão" },
+  deleted: { type: NotificationType.ADDRESS_DELETED, title: "Endereço removido", verb: "foi removido da sua conta" },
+};
+
+/** "a" · "a e b" · "a, b e c" */
+function joinPt(items: string[]): string {
+  if (items.length <= 1) return items.join("");
+  return `${items.slice(0, -1).join(", ")} e ${items[items.length - 1]}`;
+}
 
 /**
  * Link do e-mail para a mesma tela que o clique no sino abre (getNotificationHref no front).
@@ -135,13 +150,13 @@ export class NotificationService {
 
   // ─── Eventos de venda (best-effort, após a operação) ─────────────────────────
 
-  /** Vendedor(es): chegou um pedido novo. */
+  /** Vendedor(es): chegou um pedido novo. Comprador: confirmação de que o pedido foi enviado. */
   async notifyNewOrder(saleId: string): Promise<void> {
     await this.safely("NEW_ORDER", async () => {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
-      await this.createMany(
-        ctx.sellerIds.map((sellerId) => ({
+      await this.createMany([
+        ...ctx.sellerIds.map((sellerId) => ({
           userId: sellerId,
           type: NotificationType.NEW_ORDER,
           title: "Novo pedido recebido",
@@ -149,22 +164,33 @@ export class NotificationService {
           saleId,
           data: { role: "seller", orderNumber: ctx.orderNumber },
           dedupeKey: `NEW_ORDER:${saleId}:${sellerId}`,
-        }))
-      );
+        })),
+        {
+          userId: ctx.buyerId,
+          type: NotificationType.NEW_ORDER,
+          title: "Pedido enviado",
+          message: `Seu pedido #${ctx.orderNumber} foi enviado ao vendedor e aguarda o aceite.`,
+          saleId,
+          data: { role: "buyer", orderNumber: ctx.orderNumber },
+          dedupeKey: `NEW_ORDER:${saleId}:${ctx.buyerId}`,
+        },
+      ]);
     });
   }
 
   /**
-   * Comprador: vendedor aceitou ou recusou o pedido. `statusVersion` é a versão gravada pela
-   * transição (SaleData.statusVersion, monotônica e única por venda) — a identidade persistente
-   * dela. A dedupeKey (decisão + venda + versão) deixa passar mudanças reais de decisão
-   * (aceitar → recusar → aceitar gera 3 avisos) e descarta o reprocessamento da mesma transição.
+   * Vendedor aceitou ou recusou o pedido: avisa o comprador e o(s) vendedor(es). `statusVersion` é a
+   * versão gravada pela transição (SaleData.statusVersion, monotônica e única por venda) — a
+   * identidade persistente dela. A dedupeKey (decisão + venda + versão [+ vendedor]) deixa passar
+   * mudanças reais de decisão (aceitar → recusar → aceitar gera 3 avisos) e descarta o
+   * reprocessamento da mesma transição.
    */
   async notifySellerDecision(saleId: string, approved: boolean, status: string, statusVersion: number): Promise<void> {
     const type = approved ? NotificationType.ORDER_ACCEPTED : NotificationType.ORDER_REJECTED;
     await this.safely(type, async () => {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
+      const transitionKey = `${type}:${saleId}:v${statusVersion}`;
       await this.createMany([
         {
           userId: ctx.buyerId,
@@ -175,14 +201,24 @@ export class NotificationService {
             : `O vendedor recusou o seu pedido #${ctx.orderNumber}.`,
           saleId,
           data: { role: "buyer", orderNumber: ctx.orderNumber, status },
-          dedupeKey: `${type}:${saleId}:v${statusVersion}`,
+          // Chave do comprador sem sufixo: mantém a de antes da notificação ao vendedor existir.
+          dedupeKey: transitionKey,
         },
+        ...ctx.sellerIds.map((sellerId) => ({
+          userId: sellerId,
+          type,
+          title: approved ? "Pedido aceito" : "Pedido recusado",
+          message: `O pedido #${ctx.orderNumber} de ${ctx.buyerName} foi ${approved ? "aceito" : "recusado"}.`,
+          saleId,
+          data: { role: "seller", orderNumber: ctx.orderNumber, status },
+          dedupeKey: `${transitionKey}:${sellerId}`,
+        })),
       ]);
     });
   }
 
   /**
-   * Comprador: qualquer outra mudança de status do pedido. Vendedor(es): só entrega e conclusão.
+   * Qualquer mudança de status do pedido: avisa o comprador e o(s) vendedor(es).
    * `statusVersion` é a versão gravada pela transição (SaleData.statusVersion): cada linha gerada
    * leva uma dedupeKey com essa versão + destinatário. Reprocessar a mesma transição não duplica;
    * duas transições distintas nunca compartilham chave (a versão é monotônica, ao contrário de um
@@ -193,25 +229,22 @@ export class NotificationService {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
       const transitionKey = `ORDER_STATUS_CHANGED:${saleId}:v${statusVersion}`;
-      const sellerNotifications: NotificationInput[] = SELLER_NOTIFIED_STATUSES.includes(status)
-        ? ctx.sellerIds.map((sellerId) => ({
-            userId: sellerId,
-            type: NotificationType.ORDER_STATUS_CHANGED,
-            title: "Status do pedido atualizado",
-            message: `O pedido #${ctx.orderNumber} agora está: ${status}.`,
-            saleId,
-            data: { role: "seller", orderNumber: ctx.orderNumber, status },
-            dedupeKey: `${transitionKey}:${sellerId}`,
-          }))
-        : [];
       await this.createMany([
         this.buildStatusChanged(ctx, status, `${transitionKey}:${ctx.buyerId}`),
-        ...sellerNotifications,
+        ...ctx.sellerIds.map((sellerId) => ({
+          userId: sellerId,
+          type: NotificationType.ORDER_STATUS_CHANGED,
+          title: "Status do pedido atualizado",
+          message: `O pedido #${ctx.orderNumber} agora está: ${status}.`,
+          saleId,
+          data: { role: "seller", orderNumber: ctx.orderNumber, status },
+          dedupeKey: `${transitionKey}:${sellerId}`,
+        })),
       ]);
     });
   }
 
-  /** Comprador: vendedor registrou a pesagem (o status passa a "Aguardando pagamento final"). */
+  /** Vendedor registrou a pesagem (o status passa a "Aguardando pagamento final"): avisa os dois lados. */
   async notifyWeightRegistered(
     saleId: string,
     params: { weightKg: number; adjustedContractTotal: number | null; status: string }
@@ -222,22 +255,32 @@ export class NotificationService {
       const totalText = params.adjustedContractTotal !== null
         ? ` Novo valor do contrato: ${formatBRL(params.adjustedContractTotal)}.`
         : "";
+      const weightText = `${params.weightKg.toLocaleString("pt-BR")} kg`;
+      const data = {
+        orderNumber: ctx.orderNumber,
+        status: params.status,
+        weightKg: params.weightKg,
+        adjustedContractTotal: params.adjustedContractTotal,
+      };
       await this.createMany([
         {
           userId: ctx.buyerId,
           type: NotificationType.WEIGHT_REGISTERED,
           title: "Pesagem registrada",
-          message: `O vendedor registrou a pesagem do pedido #${ctx.orderNumber}: ${params.weightKg.toLocaleString("pt-BR")} kg.${totalText} O próximo passo é o pagamento final.`,
+          message: `O vendedor registrou a pesagem do pedido #${ctx.orderNumber}: ${weightText}.${totalText} O próximo passo é o pagamento final.`,
           saleId,
-          data: {
-            role: "buyer",
-            orderNumber: ctx.orderNumber,
-            status: params.status,
-            weightKg: params.weightKg,
-            adjustedContractTotal: params.adjustedContractTotal,
-          },
+          data: { role: "buyer", ...data },
           dedupeKey: `WEIGHT_REGISTERED:${saleId}`,
         },
+        ...ctx.sellerIds.map((sellerId) => ({
+          userId: sellerId,
+          type: NotificationType.WEIGHT_REGISTERED,
+          title: "Pesagem registrada",
+          message: `A pesagem do pedido #${ctx.orderNumber} foi registrada: ${weightText}.${totalText} Agora o pedido aguarda o pagamento final do comprador.`,
+          saleId,
+          data: { role: "seller", ...data },
+          dedupeKey: `WEIGHT_REGISTERED:${saleId}:${sellerId}`,
+        })),
       ]);
     });
   }
@@ -246,8 +289,8 @@ export class NotificationService {
 
   /**
    * Vendedor(es): entrada (30%) ou parcela final (70%)/pagamento integral confirmados.
-   * Quando o pagamento conclui o pedido, a própria mensagem ao vendedor avisa a conclusão (em vez
-   * de uma segunda notificação de status no mesmo instante).
+   * A própria mensagem ao vendedor traz o novo status do pedido (em vez de uma segunda
+   * notificação de status no mesmo instante).
    * Comprador: o status do pedido mudou. Roda dentro da transação de applyPaymentCompletion —
    * se falhar, o pagamento não é gravado e o webhook/poller tenta de novo. As `dedupeKey` por
    * pagamento evitam duplicatas quando a mesma confirmação chega pelo webhook e pelo poller.
@@ -273,9 +316,7 @@ export class NotificationService {
       userId: sellerId,
       type,
       title,
-      message: `O comprador pagou ${what} do pedido #${ctx.orderNumber}: ${formatBRL(params.amount)}.${
-        SELLER_NOTIFIED_STATUSES.includes(params.status) ? ` O pedido agora está: ${params.status}.` : ""
-      }`,
+      message: `O comprador pagou ${what} do pedido #${ctx.orderNumber}: ${formatBRL(params.amount)}. O pedido agora está: ${params.status}.`,
       saleId: params.saleId,
       data: { role: "seller", orderNumber: ctx.orderNumber, phase: params.phase, amount: params.amount, status: params.status },
       dedupeKey: `${type}:${params.paymentId}:${sellerId}`,
@@ -300,6 +341,44 @@ export class NotificationService {
       data: { role: "buyer", orderNumber: ctx.orderNumber, status },
       dedupeKey,
     };
+  }
+
+  // ─── Perfil e endereços (best-effort, após a operação) ───────────────────────
+
+  /** Usuário: dados pessoais alterados. `fields` são os rótulos legíveis do que mudou ("nome", "telefone"…). */
+  async notifyProfileUpdated(userId: string, fields: string[]): Promise<void> {
+    if (fields.length === 0) return;
+    await this.safely(NotificationType.PROFILE_UPDATED, () =>
+      this.createMany([
+        {
+          userId,
+          type: NotificationType.PROFILE_UPDATED,
+          title: "Dados pessoais atualizados",
+          message: `${fields.length === 1 ? "Este dado do seu perfil foi alterado" : "Estes dados do seu perfil foram alterados"}: ${joinPt(fields)}. ${NOT_YOU_NOTICE}`,
+          data: { fields },
+        },
+      ])
+    );
+  }
+
+  /** Usuário: endereço adicionado, alterado, definido como padrão ou removido. */
+  async notifyAddressChanged(
+    userId: string,
+    change: AddressChange,
+    address: { id: string; alias: string; street: string; number: string; city: string; uf: string }
+  ): Promise<void> {
+    const { type, title, verb } = ADDRESS_CHANGE_TEXT[change];
+    await this.safely(type, () =>
+      this.createMany([
+        {
+          userId,
+          type,
+          title,
+          message: `O endereço "${address.alias}" (${address.street}, ${address.number} - ${address.city}/${address.uf}) ${verb}. ${NOT_YOU_NOTICE}`,
+          data: { addressId: address.id, action: change },
+        },
+      ])
+    );
   }
 
   // ─── Lembrete de colheita do anúncio (cron) ──────────────────────────────────

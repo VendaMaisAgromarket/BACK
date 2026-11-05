@@ -30,21 +30,28 @@ describe('NotificationService', () => {
   });
 
   describe('notifyNewOrder', () => {
-    it('avisa cada vendedor distinto da venda uma única vez, com dedupeKey por vendedor', async () => {
+    it('avisa cada vendedor distinto uma única vez e também o comprador, com dedupeKey por destinatário', async () => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext(['seller-1', 'seller-1', 'seller-2']) as never);
 
       await service.notifyNewOrder(SALE_ID);
 
       expect(prisma.notification.createMany).toHaveBeenCalledWith(expect.objectContaining({ skipDuplicates: true }));
       const inputs = createdInputs(prisma);
-      expect(inputs).toHaveLength(2);
-      expect(inputs.map((n) => n.userId)).toEqual(['seller-1', 'seller-2']);
+      expect(inputs.map((n) => n.userId)).toEqual(['seller-1', 'seller-2', 'buyer-1']);
       expect(inputs[0]).toMatchObject({
         type: NotificationType.NEW_ORDER,
         saleId: SALE_ID,
         data: { role: 'seller', orderNumber: 42 },
         dedupeKey: `NEW_ORDER:${SALE_ID}:seller-1`,
       });
+      expect(inputs[2]).toMatchObject({
+        type: NotificationType.NEW_ORDER,
+        title: 'Pedido enviado',
+        saleId: SALE_ID,
+        data: { role: 'buyer', orderNumber: 42 },
+        dedupeKey: `NEW_ORDER:${SALE_ID}:buyer-1`,
+      });
+      expect(inputs[2].message).toBe('Seu pedido #42 foi enviado ao vendedor e aguarda o aceite.');
     });
 
     it('não derruba a operação de negócio quando a gravação da notificação falha', async () => {
@@ -63,7 +70,7 @@ describe('NotificationService', () => {
     it.each([
       [true, NotificationType.ORDER_ACCEPTED],
       [false, NotificationType.ORDER_REJECTED],
-    ])('approved=%s notifica o comprador com %s, chaveado pela transição', async (approved, type) => {
+    ])('approved=%s notifica o comprador e o vendedor com %s, chaveado pela transição', async (approved, type) => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
       await service.notifySellerDecision(SALE_ID, approved, 'status', V1);
@@ -75,17 +82,25 @@ describe('NotificationService', () => {
           data: { role: 'buyer', orderNumber: 42, status: 'status' },
           dedupeKey: `${type}:${SALE_ID}:v${V1}`,
         }),
+        expect.objectContaining({
+          userId: 'seller-1',
+          type,
+          message: `O pedido #42 de Comprador Teste foi ${approved ? 'aceito' : 'recusado'}.`,
+          data: { role: 'seller', orderNumber: 42, status: 'status' },
+          dedupeKey: `${type}:${SALE_ID}:v${V1}:seller-1`,
+        }),
       ]);
     });
 
-    it('reprocessar a MESMA transição gera a mesma dedupeKey (o banco descarta a duplicata)', async () => {
+    it('reprocessar a MESMA transição gera as mesmas dedupeKeys (o banco descarta a duplicata)', async () => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
 
       await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', V1);
       await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', V1);
 
       const keys = createdInputs(prisma).map((n) => n.dedupeKey);
-      expect(new Set(keys).size).toBe(1);
+      expect(keys).toHaveLength(4);
+      expect(new Set(keys).size).toBe(2);
       expect(prisma.notification.createMany).toHaveBeenCalledWith(expect.objectContaining({ skipDuplicates: true }));
     });
 
@@ -96,7 +111,7 @@ describe('NotificationService', () => {
       await service.notifySellerDecision(SALE_ID, false, 'Recusado pelo vendedor', V2);
       await service.notifySellerDecision(SALE_ID, true, 'Aprovado pelo vendedor', V3);
 
-      expect(createdInputs(prisma).map((n) => n.dedupeKey)).toEqual([
+      expect(createdInputs(prisma).filter((n) => n.userId === 'buyer-1').map((n) => n.dedupeKey)).toEqual([
         `ORDER_ACCEPTED:${SALE_ID}:v${V1}`,
         `ORDER_REJECTED:${SALE_ID}:v${V2}`,
         `ORDER_ACCEPTED:${SALE_ID}:v${V3}`,
@@ -109,7 +124,7 @@ describe('NotificationService', () => {
     const V2 = 8;
     const key = (v: number, userId: string) => `ORDER_STATUS_CHANGED:${SALE_ID}:v${v}:${userId}`;
 
-    it.each(['Entregue', 'Concluído'])('status %s avisa o comprador e também o vendedor, cada linha com a dedupeKey da transição', async (status) => {
+    it.each(['Entregue', 'Concluído', 'Cancelado', 'Colheita autorizada'])('status %s avisa o comprador e também o vendedor, cada linha com a dedupeKey da transição', async (status) => {
       prisma.saleData.findUnique.mockResolvedValue(saleContext(['seller-1', 'seller-2']) as never);
 
       await service.notifyStatusChanged(SALE_ID, status, V1);
@@ -119,14 +134,6 @@ describe('NotificationService', () => {
         expect.objectContaining({ userId: 'seller-1', data: { role: 'seller', orderNumber: 42, status }, dedupeKey: key(V1, 'seller-1') }),
         expect.objectContaining({ userId: 'seller-2', data: { role: 'seller', orderNumber: 42, status }, dedupeKey: key(V1, 'seller-2') }),
       ]);
-    });
-
-    it.each(['Cancelado', 'Colheita autorizada'])('status %s avisa só o comprador', async (status) => {
-      prisma.saleData.findUnique.mockResolvedValue(saleContext() as never);
-
-      await service.notifyStatusChanged(SALE_ID, status, V1);
-
-      expect(createdInputs(prisma).map((n) => n.userId)).toEqual(['buyer-1']);
     });
 
     it('reprocessar a mesma transição repete as chaves (duplicata descartada); uma nova transição gera chaves novas', async () => {
@@ -165,6 +172,7 @@ describe('NotificationService', () => {
         }),
       ]);
       expect(inputs[0].message).toContain('entrada (30%)');
+      expect(inputs[0].message).toContain('O pedido agora está: Entrada confirmada.');
     });
 
     it.each([
@@ -192,6 +200,63 @@ describe('NotificationService', () => {
       await expect(service.notifyPaymentCompleted(prisma as never, {
         paymentId: 'pay-1', saleId: SALE_ID, phase: 'down_payment', amount: 300, status: 'Entrada confirmada',
       })).rejects.toThrow('db down');
+    });
+  });
+
+  describe('notifyWeightRegistered', () => {
+    it('avisa o comprador e cada vendedor, com dedupeKey por destinatário', async () => {
+      prisma.saleData.findUnique.mockResolvedValue(saleContext(['seller-1', 'seller-2']) as never);
+
+      await service.notifyWeightRegistered(SALE_ID, { weightKg: 1500, adjustedContractTotal: 4500, status: 'Aguardando pagamento final' });
+
+      const inputs = createdInputs(prisma);
+      expect(inputs.map((n) => [n.userId, n.dedupeKey, (n.data as { role: string }).role])).toEqual([
+        ['buyer-1', `WEIGHT_REGISTERED:${SALE_ID}`, 'buyer'],
+        ['seller-1', `WEIGHT_REGISTERED:${SALE_ID}:seller-1`, 'seller'],
+        ['seller-2', `WEIGHT_REGISTERED:${SALE_ID}:seller-2`, 'seller'],
+      ]);
+      expect(inputs[1].message).toContain('aguarda o pagamento final do comprador');
+      expect(inputs[1].message).toContain('1.500 kg');
+    });
+  });
+
+  describe('perfil e endereços', () => {
+    it('notifyProfileUpdated lista os campos alterados e não grava nada sem alteração', async () => {
+      await service.notifyProfileUpdated('user-1', []);
+      expect(prisma.notification.createMany).not.toHaveBeenCalled();
+
+      await service.notifyProfileUpdated('user-1', ['nome', 'telefone', 'e-mail']);
+
+      const [input] = createdInputs(prisma);
+      expect(input).toMatchObject({
+        userId: 'user-1',
+        type: NotificationType.PROFILE_UPDATED,
+        title: 'Dados pessoais atualizados',
+        data: { fields: ['nome', 'telefone', 'e-mail'] },
+      });
+      expect(input.message).toMatch(/^Estes dados do seu perfil foram alterados: nome, telefone e e-mail\. Se não foi você/);
+      expect(input.dedupeKey).toBeUndefined();
+    });
+
+    it.each([
+      ['created', NotificationType.ADDRESS_CREATED, 'foi adicionado à sua conta'],
+      ['updated', NotificationType.ADDRESS_UPDATED, 'foi atualizado'],
+      ['default', NotificationType.ADDRESS_UPDATED, 'agora é o seu endereço padrão'],
+      ['deleted', NotificationType.ADDRESS_DELETED, 'foi removido da sua conta'],
+    ] as const)('notifyAddressChanged(%s) grava %s descrevendo o endereço', async (change, type, verb) => {
+      const address = { id: 'addr-1', alias: 'Sítio', street: 'Estrada X', number: '10', city: 'Holambra', uf: 'SP' };
+
+      await service.notifyAddressChanged('user-1', change, address);
+
+      const [input] = createdInputs(prisma);
+      expect(input).toMatchObject({ userId: 'user-1', type, data: { addressId: 'addr-1', action: change } });
+      expect(input.message).toContain(`O endereço "Sítio" (Estrada X, 10 - Holambra/SP) ${verb}.`);
+    });
+
+    it('falha ao gravar notificação de perfil não derruba a alteração', async () => {
+      prisma.notification.createMany.mockRejectedValue(new Error('db down'));
+
+      await expect(service.notifyProfileUpdated('user-1', ['nome'])).resolves.toBeUndefined();
     });
   });
 
