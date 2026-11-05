@@ -20,15 +20,20 @@ enum SaleStatus {
   REJECTED
 }
 
+/// Eventos de pedido notificam comprador E vendedor(es); `data.role` diz o papel de quem recebe.
 enum NotificationType {
-  NEW_ORDER // vendedor: chegou um pedido
-  ORDER_ACCEPTED // comprador: vendedor aceitou o pedido
-  ORDER_REJECTED // comprador: vendedor recusou o pedido
-  DOWN_PAYMENT_RECEIVED // vendedor: comprador pagou a entrada (30%)
-  WEIGHT_REGISTERED // comprador: vendedor registrou a pesagem
-  FINAL_PAYMENT_RECEIVED // vendedor: comprador pagou a parcela final (70%) ou o valor integral
-  ORDER_STATUS_CHANGED // comprador: demais mudanças de status; vendedor: só Entregue/Concluído
+  NEW_ORDER // pedido criado (vendedor: chegou um pedido; comprador: pedido enviado)
+  ORDER_ACCEPTED // vendedor aceitou o pedido
+  ORDER_REJECTED // vendedor recusou o pedido
+  DOWN_PAYMENT_RECEIVED // vendedor: comprador pagou a entrada (30%) — o comprador recebe ORDER_STATUS_CHANGED
+  WEIGHT_REGISTERED // vendedor registrou a pesagem
+  FINAL_PAYMENT_RECEIVED // vendedor: parcela final (70%) ou valor integral pago — o comprador recebe ORDER_STATUS_CHANGED
+  ORDER_STATUS_CHANGED // qualquer mudança de status do pedido
   PRODUCT_HARVEST_REMINDER // vendedor: anúncio ativo com colheita em até 5 dias (será desativado na data)
+  PROFILE_UPDATED // dados pessoais do perfil alterados (data.fields lista quais)
+  ADDRESS_CREATED // endereço adicionado
+  ADDRESS_UPDATED // endereço alterado ou definido como padrão
+  ADDRESS_DELETED // endereço removido
 }
 
 enum ContractKind {
