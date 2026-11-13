@@ -3,6 +3,7 @@ import { UploadS3Service } from "../upload-S3/uploadS3.service";
 import { logger } from "../../lib/logger";
 import { startOfTodayInBrasilia } from "../../lib/brasiliaTime";
 import { ProductError, ProductRequester } from "./product.errors";
+import { sellerFarmBadgeSelect } from "../certification/farmCertification.service";
 
 export type ProductStatusFilter = "active" | "inactive" | "all";
 
@@ -124,7 +125,7 @@ export class ProductService {
         sellingUnitProduct: { include: { unit: true } },
         boughtProducts: true,
         questions: true,
-        seller: { select: { id: true, name: true, phone_number: true, email: true } },
+        seller: { select: { id: true, name: true, phone_number: true, email: true, farmCertifications: sellerFarmBadgeSelect() } },
       },
     });
   }
@@ -160,7 +161,7 @@ export class ProductService {
       where: { id: { in: topIds } },
       include: {
         sellingUnitProduct: { include: { unit: true } },
-        seller: { select: { id: true, name: true } },
+        seller: { select: { id: true, name: true, farmCertifications: sellerFarmBadgeSelect() } },
       },
     });
     const byId = new Map(products.map((p) => [p.id, p]));
@@ -186,7 +187,7 @@ export class ProductService {
         sellingUnitProduct: { include: { unit: true } },
         boughtProducts: true,
         questions: true,
-        seller: { select: { id: true, name: true, phone_number: true, email: true } },
+        seller: { select: { id: true, name: true, phone_number: true, email: true, farmCertifications: sellerFarmBadgeSelect() } },
       },
     });
   }
@@ -198,7 +199,7 @@ export class ProductService {
         sellingUnitProduct: { include: { unit: true } },
         boughtProducts: true,
         questions: true,
-        seller: { select: { id: true, name: true, phone_number: true, email: true } },
+        seller: { select: { id: true, name: true, phone_number: true, email: true, farmCertifications: sellerFarmBadgeSelect() } },
       },
     });
   }

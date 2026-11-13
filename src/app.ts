@@ -20,6 +20,7 @@ import paymentRoutes from './modules/payment/payment.route';
 import { PaymentService } from './modules/payment/payment.service';
 import dashboardRoutes from './modules/dashboard/dashboard.route';
 import notificationRoutes from './modules/notification/notification.route';
+import farmCertificationRoutes from './modules/certification/farmCertification.route';
 
 import 'dotenv/config';
 
@@ -49,6 +50,7 @@ app.use('/payment-methods', paymentMethodsRoutes);
 app.use('/payment', paymentRoutes);
 app.use('/dashboard', dashboardRoutes);
 app.use('/notifications', notificationRoutes);
+app.use('/certifications/farm', farmCertificationRoutes);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.use('/upload-s3', uploadS3Router);
 

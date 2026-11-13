@@ -4,6 +4,7 @@ import './modules/price-recommendation/syncPricesJob';
 import './modules/product/deactivateExpiredProductsJob';
 import './modules/notification/harvestReminderJob';
 import './modules/notification/notificationEmailJob';
+import './modules/certification/farmCertificationExpiryJob';
 
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 5000;
