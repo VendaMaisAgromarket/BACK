@@ -34,6 +34,52 @@ enum NotificationType {
   ADDRESS_CREATED // endereço adicionado
   ADDRESS_UPDATED // endereço alterado ou definido como padrão
   ADDRESS_DELETED // endereço removido
+  FARM_CERTIFICATION_SUBMITTED // admins: certificação de fazenda enviada/reenviada para avaliação
+  FARM_CERTIFICATION_APPROVED // produtor: certificação aprovada (selo ativo)
+  FARM_CERTIFICATION_REJECTED // produtor: certificação recusada (data.reason traz o motivo)
+  FARM_CERTIFICATION_REVOKED // produtor: certificação aprovada foi revogada por um admin
+  FARM_CERTIFICATION_EXPIRING // produtor: certificação aprovada vence em breve
+  FARM_CERTIFICATION_EXPIRED // produtor: certificação venceu e o selo saiu do ar
+}
+
+/// Lista fechada de certificações de fazenda aceitas (o produtor escolhe, não digita).
+enum FarmCertificationType {
+  ORGANIC_SISORG // Orgânico (SisOrg / MAPA)
+  GLOBALGAP // GlobalG.A.P.
+  RAINFOREST_ALLIANCE // Rainforest Alliance
+  FAIR_TRADE // Fair Trade
+  OTHER // Outra (o admin confere pelo documento)
+}
+
+/// UPLOADED = o produtor já tinha o certificado e enviou; PURCHASED = adquirido pela plataforma (fluxo de compra futuro).
+enum CertificationOrigin {
+  UPLOADED
+  PURCHASED
+}
+
+/// PENDING → APPROVED | REJECTED; APPROVED → EXPIRED (job, no vencimento) | REVOKED (admin).
+/// REJECTED pode ser corrigida e reenviada pelo produtor (volta a PENDING).
+enum CertificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+  REVOKED
+}
+
+enum CertificationDocumentType {
+  CERTIFICATE // o certificado em si
+  AUDIT_REPORT // relatório/laudo de auditoria
+  OTHER
+}
+
+enum CertificationEventAction {
+  SUBMITTED
+  RESUBMITTED
+  APPROVED
+  REJECTED
+  REVOKED
+  EXPIRED
 }
 
 enum ContractKind {
@@ -74,10 +120,100 @@ model User {
   sellerStats SellerStats?
   Cart        Cart[]
 
-  acceptances        ContractAcceptance[]
-  operationDocuments OperationDocument[]
-  notifications      Notification[]
+  acceptances         ContractAcceptance[]
+  operationDocuments  OperationDocument[]
+  notifications       Notification[]
   passwordResetTokens PasswordResetToken[]
+
+  farmCertifications         FarmCertification[]         @relation("FarmCertificationOwner")
+  reviewedFarmCertifications FarmCertification[]         @relation("FarmCertificationReviewer")
+  certificationDocuments     FarmCertificationDocument[]
+  certificationEvents        FarmCertificationEvent[]
+}
+
+/// Certificação da fazenda de um produtor. Selo ativo = APPROVED e validUntil >= hoje (Brasília):
+/// o selo some no vencimento mesmo antes do job marcar EXPIRED.
+/// Datas do certificado (issuedAt/validUntil) são gravadas como o início do dia em Brasília.
+model FarmCertification {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+
+  // Identificação da fazenda
+  farmName     String  @map("farm_name")
+  city         String
+  uf           String  @db.VarChar(2)
+  ccir         String?
+  car          String?
+  areaHectares Decimal @map("area_hectares") @db.Decimal(12, 2)
+
+  // Certificado
+  type              FarmCertificationType
+  certifierName     String                @map("certifier_name")
+  certifierCnpj     String                @map("certifier_cnpj")
+  certificateNumber String                @map("certificate_number")
+  issuedAt          DateTime              @map("issued_at")
+  validUntil        DateTime              @map("valid_until")
+
+  origin CertificationOrigin @default(UPLOADED)
+  status CertificationStatus @default(PENDING)
+
+  // Última avaliação (o histórico completo fica em FarmCertificationEvent)
+  reviewedById    String?   @map("reviewed_by_id")
+  reviewedAt      DateTime? @map("reviewed_at")
+  rejectionReason String?   @map("rejection_reason")
+  reviewNotes     String?   @map("review_notes")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user       User                        @relation("FarmCertificationOwner", fields: [userId], references: [id])
+  reviewedBy User?                       @relation("FarmCertificationReviewer", fields: [reviewedById], references: [id])
+  documents  FarmCertificationDocument[]
+  events     FarmCertificationEvent[]
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+  @@index([status, validUntil])
+}
+
+/// Arquivo da certificação no S3 (privado: acesso só por URL assinada, para o dono e admins).
+model FarmCertificationDocument {
+  id              String                    @id @default(uuid())
+  certificationId String                    @map("certification_id")
+  docType         CertificationDocumentType @default(CERTIFICATE) @map("doc_type")
+  s3Key           String                    @map("s3_key")
+  originalName    String                    @map("original_name")
+  mimeType        String                    @map("mime_type")
+  sizeBytes       Int                       @map("size_bytes")
+  uploadedById    String                    @map("uploaded_by_id")
+  uploadedAt      DateTime                  @default(now()) @map("uploaded_at")
+
+  certification FarmCertification        @relation(fields: [certificationId], references: [id], onDelete: Cascade)
+  uploadedBy    User                     @relation(fields: [uploadedById], references: [id])
+  events        FarmCertificationEvent[]
+
+  @@index([certificationId])
+}
+
+/// Histórico (só inserção) da certificação: quem fez o quê, quando, com qual documento.
+/// "Quem certificou" é a certificadora (FarmCertification.certifierName/Cnpj); "quem deu o aval" é o actor dos eventos APPROVED.
+model FarmCertificationEvent {
+  id              String                   @id @default(uuid())
+  certificationId String                   @map("certification_id")
+  action          CertificationEventAction
+  fromStatus      CertificationStatus?     @map("from_status")
+  toStatus        CertificationStatus      @map("to_status")
+  /// null = ação do sistema (ex.: job de vencimento)
+  actorId         String?                  @map("actor_id")
+  documentId      String?                  @map("document_id")
+  note            String?
+  createdAt       DateTime                 @default(now()) @map("created_at")
+
+  certification FarmCertification          @relation(fields: [certificationId], references: [id], onDelete: Cascade)
+  actor         User?                      @relation(fields: [actorId], references: [id])
+  document      FarmCertificationDocument? @relation(fields: [documentId], references: [id])
+
+  @@index([certificationId, createdAt])
 }
 
 /// Link de "esqueci minha senha". Guarda só o hash SHA-256 do token (o token em claro existe
@@ -454,21 +590,21 @@ model ContractAcceptance {
 /// (ver NotificationService). `dedupeKey` é único: a mesma transição processada duas vezes
 /// (webhook + poller, retry, job reiniciado) não gera notificação duplicada.
 model Notification {
-  id        String           @id @default(uuid())
-  userId    String           @map("user_id")
-  type      NotificationType
-  title     String
-  message   String
-  saleId    String?          @map("sale_id")
-  productId String?          @map("product_id")
-  data      Json?
-  dedupeKey String?          @unique @map("dedupe_key")
-  readAt    DateTime?        @map("read_at")
-  createdAt DateTime         @default(now()) @map("created_at")
+  id            String           @id @default(uuid())
+  userId        String           @map("user_id")
+  type          NotificationType
+  title         String
+  message       String
+  saleId        String?          @map("sale_id")
+  productId     String?          @map("product_id")
+  data          Json?
+  dedupeKey     String?          @unique @map("dedupe_key")
+  readAt        DateTime?        @map("read_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
   /// Caixa de saída do e-mail: null = pendente. O notificationEmailJob envia só após o commit
   /// (notificações de pagamento nascem dentro de uma transação que pode ser revertida).
-  emailSentAt   DateTime? @map("email_sent_at")
-  emailAttempts Int       @default(0) @map("email_attempts")
+  emailSentAt   DateTime?        @map("email_sent_at")
+  emailAttempts Int              @default(0) @map("email_attempts")
 
   user    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   sale    SaleData? @relation(fields: [saleId], references: [id], onDelete: Cascade)

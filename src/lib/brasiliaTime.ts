@@ -19,3 +19,17 @@ export function startOfTodayInBrasilia(now: Date = new Date()): Date {
   const [year, month, day] = brasiliaDateKey(now).split("-").map(Number);
   return new Date(Date.UTC(year, month - 1, day, BRASILIA_UTC_OFFSET_HOURS));
 }
+
+/**
+ * Converte uma data de calendário "YYYY-MM-DD" (também aceita um ISO completo, usando só a parte da
+ * data) no instante em que esse dia começa em Brasília. Retorna null se a data não existir.
+ */
+export function brasiliaDateFromKey(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(value.trim());
+  if (!match) return null;
+  const [year, month, day] = match.slice(1).map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day, BRASILIA_UTC_OFFSET_HOURS));
+  // Rejeita datas que "transbordam" (ex.: 2026-02-30 → 2026-03-02).
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return date;
+}

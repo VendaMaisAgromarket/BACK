@@ -3,8 +3,10 @@ import { s3Client, AWS_BUCKET_NAME } from "../../config/aws.config";
 import {
   PutObjectCommand,
   DeleteObjectCommand,
+  GetObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
 
 export class UploadS3Service {
@@ -20,14 +22,16 @@ export class UploadS3Service {
     this.region = region;
   }
 
-  public async upload(file: Express.Multer.File): Promise<{
+  /** `prefix` agrupa a chave numa "pasta" do bucket (ex.: "certifications/farm/<id>"). */
+  public async upload(file: Express.Multer.File, prefix?: string): Promise<{
     key: string;
     url: string;
     publicUrl: string;
   }> {
     if (!file) throw new Error("Arquivo não enviado");
 
-    const key = `${randomUUID()}-${file.originalname.replace(/\s+/g, '-')}`;
+    const fileName = `${randomUUID()}-${file.originalname.replace(/\s+/g, '-')}`;
+    const key = prefix ? `${prefix.replace(/\/+$/, "")}/${fileName}` : fileName;
 
     await this.s3Client.send(
       new PutObjectCommand({
@@ -53,6 +57,17 @@ export class UploadS3Service {
     if (!key) throw new Error("Chave do arquivo é obrigatória");
 
     return `https://${this.bucketName}.s3.${this.region}.amazonaws.com/${encodeURIComponent(key)}`;
+  }
+
+  /** URL temporária de leitura (documentos privados, ex.: certificações). Padrão: 10 minutos. */
+  public async getSignedReadUrl(key: string, expiresInSeconds: number = 600): Promise<string> {
+    if (!key) throw new Error("Chave do arquivo é obrigatória");
+
+    return getSignedUrl(
+      this.s3Client,
+      new GetObjectCommand({ Bucket: this.bucketName, Key: key }),
+      { expiresIn: expiresInSeconds }
+    );
   }
 
   public getCdnUrl(key: string, cloudFrontDomain?: string): string {
