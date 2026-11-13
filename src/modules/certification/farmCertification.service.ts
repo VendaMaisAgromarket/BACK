@@ -18,7 +18,8 @@ import {
   listFarmCertificationsQuerySchema,
   parseDocumentTypes,
   parseOrThrow,
-  rejectOrRevokeSchema,
+  rejectSchema,
+  revokeSchema,
 } from "./farmCertification.schema";
 
 /** Arquivos por envio (criação ou reenvio) e no total da certificação. */
@@ -34,6 +35,24 @@ const DEFAULT_PAGE_SIZE = 20;
 
 /** Certificações que ainda "ocupam a vaga": impedem enviar outra igual. */
 const OPEN_STATUSES: CertificationStatus[] = [CertificationStatus.PENDING, CertificationStatus.APPROVED];
+
+const DUPLICATE_MESSAGE = "Este certificado já foi enviado e está pendente ou aprovado.";
+
+/**
+ * Violação do índice único parcial de certificado aberto (FarmCertification_open_certificate_unique):
+ * dois envios simultâneos do mesmo certificado passam pela checagem prévia, mas só um grava.
+ */
+function isUniqueViolation(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
+}
+
+/**
+ * Dados gravados a partir do formulário. CCIR/CAR ausentes viram `null` explícito: o reenvio substitui
+ * todos os dados, e o Prisma ignoraria um `undefined` (o identificador antigo ficaria gravado).
+ */
+function certificationData(input: FarmCertificationInput) {
+  return { ...input, ccir: input.ccir ?? null, car: input.car ?? null };
+}
 
 /** Filtro do selo ativo: aprovada e dentro da validade (calendário de Brasília). */
 export function activeFarmCertificationWhere(now: Date = new Date()): Prisma.FarmCertificationWhereInput {
@@ -125,7 +144,7 @@ export class FarmCertificationService {
           data: {
             id: certificationId,
             userId: producer.id,
-            ...input,
+            ...certificationData(input),
             documents: { create: documents.map((doc) => ({ ...doc, uploadedById: producer.id })) },
           },
         });
@@ -143,6 +162,7 @@ export class FarmCertificationService {
       });
     } catch (err: unknown) {
       await this.discardUploads(documents);
+      if (isUniqueViolation(err)) throw new CertificationError(409, DUPLICATE_MESSAGE);
       throw err;
     }
 
@@ -159,7 +179,8 @@ export class FarmCertificationService {
 
   /**
    * Corrige e reenvia uma certificação PENDING ou REJECTED (substitui os dados e anexa novos
-   * arquivos, se houver). Volta para PENDING e limpa a avaliação anterior (que segue no histórico).
+   * arquivos, se houver). Volta para PENDING, limpa a avaliação anterior (que segue no histórico) e
+   * incrementa `revision`: uma avaliação feita sobre os dados antigos passa a receber 409.
    */
   async resubmit(
     requester: CertificationRequester,
@@ -171,7 +192,7 @@ export class FarmCertificationService {
     const producer = await this.requireProducer(requester.userId);
     const current = await this.prisma.farmCertification.findUnique({
       where: { id: certificationId },
-      select: { id: true, userId: true, status: true, _count: { select: { documents: true } } },
+      select: { id: true, userId: true, status: true, revision: true, _count: { select: { documents: true } } },
     });
     if (!current || current.userId !== producer.id) throw new CertificationError(404, "Certificação não encontrada.");
     if (current.status !== CertificationStatus.PENDING && current.status !== CertificationStatus.REJECTED) {
@@ -193,11 +214,13 @@ export class FarmCertificationService {
 
     try {
       await this.prisma.$transaction(async (tx) => {
-        // Compare-and-set no status: um admin pode ter avaliado no meio do caminho.
+        // Compare-and-set em status + revisão: um admin pode ter avaliado no meio do caminho, ou outro
+        // reenvio (outra aba/requisição) pode ter gravado antes — o segundo recebe 409.
         const updated = await tx.farmCertification.updateMany({
-          where: { id: certificationId, status: current.status },
+          where: { id: certificationId, status: current.status, revision: current.revision },
           data: {
-            ...input,
+            ...certificationData(input),
+            revision: { increment: 1 },
             status: CertificationStatus.PENDING,
             reviewedById: null,
             reviewedAt: null,
@@ -206,12 +229,17 @@ export class FarmCertificationService {
           },
         });
         if (updated.count === 0) {
-          throw new CertificationError(409, "A certificação foi avaliada enquanto você editava. Atualize a página.");
+          throw new CertificationError(409, "A certificação foi alterada enquanto você editava. Atualize a página.");
         }
         if (documents.length > 0) {
           await tx.farmCertificationDocument.createMany({
             data: documents.map((doc) => ({ ...doc, certificationId, uploadedById: producer.id })),
           });
+          // Confere o limite com o total real gravado (a checagem prévia usou uma contagem lida antes).
+          const total = await tx.farmCertificationDocument.count({ where: { certificationId } });
+          if (total > MAX_DOCUMENTS_PER_CERTIFICATION) {
+            throw new CertificationError(400, `Limite de ${MAX_DOCUMENTS_PER_CERTIFICATION} documentos por certificação atingido.`);
+          }
         }
         await tx.farmCertificationEvent.create({
           data: {
@@ -227,6 +255,7 @@ export class FarmCertificationService {
       });
     } catch (err: unknown) {
       await this.discardUploads(documents);
+      if (isUniqueViolation(err)) throw new CertificationError(409, DUPLICATE_MESSAGE);
       throw err;
     }
 
@@ -324,18 +353,18 @@ export class FarmCertificationService {
   }
 
   async approve(admin: CertificationRequester, certificationId: string, body: unknown, now: Date = new Date()) {
-    const { documentId, notes } = parseOrThrow(approveSchema, body);
-    return this.review("approve", admin, certificationId, { documentId, notes }, now);
+    const { revision, documentId, notes } = parseOrThrow(approveSchema, body);
+    return this.review("approve", admin, certificationId, { revision, documentId, notes }, now);
   }
 
   async reject(admin: CertificationRequester, certificationId: string, body: unknown, now: Date = new Date()) {
-    const { reason, notes } = parseOrThrow(rejectOrRevokeSchema, body);
-    return this.review("reject", admin, certificationId, { reason, notes }, now);
+    const { revision, reason, notes } = parseOrThrow(rejectSchema, body);
+    return this.review("reject", admin, certificationId, { revision, reason, notes }, now);
   }
 
   async revoke(admin: CertificationRequester, certificationId: string, body: unknown, now: Date = new Date()) {
-    const { reason, notes } = parseOrThrow(rejectOrRevokeSchema, body);
-    return this.review("revoke", admin, certificationId, { reason, notes }, now);
+    const { revision, reason, notes } = parseOrThrow(revokeSchema, body);
+    return this.review("revoke", admin, certificationId, { revision, reason, notes }, now);
   }
 
   // ─── Vencimento (job diário) ─────────────────────────────────────────────────
@@ -414,7 +443,7 @@ export class FarmCertificationService {
     action: ReviewAction,
     admin: CertificationRequester,
     certificationId: string,
-    params: { documentId?: string; notes?: string; reason?: string },
+    params: { revision?: number; documentId?: string; notes?: string; reason?: string },
     now: Date
   ) {
     if (admin.role !== "admin") throw new CertificationError(403, "Apenas administradores podem avaliar certificações.");
@@ -427,6 +456,7 @@ export class FarmCertificationService {
         userId: true,
         farmName: true,
         status: true,
+        revision: true,
         validUntil: true,
         documents: { select: { id: true, docType: true }, orderBy: { uploadedAt: "desc" } },
       },
@@ -434,6 +464,11 @@ export class FarmCertificationService {
     if (!cert) throw new CertificationError(404, "Certificação não encontrada.");
     if (cert.status !== transition.from) {
       throw new CertificationError(409, `Ação indisponível: a certificação está ${cert.status}.`);
+    }
+    // O admin avalia os dados que viu: se o produtor reenviou depois disso, a decisão está obsoleta.
+    const revision = params.revision ?? cert.revision;
+    if (revision !== cert.revision) {
+      throw new CertificationError(409, "O produtor alterou a certificação depois que você a abriu. Recarregue e avalie de novo.");
     }
 
     let documentId: string | null = null;
@@ -455,7 +490,9 @@ export class FarmCertificationService {
     const eventId = randomUUID();
     await this.prisma.$transaction(async (tx) => {
       const updated = await tx.farmCertification.updateMany({
-        where: { id: certificationId, status: transition.from },
+        // Compare-and-set em status + revisão: garante que a validade e os documentos conferidos acima
+        // são os gravados (um reenvio concorrente incrementa a revisão e faz este update falhar).
+        where: { id: certificationId, status: transition.from, revision },
         data: {
           status: transition.to,
           reviewedById: admin.userId,
@@ -465,7 +502,7 @@ export class FarmCertificationService {
         },
       });
       if (updated.count === 0) {
-        throw new CertificationError(409, "A certificação foi alterada por outra pessoa. Atualize a página.");
+        throw new CertificationError(409, "A certificação foi alterada por outra pessoa. Recarregue e avalie de novo.");
       }
       await tx.farmCertificationEvent.create({
         data: {
@@ -511,7 +548,10 @@ export class FarmCertificationService {
     return input;
   }
 
-  /** Mesmo certificado (tipo + número) já pendente ou aprovado para o produtor. */
+  /**
+   * Mesmo certificado (tipo + número) já pendente ou aprovado para o produtor. Checagem prévia, para
+   * não subir arquivos à toa; a garantia sob concorrência é o índice único parcial no banco.
+   */
   private async assertNotDuplicate(userId: string, input: FarmCertificationInput, ignoreId?: string) {
     const duplicate = await this.prisma.farmCertification.findFirst({
       where: {
@@ -524,7 +564,7 @@ export class FarmCertificationService {
       select: { id: true },
     });
     if (duplicate) {
-      throw new CertificationError(409, "Este certificado já foi enviado e está pendente ou aprovado.");
+      throw new CertificationError(409, DUPLICATE_MESSAGE);
     }
   }
 

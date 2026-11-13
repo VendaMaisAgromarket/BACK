@@ -154,8 +154,11 @@ model FarmCertification {
   issuedAt          DateTime              @map("issued_at")
   validUntil        DateTime              @map("valid_until")
 
-  origin CertificationOrigin @default(UPLOADED)
-  status CertificationStatus @default(PENDING)
+  origin   CertificationOrigin @default(UPLOADED)
+  status   CertificationStatus @default(PENDING)
+  /// Versão dos dados: incrementada a cada reenvio. É o token de compare-and-set do reenvio e da
+  /// avaliação — o admin aprova/recusa informando a revisão que analisou (409 se o produtor mudou algo).
+  revision Int                 @default(0)
 
   // Última avaliação (o histórico completo fica em FarmCertificationEvent)
   reviewedById    String?   @map("reviewed_by_id")
@@ -170,6 +173,11 @@ model FarmCertification {
   reviewedBy User?                       @relation("FarmCertificationReviewer", fields: [reviewedById], references: [id])
   documents  FarmCertificationDocument[]
   events     FarmCertificationEvent[]
+  // NOTA: existe um índice único PARCIAL e case-insensitive (user_id, type, lower(certificate_number))
+  // WHERE status IN ('PENDING','APPROVED'), criado via SQL manual na migration
+  // farm_certification_revision_and_open_unique: o mesmo certificado não pode estar aberto duas vezes,
+  // nem sob concorrência. A sintaxe do Prisma não suporta índice parcial/por expressão, então ele não
+  // aparece aqui. Não remover essa migration ao rodar `prisma migrate dev`/`db push`.
 
   @@index([userId, status])
   @@index([status, createdAt])

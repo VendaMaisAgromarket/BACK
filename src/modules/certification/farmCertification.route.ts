@@ -111,16 +111,19 @@ router.get("/admin", requireAdmin, wrap(controller.listForAdmin.bind(controller)
  *     parameters:
  *       - { in: path, name: id, required: true, schema: { type: string } }
  *     requestBody:
+ *       required: true
  *       content:
  *         application/json:
  *           schema:
  *             type: object
+ *             required: [revision]
  *             properties:
+ *               revision: { type: integer, description: "Campo `revision` do detalhe que o admin analisou" }
  *               documentId: { type: string, description: "Documento que embasou a aprovação (padrão: certificado mais recente)" }
  *               notes: { type: string }
  *     responses:
  *       200: { description: Certificação atualizada, com histórico }
- *       409: { description: Não está pendente, ou o certificado já venceu }
+ *       409: { description: "Não está pendente, o certificado já venceu, ou o produtor reenviou depois (revision desatualizada)" }
  */
 router.patch("/admin/:id/approve", requireAdmin, wrap(controller.approve.bind(controller)));
 
@@ -139,13 +142,14 @@ router.patch("/admin/:id/approve", requireAdmin, wrap(controller.approve.bind(co
  *         application/json:
  *           schema:
  *             type: object
- *             required: [reason]
+ *             required: [revision, reason]
  *             properties:
+ *               revision: { type: integer, description: "Campo `revision` do detalhe que o admin analisou" }
  *               reason: { type: string }
  *               notes: { type: string }
  *     responses:
  *       200: { description: Certificação atualizada }
- *       409: { description: Não está pendente }
+ *       409: { description: "Não está pendente, ou revision desatualizada" }
  */
 router.patch("/admin/:id/reject", requireAdmin, wrap(controller.reject.bind(controller)));
 
@@ -166,6 +170,7 @@ router.patch("/admin/:id/reject", requireAdmin, wrap(controller.reject.bind(cont
  *             type: object
  *             required: [reason]
  *             properties:
+ *               revision: { type: integer, description: "Opcional: se enviado, precisa ser o atual" }
  *               reason: { type: string }
  *               notes: { type: string }
  *     responses:

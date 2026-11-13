@@ -70,14 +70,34 @@ export const listFarmCertificationsQuerySchema = z.object({
 
 export type ListFarmCertificationsQuery = z.infer<typeof listFarmCertificationsQuerySchema>;
 
+/** Revisão dos dados que o admin analisou (campo `revision` do detalhe). */
+const revisionField = z.preprocess(
+  (value) => (value === undefined || value === null || value === "" ? undefined : value),
+  z.coerce
+    .number({ error: "Informe a revisão analisada (revision)." })
+    .int("Revisão inválida.")
+    .min(0, "Revisão inválida.")
+);
+
+const reasonField = z.string({ error: "Motivo é obrigatório." }).trim().min(3, "Motivo é obrigatório.").max(500);
+
 export const approveSchema = z.object({
+  revision: revisionField,
   /** Documento que embasou a aprovação; padrão: o certificado mais recente. */
   documentId: optionalText(64),
   notes: optionalText(1000),
 });
 
-export const rejectOrRevokeSchema = z.object({
-  reason: z.string({ error: "Motivo é obrigatório." }).trim().min(3, "Motivo é obrigatório.").max(500),
+export const rejectSchema = z.object({
+  revision: revisionField,
+  reason: reasonField,
+  notes: optionalText(1000),
+});
+
+/** Revogação parte de APPROVED, que não aceita edição: a revisão é opcional. */
+export const revokeSchema = z.object({
+  revision: revisionField.optional(),
+  reason: reasonField,
   notes: optionalText(1000),
 });
 

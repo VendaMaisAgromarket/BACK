@@ -1,4 +1,4 @@
-import { CertificationDocumentType, CertificationStatus, PrismaClient } from '@prisma/client';
+import { CertificationDocumentType, CertificationStatus, Prisma, PrismaClient } from '@prisma/client';
 import { mockDeep, DeepMockProxy } from 'jest-mock-extended';
 import { FarmCertificationService } from '../farmCertification.service';
 import { CertificationError } from '../certification.errors';
@@ -89,7 +89,7 @@ describe('FarmCertificationService', () => {
         issuedAt: brasiliaDateFromKey('2026-03-01'),
         validUntil: brasiliaDateFromKey('2027-03-01'),
       });
-      expect(createArgs.data.car).toBeUndefined();
+      expect(createArgs.data.car).toBeNull(); // vazio vira null explícito
       const docs = (createArgs.data.documents as { create: Array<{ id: string; docType: string; uploadedById: string }> }).create;
       expect(docs.map((d) => d.docType)).toEqual(['AUDIT_REPORT', 'CERTIFICATE']);
       expect(docs.every((d) => d.uploadedById === PRODUCER.userId)).toBe(true);
@@ -143,6 +143,15 @@ describe('FarmCertificationService', () => {
       });
     });
 
+    it('traduz a violação do índice único (envio simultâneo do mesmo certificado) em 409 e descarta os arquivos', async () => {
+      prisma.$transaction.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: 'test' })
+      );
+      await expectError(service.create(PRODUCER, validBody(), [file()], NOW), 409, /já foi enviado/);
+      expect(uploads.delete).toHaveBeenCalledTimes(1);
+      expect(notifications.notifyFarmCertificationSubmitted).not.toHaveBeenCalled();
+    });
+
     it('remove do S3 os arquivos enviados se a gravação no banco falhar', async () => {
       prisma.$transaction.mockRejectedValue(new Error('db down'));
       await expect(service.create(PRODUCER, validBody(), [file(), file()], NOW)).rejects.toThrow('db down');
@@ -160,7 +169,8 @@ describe('FarmCertificationService', () => {
 
   describe('resubmit', () => {
     function current(status: CertificationStatus, userId = PRODUCER.userId, documents = 1) {
-      prisma.farmCertification.findUnique.mockResolvedValue({ id: CERT_ID, userId, status, _count: { documents } } as never);
+      prisma.farmCertification.findUnique.mockResolvedValue({ id: CERT_ID, userId, status, revision: 3, _count: { documents } } as never);
+      prisma.farmCertificationDocument.count.mockResolvedValue(documents + 1);
     }
 
     it('reenvia uma recusada: volta a PENDING, limpa a avaliação, anexa arquivos e registra RESUBMITTED', async () => {
@@ -168,8 +178,15 @@ describe('FarmCertificationService', () => {
       await service.resubmit(PRODUCER, CERT_ID, validBody(), [file()], NOW);
 
       expect(prisma.farmCertification.updateMany).toHaveBeenCalledWith({
-        where: { id: CERT_ID, status: 'REJECTED' },
-        data: expect.objectContaining({ status: 'PENDING', reviewedById: null, reviewedAt: null, rejectionReason: null, reviewNotes: null }),
+        where: { id: CERT_ID, status: 'REJECTED', revision: 3 },
+        data: expect.objectContaining({
+          status: 'PENDING',
+          revision: { increment: 1 },
+          reviewedById: null,
+          reviewedAt: null,
+          rejectionReason: null,
+          reviewNotes: null,
+        }),
       });
       expect(prisma.farmCertificationDocument.createMany).toHaveBeenCalled();
       expect(prisma.farmCertificationEvent.create.mock.calls[0][0].data).toMatchObject({
@@ -179,6 +196,28 @@ describe('FarmCertificationService', () => {
       });
       expect(prisma.farmCertification.findFirst.mock.calls[0][0]?.where).toMatchObject({ id: { not: CERT_ID } });
       expect(notifications.notifyFarmCertificationSubmitted).toHaveBeenCalledWith(expect.objectContaining({ resubmitted: true }));
+    });
+
+    it('grava null nos identificadores removidos (o reenvio substitui todos os dados)', async () => {
+      current(CertificationStatus.REJECTED);
+      await service.resubmit(PRODUCER, CERT_ID, validBody({ ccir: '', car: 'MG-3170206-ABC' }), [], NOW);
+      expect(prisma.farmCertification.updateMany.mock.calls[0][0].data).toMatchObject({ ccir: null, car: 'MG-3170206-ABC' });
+    });
+
+    it('reconfere o limite de documentos dentro da transação (contagem real após gravar)', async () => {
+      current(CertificationStatus.REJECTED, PRODUCER.userId, 14);
+      prisma.farmCertificationDocument.count.mockResolvedValue(16); // outro envio gravou no meio do caminho
+      await expectError(service.resubmit(PRODUCER, CERT_ID, validBody(), [file()], NOW), 400, /Limite/);
+      expect(uploads.delete).toHaveBeenCalledTimes(1);
+      expect(notifications.notifyFarmCertificationSubmitted).not.toHaveBeenCalled();
+    });
+
+    it('traduz a violação do índice único em 409', async () => {
+      current(CertificationStatus.REJECTED);
+      prisma.farmCertification.updateMany.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: 'test' })
+      );
+      await expectError(service.resubmit(PRODUCER, CERT_ID, validBody(), [], NOW), 409, /já foi enviado/);
     });
 
     it('permite reenviar sem arquivos novos', async () => {
@@ -203,7 +242,7 @@ describe('FarmCertificationService', () => {
       await expectError(service.resubmit(PRODUCER, CERT_ID, validBody(), [file(), file()], NOW), 400, /Limite/);
     });
 
-    it('devolve 409 e descarta os arquivos se um admin avaliou no meio do caminho', async () => {
+    it('devolve 409 e descarta os arquivos se um admin avaliou ou outro reenvio gravou no meio do caminho', async () => {
       current(CertificationStatus.PENDING);
       prisma.farmCertification.updateMany.mockResolvedValue({ count: 0 });
       await expectError(service.resubmit(PRODUCER, CERT_ID, validBody(), [file()], NOW), 409);
@@ -219,6 +258,7 @@ describe('FarmCertificationService', () => {
         userId: PRODUCER.userId,
         farmName: 'Fazenda Boa Vista',
         status: CertificationStatus.PENDING,
+        revision: 2,
         validUntil: brasiliaDateFromKey('2027-03-01'),
         documents: [
           { id: 'doc-report', docType: CertificationDocumentType.AUDIT_REPORT },
@@ -230,10 +270,10 @@ describe('FarmCertificationService', () => {
 
     it('aprova: CAS a partir de PENDING, registra quem aprovou e o certificado usado, e avisa o produtor', async () => {
       pending();
-      await service.approve(ADMIN, CERT_ID, { notes: 'ok' }, NOW);
+      await service.approve(ADMIN, CERT_ID, { revision: 2, notes: 'ok' }, NOW);
 
       expect(prisma.farmCertification.updateMany).toHaveBeenCalledWith({
-        where: { id: CERT_ID, status: 'PENDING' },
+        where: { id: CERT_ID, status: 'PENDING', revision: 2 },
         data: { status: 'APPROVED', reviewedById: ADMIN.userId, reviewedAt: NOW, reviewNotes: 'ok', rejectionReason: null },
       });
       const event = prisma.farmCertificationEvent.create.mock.calls[0][0].data;
@@ -245,23 +285,23 @@ describe('FarmCertificationService', () => {
 
     it('aprova com o documento escolhido, desde que seja da certificação', async () => {
       pending();
-      await service.approve(ADMIN, CERT_ID, { documentId: 'doc-report' }, NOW);
+      await service.approve(ADMIN, CERT_ID, { revision: 2, documentId: 'doc-report' }, NOW);
       expect(prisma.farmCertificationEvent.create.mock.calls[0][0].data.documentId).toBe('doc-report');
 
-      await expectError(service.approve(ADMIN, CERT_ID, { documentId: 'doc-alheio' }, NOW), 400);
+      await expectError(service.approve(ADMIN, CERT_ID, { revision: 2, documentId: 'doc-alheio' }, NOW), 400);
     });
 
     it('não aprova certificado já vencido', async () => {
       pending({ validUntil: brasiliaDateFromKey('2026-11-10') });
-      await expectError(service.approve(ADMIN, CERT_ID, {}, NOW), 409, /vencido/);
+      await expectError(service.approve(ADMIN, CERT_ID, { revision: 2 }, NOW), 409, /vencido/);
       expect(prisma.farmCertification.updateMany).not.toHaveBeenCalled();
     });
 
     it('recusa exige motivo e grava o motivo', async () => {
       pending();
-      await expectError(service.reject(ADMIN, CERT_ID, {}, NOW), 400, /Motivo/);
+      await expectError(service.reject(ADMIN, CERT_ID, { revision: 2 }, NOW), 400, /Motivo/);
 
-      await service.reject(ADMIN, CERT_ID, { reason: 'Documento ilegível' }, NOW);
+      await service.reject(ADMIN, CERT_ID, { revision: 2, reason: 'Documento ilegível' }, NOW);
       expect(prisma.farmCertification.updateMany.mock.calls[0][0].data).toMatchObject({ status: 'REJECTED', rejectionReason: 'Documento ilegível' });
       expect(prisma.farmCertificationEvent.create.mock.calls[0][0].data).toMatchObject({ action: 'REJECTED', documentId: null, note: 'Documento ilegível' });
       expect(notifications.notifyFarmCertification).toHaveBeenCalledWith('REJECTED', [expect.objectContaining({ reason: 'Documento ilegível' })]);
@@ -272,21 +312,37 @@ describe('FarmCertificationService', () => {
       await expectError(service.revoke(ADMIN, CERT_ID, { reason: 'Fraude' }, NOW), 409);
 
       pending({ status: CertificationStatus.APPROVED });
-      await service.revoke(ADMIN, CERT_ID, { reason: 'Fraude' }, NOW);
-      expect(prisma.farmCertification.updateMany.mock.calls[0][0].where).toEqual({ id: CERT_ID, status: 'APPROVED' });
+      await service.revoke(ADMIN, CERT_ID, { reason: 'Fraude' }, NOW); // revisão opcional na revogação
+      expect(prisma.farmCertification.updateMany.mock.calls[0][0].where).toEqual({ id: CERT_ID, status: 'APPROVED', revision: 2 });
       expect(notifications.notifyFarmCertification).toHaveBeenCalledWith('REVOKED', expect.any(Array));
     });
 
-    it('devolve 409 sem notificar quando outro admin avaliou antes', async () => {
+    it('exige a revisão analisada para aprovar e para recusar', async () => {
+      pending();
+      await expectError(service.approve(ADMIN, CERT_ID, {}, NOW), 400, /revisão/);
+      await expectError(service.reject(ADMIN, CERT_ID, { reason: 'Documento ilegível' }, NOW), 400, /revisão/);
+      await expectError(service.approve(ADMIN, CERT_ID, { revision: -1 }, NOW), 400, /Revisão inválida/);
+      expect(prisma.farmCertification.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('recusa avaliação sobre dados desatualizados (produtor reenviou depois) com 409', async () => {
+      pending({ revision: 3 });
+      await expectError(service.approve(ADMIN, CERT_ID, { revision: 2 }, NOW), 409, /alterou/);
+      await expectError(service.reject(ADMIN, CERT_ID, { revision: 2, reason: 'Ilegível' }, NOW), 409, /alterou/);
+      expect(prisma.farmCertification.updateMany).not.toHaveBeenCalled();
+      expect(notifications.notifyFarmCertification).not.toHaveBeenCalled();
+    });
+
+    it('devolve 409 sem notificar quando a gravação concorrente vence (CAS em status + revisão)', async () => {
       pending();
       prisma.farmCertification.updateMany.mockResolvedValue({ count: 0 });
-      await expectError(service.approve(ADMIN, CERT_ID, {}, NOW), 409);
+      await expectError(service.approve(ADMIN, CERT_ID, { revision: 2 }, NOW), 409);
       expect(prisma.farmCertificationEvent.create).not.toHaveBeenCalled();
       expect(notifications.notifyFarmCertification).not.toHaveBeenCalled();
     });
 
     it('só admin avalia', async () => {
-      await expectError(service.approve(PRODUCER, CERT_ID, {}, NOW), 403);
+      await expectError(service.approve(PRODUCER, CERT_ID, { revision: 2 }, NOW), 403);
     });
   });
 
@@ -405,5 +461,15 @@ describe('brasiliaDateFromKey', () => {
     expect(brasiliaDateFromKey('2026-11-11T00:00:00.000Z')?.toISOString()).toBe('2026-11-11T03:00:00.000Z');
     expect(brasiliaDateFromKey('2026-02-30')).toBeNull();
     expect(brasiliaDateFromKey('11/11/2026')).toBeNull();
+  });
+
+  it('valida a string inteira, não só os 10 primeiros caracteres', () => {
+    expect(brasiliaDateFromKey('2026-11-11-not-a-date')).toBeNull();
+    expect(brasiliaDateFromKey('2026-11-11T99:99:99Z')).toBeNull();
+    expect(brasiliaDateFromKey('2026-11-11T24:00:00Z')).toBeNull();
+    expect(brasiliaDateFromKey('2026-11-11T10:00:00+25:00')).toBeNull();
+    expect(brasiliaDateFromKey('2026-11-11 ')?.toISOString()).toBe('2026-11-11T03:00:00.000Z');
+    expect(brasiliaDateFromKey('2026-11-11T10:30Z')?.toISOString()).toBe('2026-11-11T03:00:00.000Z');
+    expect(brasiliaDateFromKey('2026-11-11T10:30:15.123-03:00')?.toISOString()).toBe('2026-11-11T03:00:00.000Z');
   });
 });

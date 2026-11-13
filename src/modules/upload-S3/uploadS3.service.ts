@@ -9,6 +9,29 @@ import {
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
 
+/** Erro de regra do upload genérico, já com o status HTTP. */
+export class UploadS3Error extends Error {
+  constructor(
+    public readonly status: 400 | 403,
+    message: string
+  ) {
+    super(message);
+    this.name = "UploadS3Error";
+  }
+}
+
+/**
+ * Prefixos de arquivos gerenciados por módulos com regras próprias de autorização e ciclo de vida
+ * (ex.: documentos de certificação, que são evidência da avaliação). O endpoint genérico
+ * `DELETE /upload-s3` não pode apagá-los.
+ */
+export const PROTECTED_KEY_PREFIXES = ["certifications/"] as const;
+
+export function isProtectedKey(key: string): boolean {
+  const normalized = key.trim().replace(/^\/+/, "");
+  return PROTECTED_KEY_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
 export class UploadS3Service {
   private readonly prisma: PrismaClient;
   private readonly s3Client: S3Client;
@@ -91,6 +114,15 @@ export class UploadS3Service {
     );
 
     return { deleted: true };
+  }
+
+  /** Exclusão pedida pelo endpoint genérico: recusa arquivos de módulos protegidos. */
+  public async deleteUnprotected(key: string): Promise<{ deleted: boolean }> {
+    if (!key) throw new UploadS3Error(400, "Chave do arquivo é obrigatória");
+    if (isProtectedKey(key)) {
+      throw new UploadS3Error(403, "Este arquivo não pode ser removido por esta rota.");
+    }
+    return this.delete(key);
   }
 
   public async exists(key: string): Promise<boolean> {
