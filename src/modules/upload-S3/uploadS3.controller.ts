@@ -59,7 +59,7 @@ export class UploadS3Controller {
         return;
       }
 
-      const result = await service.deleteUnprotected(key);
+      const result = await service.delete(key);
       res.status(200).json(result);
     } catch (error: any) {
       if (error instanceof UploadS3Error) {

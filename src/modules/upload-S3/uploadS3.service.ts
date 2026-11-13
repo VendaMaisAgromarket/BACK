@@ -22,13 +22,17 @@ export class UploadS3Error extends Error {
 
 /**
  * Prefixos de arquivos gerenciados por módulos com regras próprias de autorização e ciclo de vida
- * (ex.: documentos de certificação, que são evidência da avaliação). O endpoint genérico
- * `DELETE /upload-s3` não pode apagá-los.
+ * (ex.: documentos de certificação, que são evidência da avaliação). `delete()` recusa essas chaves em
+ * QUALQUER caminho (endpoint genérico, limpeza de imagens de produto/perfil…); só o módulo dono apaga,
+ * e apenas para desfazer um upload que ele mesmo acabou de fazer (`deleteModuleOwnedUpload`).
  */
 export const PROTECTED_KEY_PREFIXES = ["certifications/"] as const;
 
 export function isProtectedKey(key: string): boolean {
   const normalized = key.trim().replace(/^\/+/, "");
+  // Segmentos "." / ".." não existem em chaves legítimas do sistema: recusa para não depender de
+  // como cada camada (SDK, proxy, S3) normaliza o caminho.
+  if (normalized.split("/").some((segment) => segment === "." || segment === "..")) return true;
   return PROTECTED_KEY_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
@@ -103,9 +107,30 @@ export class UploadS3Service {
     return this.getPublicUrl(key);
   }
 
+  /**
+   * Exclusão para todos os caminhos acionados pelo usuário (endpoint genérico, imagens de produto,
+   * foto de perfil). Recusa (403) chaves de prefixos protegidos: uma URL de documento de certificação
+   * salva como imagem de produto/perfil não pode servir para apagar a evidência.
+   */
   public async delete(key: string): Promise<{ deleted: boolean }> {
-    if (!key) throw new Error("Chave do arquivo é obrigatória");
+    if (!key) throw new UploadS3Error(400, "Chave do arquivo é obrigatória");
+    if (isProtectedKey(key)) {
+      throw new UploadS3Error(403, "Este arquivo não pode ser removido por esta rota.");
+    }
+    return this.sendDelete(key);
+  }
 
+  /**
+   * Exclusão irrestrita, SÓ para o módulo dono de um prefixo protegido desfazer um upload que ele
+   * mesmo acabou de fazer e que não chegou a ser gravado (ex.: rollback do envio de certificação).
+   * Nunca chame com uma chave vinda do cliente.
+   */
+  public async deleteModuleOwnedUpload(key: string): Promise<{ deleted: boolean }> {
+    if (!key) throw new UploadS3Error(400, "Chave do arquivo é obrigatória");
+    return this.sendDelete(key);
+  }
+
+  private async sendDelete(key: string): Promise<{ deleted: boolean }> {
     await this.s3Client.send(
       new DeleteObjectCommand({
         Bucket: this.bucketName,
@@ -114,15 +139,6 @@ export class UploadS3Service {
     );
 
     return { deleted: true };
-  }
-
-  /** Exclusão pedida pelo endpoint genérico: recusa arquivos de módulos protegidos. */
-  public async deleteUnprotected(key: string): Promise<{ deleted: boolean }> {
-    if (!key) throw new UploadS3Error(400, "Chave do arquivo é obrigatória");
-    if (isProtectedKey(key)) {
-      throw new UploadS3Error(403, "Este arquivo não pode ser removido por esta rota.");
-    }
-    return this.delete(key);
   }
 
   public async exists(key: string): Promise<boolean> {

@@ -45,7 +45,7 @@ async function expectError(promise: Promise<unknown>, status: number, message?: 
 
 describe('FarmCertificationService', () => {
   let prisma: DeepMockProxy<PrismaClient>;
-  let uploads: { upload: jest.Mock; delete: jest.Mock; getSignedReadUrl: jest.Mock };
+  let uploads: { upload: jest.Mock; deleteModuleOwnedUpload: jest.Mock; getSignedReadUrl: jest.Mock };
   let notifications: { notifyFarmCertificationSubmitted: jest.Mock; notifyFarmCertification: jest.Mock };
   let service: FarmCertificationService;
 
@@ -59,7 +59,7 @@ describe('FarmCertificationService', () => {
     let n = 0;
     uploads = {
       upload: jest.fn(async (_f: Express.Multer.File, prefix: string) => ({ key: `${prefix}/k${++n}`, url: '', publicUrl: '' })),
-      delete: jest.fn().mockResolvedValue({ deleted: true }),
+      deleteModuleOwnedUpload: jest.fn().mockResolvedValue({ deleted: true }),
       getSignedReadUrl: jest.fn().mockResolvedValue('https://signed.example/doc'),
     };
     notifications = {
@@ -148,21 +148,21 @@ describe('FarmCertificationService', () => {
         new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: 'test' })
       );
       await expectError(service.create(PRODUCER, validBody(), [file()], NOW), 409, /já foi enviado/);
-      expect(uploads.delete).toHaveBeenCalledTimes(1);
+      expect(uploads.deleteModuleOwnedUpload).toHaveBeenCalledTimes(1);
       expect(notifications.notifyFarmCertificationSubmitted).not.toHaveBeenCalled();
     });
 
     it('remove do S3 os arquivos enviados se a gravação no banco falhar', async () => {
       prisma.$transaction.mockRejectedValue(new Error('db down'));
       await expect(service.create(PRODUCER, validBody(), [file(), file()], NOW)).rejects.toThrow('db down');
-      expect(uploads.delete).toHaveBeenCalledTimes(2);
+      expect(uploads.deleteModuleOwnedUpload).toHaveBeenCalledTimes(2);
       expect(notifications.notifyFarmCertificationSubmitted).not.toHaveBeenCalled();
     });
 
     it('remove os que subiram e devolve 502 se algum upload falhar', async () => {
       uploads.upload.mockResolvedValueOnce({ key: 'certifications/farm/x/ok', url: '', publicUrl: '' }).mockRejectedValueOnce(new Error('s3'));
       await expectError(service.create(PRODUCER, validBody(), [file(), file()], NOW), 502);
-      expect(uploads.delete).toHaveBeenCalledWith('certifications/farm/x/ok');
+      expect(uploads.deleteModuleOwnedUpload).toHaveBeenCalledWith('certifications/farm/x/ok');
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
   });
@@ -208,7 +208,7 @@ describe('FarmCertificationService', () => {
       current(CertificationStatus.REJECTED, PRODUCER.userId, 14);
       prisma.farmCertificationDocument.count.mockResolvedValue(16); // outro envio gravou no meio do caminho
       await expectError(service.resubmit(PRODUCER, CERT_ID, validBody(), [file()], NOW), 400, /Limite/);
-      expect(uploads.delete).toHaveBeenCalledTimes(1);
+      expect(uploads.deleteModuleOwnedUpload).toHaveBeenCalledTimes(1);
       expect(notifications.notifyFarmCertificationSubmitted).not.toHaveBeenCalled();
     });
 
@@ -246,7 +246,7 @@ describe('FarmCertificationService', () => {
       current(CertificationStatus.PENDING);
       prisma.farmCertification.updateMany.mockResolvedValue({ count: 0 });
       await expectError(service.resubmit(PRODUCER, CERT_ID, validBody(), [file()], NOW), 409);
-      expect(uploads.delete).toHaveBeenCalledTimes(1);
+      expect(uploads.deleteModuleOwnedUpload).toHaveBeenCalledTimes(1);
       expect(notifications.notifyFarmCertificationSubmitted).not.toHaveBeenCalled();
     });
   });

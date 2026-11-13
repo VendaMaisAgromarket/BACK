@@ -1,6 +1,6 @@
 import { Request, Response, RequestHandler } from 'express';
 import { PrismaClient } from '@prisma/client';
-import { INVALID_RESET_TOKEN_MESSAGE, UserService, WEAK_PASSWORD_MESSAGE } from './user.service';
+import { INVALID_RESET_TOKEN_MESSAGE, ProfileUpdateError, UserService, WEAK_PASSWORD_MESSAGE } from './user.service';
 import { logger } from '../../lib/logger';
 
 const prisma = new PrismaClient();
@@ -113,6 +113,10 @@ export class UserController {
       const result = await service.update(id, req.body, file);
       res.status(200).json(result);
     } catch (error: any) {
+      if (error instanceof ProfileUpdateError) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
       console.error(error);
       res.status(500).json({ error: 'Failed to update user' });
     }

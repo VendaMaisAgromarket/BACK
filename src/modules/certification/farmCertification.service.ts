@@ -598,10 +598,11 @@ export class FarmCertificationService {
     return documents;
   }
 
+  /** Rollback de arquivos que este envio acabou de subir e não chegaram a ser gravados. */
   private async discardUploads(documents: UploadedDocument[]) {
     await Promise.allSettled(
       documents.map((doc) =>
-        this.uploads.delete(doc.s3Key).catch((err: unknown) => {
+        this.uploads.deleteModuleOwnedUpload(doc.s3Key).catch((err: unknown) => {
           logger.error(`[FarmCertification] arquivo órfão no S3 (${doc.s3Key}):`, err instanceof Error ? err.message : err);
         })
       )
