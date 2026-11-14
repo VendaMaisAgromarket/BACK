@@ -1,4 +1,4 @@
-import { PrismaClient, User } from "@prisma/client";
+import { Prisma, PrismaClient, User } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { createHash, randomBytes } from "crypto";
 import { isCPF, isCNPJ, formatToCPF, formatToCNPJ } from "brazilian-values";
@@ -35,6 +35,57 @@ const PROFILE_FIELD_LABELS = {
 } as const;
 
 type ProfileSnapshot = { [K in keyof typeof PROFILE_FIELD_LABELS]: string | null };
+
+/** Erro de dados inválidos na atualização de perfil (vira 400 no controller). */
+export class ProfileUpdateError extends Error {
+  readonly status = 400;
+  constructor(message: string) {
+    super(message);
+    this.name = "ProfileUpdateError";
+  }
+}
+
+/**
+ * Únicos campos que o próprio usuário (ou o admin) altera via PUT /user/:id. Tudo o mais é descartado:
+ * o corpo nunca chega inteiro ao Prisma — campos como role/valid/tokenVersion e, principalmente,
+ * relações (`farmCertifications: { updateMany: … }`, `connect` …) permitiriam ao usuário aprovar a
+ * própria certificação ou tomar a de outro, sem passar pela avaliação nem pelo histórico.
+ * A foto vem pelo arquivo (`img`), e a senha passa pela validação/hash abaixo.
+ */
+const EDITABLE_PROFILE_FIELDS = ["name", "phone_number", "email", "password", "cpf", "cnpj", "ccir"] as const;
+const NULLABLE_PROFILE_FIELDS: ReadonlySet<string> = new Set(["cpf", "cnpj", "ccir"]);
+
+interface EditableProfileData {
+  name?: string;
+  phone_number?: string;
+  email?: string;
+  password?: string;
+  cpf?: string | null;
+  cnpj?: string | null;
+  ccir?: string | null;
+}
+
+function pickEditableProfileFields(data: unknown): EditableProfileData {
+  const body = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+
+  // Escrita aninhada (objeto/array) em qualquer chave é recusada explicitamente, mesmo nas ignoradas.
+  const nested = Object.keys(body).find((key) => body[key] !== null && typeof body[key] === "object");
+  if (nested) throw new ProfileUpdateError(`Campo não permitido na atualização de perfil: ${nested}.`);
+
+  const picked: Record<string, string | null> = {};
+  for (const key of EDITABLE_PROFILE_FIELDS) {
+    const value = body[key];
+    if (value === undefined) continue;
+    if (value === null && NULLABLE_PROFILE_FIELDS.has(key)) {
+      picked[key] = null;
+      continue;
+    }
+    if (typeof value !== "string") throw new ProfileUpdateError(`Valor inválido para ${key}.`);
+    picked[key] = value;
+  }
+  // Os não anuláveis só recebem string (checado acima), então o formato bate com EditableProfileData.
+  return picked as EditableProfileData;
+}
 
 /**
  * Compara o que vai ser gravado com o que estava salvo: só entra o que de fato muda de valor.
@@ -268,9 +319,10 @@ export class UserService {
 
   public async update(
     id: string,
-    data: Partial<User>,
+    body: unknown,
     file?: Express.Multer.File
   ): Promise<User> {
+    const data = pickEditableProfileFields(body);
     const user = await this.prisma.user.findUnique({
       where: { id },
       select: { id: true, name: true, phone_number: true, email: true, cpf: true, cnpj: true, ccir: true, img: true }
@@ -280,10 +332,7 @@ export class UserService {
       throw new Error("Usuário não encontrado.");
     }
 
-    const updateData: any = { ...data };
-    delete updateData.role;
-    delete updateData.valid;
-    delete updateData.tokenVersion;
+    const updateData: Prisma.UserUpdateInput = { ...data };
 
     if (data.password) {
       const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;

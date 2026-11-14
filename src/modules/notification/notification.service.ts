@@ -82,8 +82,64 @@ export function buildNotificationLink(
   if (notification.productId) {
     return { label: "Acesse o anúncio", url: `${base}/market/edit-product/${encodeURIComponent(notification.productId)}` };
   }
+  const data = notification.data;
+  if (data && typeof data === "object" && !Array.isArray(data) && typeof data.certificationId === "string") {
+    return data.role === "admin"
+      ? { label: "Avaliar a certificação", url: `${base}/admin/certifications/farm/${encodeURIComponent(data.certificationId)}` }
+      : { label: "Ver minhas certificações", url: `${base}/market/certifications/farm` };
+  }
   return null;
 }
+
+/** Desfechos da certificação de fazenda avisados ao produtor. */
+export type FarmCertificationOutcome = "APPROVED" | "REJECTED" | "REVOKED" | "EXPIRING" | "EXPIRED";
+
+export interface FarmCertificationNotice {
+  certificationId: string;
+  userId: string;
+  farmName: string;
+  validUntil: Date;
+  /** Motivo da recusa/revogação. */
+  reason?: string | null;
+  /** Identidade da transição (id do evento de histórico, ou chave do lembrete): base da dedupeKey. */
+  dedupeId: string;
+}
+
+const FARM_CERTIFICATION_TEXT: Record<
+  FarmCertificationOutcome,
+  { type: NotificationType; title: string; message: (n: FarmCertificationNotice) => string }
+> = {
+  APPROVED: {
+    type: NotificationType.FARM_CERTIFICATION_APPROVED,
+    title: "Certificação da fazenda aprovada",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" foi aprovada. O selo de fazenda certificada já aparece no seu perfil e nos seus anúncios até ${formatBrasiliaDate(n.validUntil)}.`,
+  },
+  REJECTED: {
+    type: NotificationType.FARM_CERTIFICATION_REJECTED,
+    title: "Certificação da fazenda recusada",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" foi recusada. Motivo: ${n.reason ?? "não informado"}. Você pode corrigir os dados ou documentos e reenviar.`,
+  },
+  REVOKED: {
+    type: NotificationType.FARM_CERTIFICATION_REVOKED,
+    title: "Certificação da fazenda revogada",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" foi revogada e o selo foi removido. Motivo: ${n.reason ?? "não informado"}.`,
+  },
+  EXPIRING: {
+    type: NotificationType.FARM_CERTIFICATION_EXPIRING,
+    title: "Certificação da fazenda vencendo",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" vence em ${formatBrasiliaDate(n.validUntil)}. Após essa data o selo sai do ar: envie o certificado renovado para mantê-lo.`,
+  },
+  EXPIRED: {
+    type: NotificationType.FARM_CERTIFICATION_EXPIRED,
+    title: "Certificação da fazenda vencida",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" venceu em ${formatBrasiliaDate(n.validUntil)} e o selo foi removido. Envie o certificado renovado para reativá-lo.`,
+  },
+};
 
 function formatBRL(value: number): string {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -378,6 +434,54 @@ export class NotificationService {
           data: { addressId: address.id, action: change },
         },
       ])
+    );
+  }
+
+  // ─── Certificação da fazenda (best-effort, após a operação) ──────────────────
+
+  /** Admins: certificação de fazenda enviada (ou reenviada) e aguardando avaliação. */
+  async notifyFarmCertificationSubmitted(params: {
+    certificationId: string;
+    farmName: string;
+    producerName: string;
+    resubmitted: boolean;
+    eventId: string;
+  }): Promise<void> {
+    await this.safely(NotificationType.FARM_CERTIFICATION_SUBMITTED, async () => {
+      const admins = await this.prisma.user.findMany({ where: { role: "admin", valid: true }, select: { id: true } });
+      await this.createMany(
+        admins.map((admin) => ({
+          userId: admin.id,
+          type: NotificationType.FARM_CERTIFICATION_SUBMITTED,
+          title: params.resubmitted ? "Certificação de fazenda reenviada" : "Nova certificação de fazenda",
+          message: `${params.producerName} ${params.resubmitted ? "reenviou" : "enviou"} a certificação da fazenda "${params.farmName}" para avaliação.`,
+          data: { role: "admin", certificationId: params.certificationId },
+          dedupeKey: `${NotificationType.FARM_CERTIFICATION_SUBMITTED}:${params.eventId}:${admin.id}`,
+        }))
+      );
+    });
+  }
+
+  /** Produtor: certificação aprovada, recusada, revogada, vencendo ou vencida. */
+  async notifyFarmCertification(outcome: FarmCertificationOutcome, notices: FarmCertificationNotice[]): Promise<void> {
+    if (notices.length === 0) return;
+    const text = FARM_CERTIFICATION_TEXT[outcome];
+    await this.safely(text.type, () =>
+      this.createMany(
+        notices.map((n) => ({
+          userId: n.userId,
+          type: text.type,
+          title: text.title,
+          message: text.message(n),
+          data: {
+            role: "producer",
+            certificationId: n.certificationId,
+            validUntil: n.validUntil.toISOString(),
+            ...(n.reason ? { reason: n.reason } : {}),
+          },
+          dedupeKey: `${text.type}:${n.dedupeId}`,
+        }))
+      )
     );
   }
 

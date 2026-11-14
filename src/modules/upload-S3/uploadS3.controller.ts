@@ -1,6 +1,6 @@
 import { Request, Response, RequestHandler } from "express";
 import { PrismaClient } from "@prisma/client";
-import { UploadS3Service } from "./uploadS3.service";
+import { UploadS3Error, UploadS3Service } from "./uploadS3.service";
 
 const prisma = new PrismaClient();
 const service = new UploadS3Service(prisma);
@@ -62,6 +62,10 @@ export class UploadS3Controller {
       const result = await service.delete(key);
       res.status(200).json(result);
     } catch (error: any) {
+      if (error instanceof UploadS3Error) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
       console.error(error);
       res
         .status(500)
