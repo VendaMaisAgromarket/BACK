@@ -48,14 +48,14 @@ const uploadDocuments: RequestHandler = (req, res, next) =>
  * @swagger
  * tags:
  *   - name: FarmCertification
- *     description: Certificação de fazenda (selo de produtor certificado)
+ *     description: Certificação de fazenda (selo de fazenda certificada do vendedor)
  */
 
 /**
  * @swagger
  * /certifications/farm/badge/{userId}:
  *   get:
- *     summary: Selo público de fazenda certificada de um produtor (só dados não sensíveis)
+ *     summary: Selo público de fazenda certificada de um usuário vendedor (só dados não sensíveis)
  *     tags: [FarmCertification]
  *     parameters:
  *       - in: path
@@ -123,7 +123,7 @@ router.get("/admin", requireAdmin, wrap(controller.listForAdmin.bind(controller)
  *               notes: { type: string }
  *     responses:
  *       200: { description: Certificação atualizada, com histórico }
- *       409: { description: "Não está pendente, o certificado já venceu, ou o produtor reenviou depois (revision desatualizada)" }
+ *       409: { description: "Não está pendente, o certificado já venceu, ou o dono reenviou depois (revision desatualizada)" }
  */
 router.patch("/admin/:id/approve", requireAdmin, wrap(controller.approve.bind(controller)));
 
@@ -131,7 +131,7 @@ router.patch("/admin/:id/approve", requireAdmin, wrap(controller.approve.bind(co
  * @swagger
  * /certifications/farm/admin/{id}/reject:
  *   patch:
- *     summary: Recusa uma certificação pendente (o produtor pode corrigir e reenviar)
+ *     summary: Recusa uma certificação pendente (o dono pode corrigir e reenviar)
  *     tags: [FarmCertification]
  *     security: [{ bearerAuth: [] }]
  *     parameters:
@@ -179,13 +179,13 @@ router.patch("/admin/:id/reject", requireAdmin, wrap(controller.reject.bind(cont
  */
 router.patch("/admin/:id/revoke", requireAdmin, wrap(controller.revoke.bind(controller)));
 
-// ─── Produtor ──────────────────────────────────────────────────────────────────
+// ─── Dono da certificação (qualquer usuário autenticado que não seja admin) ────
 
 /**
  * @swagger
  * /certifications/farm:
  *   post:
- *     summary: Produtor envia a certificação da fazenda para avaliação
+ *     summary: Usuário (produtor ou comprador que anuncia; não admin) envia a certificação da fazenda para avaliação
  *     tags: [FarmCertification]
  *     security: [{ bearerAuth: [] }]
  *     requestBody:
@@ -219,7 +219,7 @@ router.patch("/admin/:id/revoke", requireAdmin, wrap(controller.revoke.bind(cont
  *     responses:
  *       201: { description: Certificação criada como PENDING }
  *       400: { description: Dados ou arquivos inválidos }
- *       403: { description: Usuário não é produtor }
+ *       403: { description: Administradores não podem enviar certificações }
  *       409: { description: Certificado já pendente ou aprovado }
  */
 router.post("/", uploadDocuments, wrap(controller.create.bind(controller)));
@@ -228,7 +228,7 @@ router.post("/", uploadDocuments, wrap(controller.create.bind(controller)));
  * @swagger
  * /certifications/farm/mine:
  *   get:
- *     summary: Certificações de fazenda do produtor logado (com `badgeActive`)
+ *     summary: Certificações de fazenda do usuário logado (com `badgeActive`)
  *     tags: [FarmCertification]
  *     security: [{ bearerAuth: [] }]
  *     responses:
@@ -246,7 +246,7 @@ router.get("/mine", wrap(controller.listMine.bind(controller)));
  *     parameters:
  *       - { in: path, name: id, required: true, schema: { type: string } }
  *     responses:
- *       200: { description: Certificação; para admin inclui `user` com os dados do produtor }
+ *       200: { description: Certificação; para admin inclui `user` com os dados do dono }
  *       404: { description: Não encontrada }
  *   put:
  *     summary: Corrige e reenvia uma certificação pendente ou recusada (volta a PENDING)

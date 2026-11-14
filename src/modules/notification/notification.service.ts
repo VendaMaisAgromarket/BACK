@@ -443,7 +443,8 @@ export class NotificationService {
   async notifyFarmCertificationSubmitted(params: {
     certificationId: string;
     farmName: string;
-    producerName: string;
+    /** Nome do dono da certificação (produtor ou comprador que anuncia). */
+    ownerName: string;
     resubmitted: boolean;
     eventId: string;
   }): Promise<void> {
@@ -454,7 +455,7 @@ export class NotificationService {
           userId: admin.id,
           type: NotificationType.FARM_CERTIFICATION_SUBMITTED,
           title: params.resubmitted ? "Certificação de fazenda reenviada" : "Nova certificação de fazenda",
-          message: `${params.producerName} ${params.resubmitted ? "reenviou" : "enviou"} a certificação da fazenda "${params.farmName}" para avaliação.`,
+          message: `${params.ownerName} ${params.resubmitted ? "reenviou" : "enviou"} a certificação da fazenda "${params.farmName}" para avaliação.`,
           data: { role: "admin", certificationId: params.certificationId },
           dedupeKey: `${NotificationType.FARM_CERTIFICATION_SUBMITTED}:${params.eventId}:${admin.id}`,
         }))
@@ -462,7 +463,10 @@ export class NotificationService {
     });
   }
 
-  /** Produtor: certificação aprovada, recusada, revogada, vencendo ou vencida. */
+  /**
+   * Dono da certificação (qualquer papel): aprovada, recusada, revogada, vencendo ou vencida.
+   * `data.role: "producer"` é só o destino do clique no front (/market/certifications/farm), não permissão.
+   */
   async notifyFarmCertification(outcome: FarmCertificationOutcome, notices: FarmCertificationNotice[]): Promise<void> {
     if (notices.length === 0) return;
     const text = FARM_CERTIFICATION_TEXT[outcome];

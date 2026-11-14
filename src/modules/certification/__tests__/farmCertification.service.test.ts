@@ -1,6 +1,6 @@
 import { CertificationDocumentType, CertificationStatus, Prisma, PrismaClient } from '@prisma/client';
 import { mockDeep, DeepMockProxy } from 'jest-mock-extended';
-import { FarmCertificationService } from '../farmCertification.service';
+import { canOwnFarmCertification, FarmCertificationService } from '../farmCertification.service';
 import { CertificationError } from '../certification.errors';
 import { UploadS3Service } from '../../upload-S3/uploadS3.service';
 import { NotificationService, buildNotificationLink } from '../../notification/notification.service';
@@ -99,13 +99,34 @@ describe('FarmCertificationService', () => {
       expect(event.documentId).toBe(docs[1].id); // o certificado, não o laudo
 
       expect(notifications.notifyFarmCertificationSubmitted).toHaveBeenCalledWith(
-        expect.objectContaining({ certificationId: certId, producerName: 'João Produtor', resubmitted: false, eventId: event.id })
+        expect.objectContaining({ certificationId: certId, ownerName: 'João Produtor', resubmitted: false, eventId: event.id })
       );
     });
 
-    it('recusa usuário que não é produtor', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'buyer-1', name: 'B', role: 'buyer' } as never);
-      await expectError(service.create({ userId: 'buyer-1', role: 'buyer' }, validBody(), [file()], NOW), 403);
+    it('comprador (que também anuncia) envia certificação como dono, e os admins são avisados com o nome dele', async () => {
+      const BUYER = { userId: 'buyer-1', role: 'buyer' };
+      prisma.user.findUnique.mockResolvedValue({ id: BUYER.userId, name: 'Maria Compradora', role: 'buyer' } as never);
+
+      await service.create(BUYER, validBody(), [file()], NOW);
+
+      const createArgs = prisma.farmCertification.create.mock.calls[0][0];
+      expect(createArgs.data.userId).toBe(BUYER.userId);
+      const docs = (createArgs.data.documents as { create: Array<{ uploadedById: string }> }).create;
+      expect(docs[0].uploadedById).toBe(BUYER.userId);
+      expect(prisma.farmCertificationEvent.create.mock.calls[0][0].data).toMatchObject({ action: 'SUBMITTED', actorId: BUYER.userId });
+      expect(notifications.notifyFarmCertificationSubmitted).toHaveBeenCalledWith(expect.objectContaining({ ownerName: 'Maria Compradora' }));
+    });
+
+    it('admin não envia certificação para si (403, com mensagem própria)', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: ADMIN.userId, name: 'Admin', role: 'admin' } as never);
+      await expectError(service.create(ADMIN, validBody(), [file()], NOW), 403, /Administradores não podem enviar certificações/);
+      expect(uploads.upload).not.toHaveBeenCalled();
+    });
+
+    it('decide pelo papel gravado no banco, não pelo do token', async () => {
+      // Token antigo diz "buyer", mas o usuário virou admin: vale o banco.
+      prisma.user.findUnique.mockResolvedValue({ id: 'u-1', name: 'X', role: 'admin' } as never);
+      await expectError(service.create({ userId: 'u-1', role: 'buyer' }, validBody(), [file()], NOW), 403);
     });
 
     it.each([
@@ -218,6 +239,18 @@ describe('FarmCertificationService', () => {
         new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: 'test' })
       );
       await expectError(service.resubmit(PRODUCER, CERT_ID, validBody(), [], NOW), 409, /já foi enviado/);
+    });
+
+    it('comprador dono corrige e reenvia a própria certificação', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: 'buyer-1', name: 'Maria', role: 'buyer' } as never);
+      current(CertificationStatus.REJECTED, 'buyer-1');
+      await service.resubmit({ userId: 'buyer-1', role: 'buyer' }, CERT_ID, validBody(), [], NOW);
+      expect(prisma.farmCertificationEvent.create.mock.calls[0][0].data).toMatchObject({ action: 'RESUBMITTED', actorId: 'buyer-1' });
+    });
+
+    it('admin não reenvia certificação (nem a de outro usuário)', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: ADMIN.userId, name: 'Admin', role: 'admin' } as never);
+      await expectError(service.resubmit(ADMIN, CERT_ID, validBody(), [], NOW), 403);
     });
 
     it('permite reenviar sem arquivos novos', async () => {
@@ -341,6 +374,14 @@ describe('FarmCertificationService', () => {
       expect(notifications.notifyFarmCertification).not.toHaveBeenCalled();
     });
 
+    it('avisa o dono qualquer que seja o papel dele (comprador que anuncia)', async () => {
+      pending({ userId: 'buyer-1' });
+      await service.reject(ADMIN, CERT_ID, { revision: 2, reason: 'Documento ilegível' }, NOW);
+      expect(notifications.notifyFarmCertification).toHaveBeenCalledWith('REJECTED', [
+        expect.objectContaining({ userId: 'buyer-1', reason: 'Documento ilegível' }),
+      ]);
+    });
+
     it('só admin avalia', async () => {
       await expectError(service.approve(PRODUCER, CERT_ID, { revision: 2 }, NOW), 403);
     });
@@ -369,6 +410,21 @@ describe('FarmCertificationService', () => {
       expect(asAdmin).toHaveProperty('user');
 
       await expectError(service.getById({ userId: 'intruso', role: 'buyer' }, CERT_ID, NOW), 404);
+    });
+
+    it('comprador dono vê o detalhe e abre o documento da própria certificação', async () => {
+      const BUYER = { userId: 'buyer-1', role: 'buyer' };
+      row(BUYER.userId);
+      const own = await service.getById(BUYER, CERT_ID, NOW);
+      expect(own).not.toHaveProperty('user');
+
+      prisma.farmCertificationDocument.findFirst.mockResolvedValue({
+        s3Key: 'certifications/farm/cert-1/a.pdf',
+        originalName: 'a.pdf',
+        mimeType: 'application/pdf',
+        certification: { userId: BUYER.userId },
+      } as never);
+      await expect(service.getDocumentUrl(BUYER, CERT_ID, 'doc-1')).resolves.toMatchObject({ expiresIn: 600 });
     });
 
     it('selo apaga no dia seguinte ao vencimento', async () => {
@@ -471,5 +527,15 @@ describe('brasiliaDateFromKey', () => {
     expect(brasiliaDateFromKey('2026-11-11 ')?.toISOString()).toBe('2026-11-11T03:00:00.000Z');
     expect(brasiliaDateFromKey('2026-11-11T10:30Z')?.toISOString()).toBe('2026-11-11T03:00:00.000Z');
     expect(brasiliaDateFromKey('2026-11-11T10:30:15.123-03:00')?.toISOString()).toBe('2026-11-11T03:00:00.000Z');
+  });
+});
+
+describe('canOwnFarmCertification', () => {
+  it('qualquer usuário autenticado que não seja admin', () => {
+    expect(canOwnFarmCertification('producer')).toBe(true);
+    expect(canOwnFarmCertification('buyer')).toBe(true);
+    expect(canOwnFarmCertification('admin')).toBe(false);
+    expect(canOwnFarmCertification(undefined)).toBe(false);
+    expect(canOwnFarmCertification('')).toBe(false);
   });
 });

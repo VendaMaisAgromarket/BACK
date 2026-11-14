@@ -54,6 +54,15 @@ function certificationData(input: FarmCertificationInput) {
   return { ...input, ccir: input.ccir ?? null, car: input.car ?? null };
 }
 
+/**
+ * Quem pode ter (enviar, corrigir, listar) certificação de fazenda: qualquer usuário autenticado que não
+ * seja admin. Na plataforma o mesmo usuário compra e vende — um `buyer` também anuncia produtos e pode
+ * ter fazenda certificada. Admin só avalia (não envia certificação para si).
+ */
+export function canOwnFarmCertification(role: string | null | undefined): boolean {
+  return Boolean(role) && role !== "admin";
+}
+
 /** Filtro do selo ativo: aprovada e dentro da validade (calendário de Brasília). */
 export function activeFarmCertificationWhere(now: Date = new Date()): Prisma.FarmCertificationWhereInput {
   return { status: CertificationStatus.APPROVED, validUntil: { gte: startOfTodayInBrasilia(now) } };
@@ -121,18 +130,18 @@ export class FarmCertificationService {
     this.notifications = notifications || new NotificationService(this.prisma);
   }
 
-  // ─── Produtor ────────────────────────────────────────────────────────────────
+  // ─── Dono da certificação (produtor ou comprador que anuncia) ──────────────────
 
-  /** Produtor envia a certificação de uma fazenda (já certificada) com 1+ documentos. */
+  /** O usuário envia a certificação de uma fazenda (já certificada) com 1+ documentos. */
   async create(requester: CertificationRequester, body: unknown, files: Express.Multer.File[] = [], now: Date = new Date()) {
-    const producer = await this.requireProducer(requester.userId);
+    const owner = await this.requireCertificationOwner(requester.userId);
     const input = this.parseInput(body, now);
     if (files.length === 0) throw new CertificationError(400, "Envie ao menos um documento da certificação.");
     if (files.length > MAX_FILES_PER_UPLOAD) {
       throw new CertificationError(400, `Envie no máximo ${MAX_FILES_PER_UPLOAD} arquivos por vez.`);
     }
     const docTypes = parseDocumentTypes((body as Record<string, unknown> | undefined)?.documentTypes, files.length);
-    await this.assertNotDuplicate(producer.id, input);
+    await this.assertNotDuplicate(owner.id, input);
 
     const certificationId = randomUUID();
     const eventId = randomUUID();
@@ -143,9 +152,9 @@ export class FarmCertificationService {
         await tx.farmCertification.create({
           data: {
             id: certificationId,
-            userId: producer.id,
+            userId: owner.id,
             ...certificationData(input),
-            documents: { create: documents.map((doc) => ({ ...doc, uploadedById: producer.id })) },
+            documents: { create: documents.map((doc) => ({ ...doc, uploadedById: owner.id })) },
           },
         });
         await tx.farmCertificationEvent.create({
@@ -155,7 +164,7 @@ export class FarmCertificationService {
             action: CertificationEventAction.SUBMITTED,
             fromStatus: null,
             toStatus: CertificationStatus.PENDING,
-            actorId: producer.id,
+            actorId: owner.id,
             documentId: this.primaryDocumentId(documents),
           },
         });
@@ -169,7 +178,7 @@ export class FarmCertificationService {
     await this.notifications.notifyFarmCertificationSubmitted({
       certificationId,
       farmName: input.farmName,
-      producerName: producer.name,
+      ownerName: owner.name,
       resubmitted: false,
       eventId,
     });
@@ -189,12 +198,12 @@ export class FarmCertificationService {
     files: Express.Multer.File[] = [],
     now: Date = new Date()
   ) {
-    const producer = await this.requireProducer(requester.userId);
+    const owner = await this.requireCertificationOwner(requester.userId);
     const current = await this.prisma.farmCertification.findUnique({
       where: { id: certificationId },
       select: { id: true, userId: true, status: true, revision: true, _count: { select: { documents: true } } },
     });
-    if (!current || current.userId !== producer.id) throw new CertificationError(404, "Certificação não encontrada.");
+    if (!current || current.userId !== owner.id) throw new CertificationError(404, "Certificação não encontrada.");
     if (current.status !== CertificationStatus.PENDING && current.status !== CertificationStatus.REJECTED) {
       throw new CertificationError(409, "Só é possível alterar certificações pendentes ou recusadas.");
     }
@@ -207,7 +216,7 @@ export class FarmCertificationService {
       throw new CertificationError(400, `Limite de ${MAX_DOCUMENTS_PER_CERTIFICATION} documentos por certificação atingido.`);
     }
     const docTypes = parseDocumentTypes((body as Record<string, unknown> | undefined)?.documentTypes, files.length);
-    await this.assertNotDuplicate(producer.id, input, certificationId);
+    await this.assertNotDuplicate(owner.id, input, certificationId);
 
     const eventId = randomUUID();
     const documents = await this.uploadDocuments(certificationId, files, docTypes);
@@ -233,7 +242,7 @@ export class FarmCertificationService {
         }
         if (documents.length > 0) {
           await tx.farmCertificationDocument.createMany({
-            data: documents.map((doc) => ({ ...doc, certificationId, uploadedById: producer.id })),
+            data: documents.map((doc) => ({ ...doc, certificationId, uploadedById: owner.id })),
           });
           // Confere o limite com o total real gravado (a checagem prévia usou uma contagem lida antes).
           const total = await tx.farmCertificationDocument.count({ where: { certificationId } });
@@ -248,7 +257,7 @@ export class FarmCertificationService {
             action: CertificationEventAction.RESUBMITTED,
             fromStatus: current.status,
             toStatus: CertificationStatus.PENDING,
-            actorId: producer.id,
+            actorId: owner.id,
             documentId: this.primaryDocumentId(documents),
           },
         });
@@ -262,7 +271,7 @@ export class FarmCertificationService {
     await this.notifications.notifyFarmCertificationSubmitted({
       certificationId,
       farmName: input.farmName,
-      producerName: producer.name,
+      ownerName: owner.name,
       resubmitted: true,
       eventId,
     });
@@ -270,7 +279,7 @@ export class FarmCertificationService {
     return this.getById(requester, certificationId);
   }
 
-  /** Certificações do próprio produtor, com `badgeActive` (selo no ar hoje). */
+  /** Certificações do próprio usuário, com `badgeActive` (selo no ar hoje). */
   async listMine(userId: string, now: Date = new Date()) {
     const rows = await this.prisma.farmCertification.findMany({
       where: { userId },
@@ -295,7 +304,7 @@ export class FarmCertificationService {
     if (!row || (!isAdmin && row.userId !== requester.userId)) {
       throw new CertificationError(404, "Certificação não encontrada.");
     }
-    // Os dados de contato do produtor só interessam ao admin que avalia.
+    // Os dados de contato do dono só interessam ao admin que avalia.
     const { user, ...rest } = row;
     return { ...rest, ...(isAdmin ? { user } : {}), badgeActive: this.isBadgeActive(row, now) };
   }
@@ -314,7 +323,7 @@ export class FarmCertificationService {
   }
 
   /**
-   * Selo público de um produtor: só certificações ativas e só dados não sensíveis
+   * Selo público de um usuário (vendedor): só certificações ativas e só dados não sensíveis
    * (nada de nome da fazenda, CNPJ, CCIR/CAR, área ou documentos).
    */
   async getBadge(userId: string, now: Date = new Date()) {
@@ -369,7 +378,7 @@ export class FarmCertificationService {
 
   // ─── Vencimento (job diário) ─────────────────────────────────────────────────
 
-  /** Marca como EXPIRED as aprovadas cuja validade já passou, com histórico e aviso ao produtor. */
+  /** Marca como EXPIRED as aprovadas cuja validade já passou, com histórico e aviso ao dono. */
   async expireOverdue(now: Date = new Date()): Promise<number> {
     const overdue = await this.prisma.farmCertification.findMany({
       where: { status: CertificationStatus.APPROVED, validUntil: { lt: startOfTodayInBrasilia(now) } },
@@ -412,7 +421,7 @@ export class FarmCertificationService {
   }
 
   /**
-   * Avisa os produtores com certificação aprovada vencendo nos próximos EXPIRING_REMINDER_DAYS dias.
+   * Avisa os donos de certificação aprovada vencendo nos próximos EXPIRING_REMINDER_DAYS dias.
    * Um aviso por certificação e validade (dedupeKey): rodar todo dia não duplica.
    */
   async sendExpiringReminders(now: Date = new Date()): Promise<number> {
@@ -465,10 +474,10 @@ export class FarmCertificationService {
     if (cert.status !== transition.from) {
       throw new CertificationError(409, `Ação indisponível: a certificação está ${cert.status}.`);
     }
-    // O admin avalia os dados que viu: se o produtor reenviou depois disso, a decisão está obsoleta.
+    // O admin avalia os dados que viu: se o dono reenviou depois disso, a decisão está obsoleta.
     const revision = params.revision ?? cert.revision;
     if (revision !== cert.revision) {
-      throw new CertificationError(409, "O produtor alterou a certificação depois que você a abriu. Recarregue e avalie de novo.");
+      throw new CertificationError(409, "O usuário alterou a certificação depois que você a abriu. Recarregue e avalie de novo.");
     }
 
     let documentId: string | null = null;
@@ -533,10 +542,16 @@ export class FarmCertificationService {
     return this.getById(admin, certificationId, now);
   }
 
-  private async requireProducer(userId: string) {
+  /** Papel lido do banco (não do token): vale a regra de canOwnFarmCertification. */
+  private async requireCertificationOwner(userId: string) {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, name: true, role: true } });
     if (!user) throw new CertificationError(404, "Usuário não encontrado.");
-    if (user.role !== "producer") throw new CertificationError(403, "Apenas produtores podem enviar certificação de fazenda.");
+    if (!canOwnFarmCertification(user.role)) {
+      throw new CertificationError(
+        403,
+        user.role === "admin" ? "Administradores não podem enviar certificações." : "Seu perfil não pode enviar certificações."
+      );
+    }
     return user;
   }
 
@@ -549,7 +564,7 @@ export class FarmCertificationService {
   }
 
   /**
-   * Mesmo certificado (tipo + número) já pendente ou aprovado para o produtor. Checagem prévia, para
+   * Mesmo certificado (tipo + número) já pendente ou aprovado para o usuário. Checagem prévia, para
    * não subir arquivos à toa; a garantia sob concorrência é o índice único parcial no banco.
    */
   private async assertNotDuplicate(userId: string, input: FarmCertificationInput, ignoreId?: string) {
