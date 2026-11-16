@@ -352,8 +352,9 @@ describe('FarmCertificationService', () => {
 
     it('exige a revisão analisada para aprovar e para recusar', async () => {
       pending();
-      await expectError(service.approve(ADMIN, CERT_ID, {}, NOW), 400, /revisão/);
-      await expectError(service.reject(ADMIN, CERT_ID, { reason: 'Documento ilegível' }, NOW), 400, /revisão/);
+      await expectError(service.approve(ADMIN, CERT_ID, {}, NOW), 400, /^Informe a revisão analisada \(revision\)\.$/);
+      await expectError(service.reject(ADMIN, CERT_ID, { reason: 'Documento ilegível' }, NOW), 400, /^Informe a revisão analisada \(revision\)\.$/);
+      await expectError(service.approve(ADMIN, CERT_ID, { revision: null }, NOW), 400, /^Informe a revisão analisada \(revision\)\.$/);
       await expectError(service.approve(ADMIN, CERT_ID, { revision: -1 }, NOW), 400, /Revisão inválida/);
       expect(prisma.farmCertification.updateMany).not.toHaveBeenCalled();
     });

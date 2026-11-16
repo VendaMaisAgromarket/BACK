@@ -1,4 +1,4 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express from 'express';
 import cors from 'cors';
 import userRoutes from './modules/user/user.route';
 import addressRoutes from './modules/address/address.route';
@@ -21,6 +21,7 @@ import { PaymentService } from './modules/payment/payment.service';
 import dashboardRoutes from './modules/dashboard/dashboard.route';
 import notificationRoutes from './modules/notification/notification.route';
 import farmCertificationRoutes from './modules/certification/farmCertification.route';
+import { errorHandler } from './middlewares/errorHandler';
 
 import 'dotenv/config';
 
@@ -54,12 +55,7 @@ app.use('/certifications/farm', farmCertificationRoutes);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.use('/upload-s3', uploadS3Router);
 
-app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-  console.error('[Global Error Handler]', err);
-  res.status(err.status || 500).json({
-    error: err.message || 'Erro interno do servidor'
-  });
-});
+app.use(errorHandler);
 
 // Polling de boletos pendentes — roda a cada 5 minutos para compensar atrasos bancários
 const paymentService = new PaymentService();

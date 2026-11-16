@@ -53,6 +53,83 @@ const uploadDocuments: RequestHandler = (req, res, next) =>
 
 /**
  * @swagger
+ * components:
+ *   schemas:
+ *     FarmCertificationDetail:
+ *       type: object
+ *       description: Detalhe da certificação (GET /:id e retorno de POST, PUT, approve, reject e revoke)
+ *       properties:
+ *         id: { type: string, format: uuid }
+ *         userId: { type: string, format: uuid }
+ *         farmName: { type: string }
+ *         city: { type: string }
+ *         uf: { type: string, example: MG }
+ *         ccir: { type: string, nullable: true }
+ *         car: { type: string, nullable: true }
+ *         areaHectares: { type: string, description: "Decimal serializado como string", example: "12.5" }
+ *         type: { type: string, enum: [ORGANIC_SISORG, GLOBALGAP, RAINFOREST_ALLIANCE, FAIR_TRADE, OTHER] }
+ *         certifierName: { type: string }
+ *         certifierCnpj: { type: string, example: "11.222.333/0001-81" }
+ *         certificateNumber: { type: string }
+ *         issuedAt: { type: string, format: date-time, description: "Início do dia em Brasília" }
+ *         validUntil: { type: string, format: date-time, description: "Início do dia em Brasília" }
+ *         origin: { type: string, enum: [UPLOADED, PURCHASED] }
+ *         status: { type: string, enum: [PENDING, APPROVED, REJECTED, EXPIRED, REVOKED] }
+ *         revision:
+ *           type: integer
+ *           minimum: 0
+ *           description: "Versão dos dados: +1 a cada reenvio do dono. Enviar em approve/reject (obrigatório) e revoke (opcional); valor desatualizado → 409"
+ *         reviewedById: { type: string, nullable: true }
+ *         reviewedAt: { type: string, format: date-time, nullable: true }
+ *         rejectionReason: { type: string, nullable: true }
+ *         reviewNotes: { type: string, nullable: true }
+ *         createdAt: { type: string, format: date-time }
+ *         updatedAt: { type: string, format: date-time }
+ *         badgeActive: { type: boolean, description: "Selo no ar hoje (APPROVED e dentro da validade)" }
+ *         reviewedBy:
+ *           type: object
+ *           nullable: true
+ *           properties: { id: { type: string }, name: { type: string } }
+ *         documents:
+ *           type: array
+ *           items:
+ *             type: object
+ *             properties:
+ *               id: { type: string }
+ *               docType: { type: string, enum: [CERTIFICATE, AUDIT_REPORT, OTHER] }
+ *               originalName: { type: string }
+ *               mimeType: { type: string }
+ *               sizeBytes: { type: integer }
+ *               uploadedAt: { type: string, format: date-time }
+ *               uploadedBy: { type: object, properties: { id: { type: string }, name: { type: string } } }
+ *         events:
+ *           type: array
+ *           items:
+ *             type: object
+ *             properties:
+ *               id: { type: string }
+ *               action: { type: string, enum: [SUBMITTED, RESUBMITTED, APPROVED, REJECTED, REVOKED, EXPIRED] }
+ *               fromStatus: { type: string, nullable: true }
+ *               toStatus: { type: string }
+ *               note: { type: string, nullable: true }
+ *               createdAt: { type: string, format: date-time }
+ *               actor: { type: object, nullable: true, properties: { id: { type: string }, name: { type: string }, role: { type: string } } }
+ *               document: { type: object, nullable: true, properties: { id: { type: string }, docType: { type: string }, originalName: { type: string } } }
+ *         user:
+ *           type: object
+ *           description: "Só para admin"
+ *           properties:
+ *             id: { type: string }
+ *             name: { type: string }
+ *             email: { type: string }
+ *             phone_number: { type: string }
+ *             cpf: { type: string, nullable: true }
+ *             cnpj: { type: string, nullable: true }
+ *             ccir: { type: string, nullable: true }
+ */
+
+/**
+ * @swagger
  * /certifications/farm/badge/{userId}:
  *   get:
  *     summary: Selo público de fazenda certificada de um usuário vendedor (só dados não sensíveis)
@@ -122,7 +199,11 @@ router.get("/admin", requireAdmin, wrap(controller.listForAdmin.bind(controller)
  *               documentId: { type: string, description: "Documento que embasou a aprovação (padrão: certificado mais recente)" }
  *               notes: { type: string }
  *     responses:
- *       200: { description: Certificação atualizada, com histórico }
+ *       200:
+ *         description: Certificação aprovada, com histórico
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/FarmCertificationDetail' }
  *       409: { description: "Não está pendente, o certificado já venceu, ou o dono reenviou depois (revision desatualizada)" }
  */
 router.patch("/admin/:id/approve", requireAdmin, wrap(controller.approve.bind(controller)));
@@ -148,7 +229,11 @@ router.patch("/admin/:id/approve", requireAdmin, wrap(controller.approve.bind(co
  *               reason: { type: string }
  *               notes: { type: string }
  *     responses:
- *       200: { description: Certificação atualizada }
+ *       200:
+ *         description: Certificação recusada, com histórico
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/FarmCertificationDetail' }
  *       409: { description: "Não está pendente, ou revision desatualizada" }
  */
 router.patch("/admin/:id/reject", requireAdmin, wrap(controller.reject.bind(controller)));
@@ -174,8 +259,12 @@ router.patch("/admin/:id/reject", requireAdmin, wrap(controller.reject.bind(cont
  *               reason: { type: string }
  *               notes: { type: string }
  *     responses:
- *       200: { description: Certificação atualizada }
- *       409: { description: Não está aprovada }
+ *       200:
+ *         description: Certificação revogada, com histórico
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/FarmCertificationDetail' }
+ *       409: { description: "Não está aprovada, ou revision enviada e desatualizada" }
  */
 router.patch("/admin/:id/revoke", requireAdmin, wrap(controller.revoke.bind(controller)));
 
@@ -217,7 +306,11 @@ router.patch("/admin/:id/revoke", requireAdmin, wrap(controller.revoke.bind(cont
  *                 items: { type: string, enum: [CERTIFICATE, AUDIT_REPORT, OTHER] }
  *                 description: "Tipo de cada arquivo, na mesma ordem (padrão: CERTIFICATE)"
  *     responses:
- *       201: { description: Certificação criada como PENDING }
+ *       201:
+ *         description: Certificação criada como PENDING (revision 0)
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/FarmCertificationDetail' }
  *       400: { description: Dados ou arquivos inválidos }
  *       403: { description: Administradores não podem enviar certificações }
  *       409: { description: Certificado já pendente ou aprovado }
@@ -246,7 +339,11 @@ router.get("/mine", wrap(controller.listMine.bind(controller)));
  *     parameters:
  *       - { in: path, name: id, required: true, schema: { type: string } }
  *     responses:
- *       200: { description: Certificação; para admin inclui `user` com os dados do dono }
+ *       200:
+ *         description: Certificação; para admin inclui `user` com os dados do dono
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/FarmCertificationDetail' }
  *       404: { description: Não encontrada }
  *   put:
  *     summary: Corrige e reenvia uma certificação pendente ou recusada (volta a PENDING)
@@ -262,7 +359,11 @@ router.get("/mine", wrap(controller.listMine.bind(controller)));
  *             type: object
  *             description: "Mesmos campos do POST; `documents` é opcional (novos arquivos são anexados aos existentes)"
  *     responses:
- *       200: { description: Certificação reenviada }
+ *       200:
+ *         description: Certificação reenviada (revision incrementada)
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/FarmCertificationDetail' }
  *       409: { description: Status não permite edição }
  */
 router.get("/:id", wrap(controller.getById.bind(controller)));
