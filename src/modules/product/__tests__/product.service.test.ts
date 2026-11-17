@@ -210,9 +210,10 @@ describe('ProductService.getBestSellers', () => {
     expect(prisma.product.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: { in: ['b', 'c'] } } })
     );
+    // Sem certificação de safra vinculada/ativa, o selo vem null.
     expect(result).toEqual([
-      { id: 'b', salesCount: 3 },
-      { id: 'c', salesCount: 2 },
+      { id: 'b', salesCount: 3, harvestCertification: null },
+      { id: 'c', salesCount: 2, harvestCertification: null },
     ]);
   });
 

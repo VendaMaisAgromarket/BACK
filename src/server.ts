@@ -5,6 +5,7 @@ import './modules/product/deactivateExpiredProductsJob';
 import './modules/notification/harvestReminderJob';
 import './modules/notification/notificationEmailJob';
 import './modules/certification/farmCertificationExpiryJob';
+import './modules/certification/harvestCertificationExpiryJob';
 
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 5000;

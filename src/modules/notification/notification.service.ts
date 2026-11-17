@@ -84,15 +84,19 @@ export function buildNotificationLink(
   }
   const data = notification.data;
   if (data && typeof data === "object" && !Array.isArray(data) && typeof data.certificationId === "string") {
+    // Sem `scope` = notificação de fazenda gravada antes de existir a de safra.
+    const scope = data.scope === "harvest" ? "harvest" : "farm";
     return data.role === "admin"
-      ? { label: "Avaliar a certificação", url: `${base}/admin/certifications/farm/${encodeURIComponent(data.certificationId)}` }
-      : { label: "Ver minhas certificações", url: `${base}/market/certifications/farm` };
+      ? { label: "Avaliar a certificação", url: `${base}/admin/certifications/${scope}/${encodeURIComponent(data.certificationId)}` }
+      : { label: "Ver minhas certificações", url: `${base}/market/certifications/${scope}` };
   }
   return null;
 }
 
-/** Desfechos da certificação de fazenda avisados ao produtor. */
-export type FarmCertificationOutcome = "APPROVED" | "REJECTED" | "REVOKED" | "EXPIRING" | "EXPIRED";
+/** Desfechos de uma certificação (fazenda ou safra) avisados ao dono. */
+export type CertificationOutcome = "APPROVED" | "REJECTED" | "REVOKED" | "EXPIRING" | "EXPIRED";
+export type FarmCertificationOutcome = CertificationOutcome;
+export type CertificationScope = "farm" | "harvest";
 
 export interface FarmCertificationNotice {
   certificationId: string;
@@ -105,10 +109,52 @@ export interface FarmCertificationNotice {
   dedupeId: string;
 }
 
-const FARM_CERTIFICATION_TEXT: Record<
-  FarmCertificationOutcome,
-  { type: NotificationType; title: string; message: (n: FarmCertificationNotice) => string }
-> = {
+export interface HarvestCertificationNotice {
+  certificationId: string;
+  userId: string;
+  /** Identificação legível da safra, ex.: "Tomate — safra 2026/27, lote T3". */
+  label: string;
+  validUntil: Date;
+  reason?: string | null;
+  dedupeId: string;
+}
+
+type CertificationText<N> = Record<CertificationOutcome, { type: NotificationType; title: string; message: (n: N) => string }>;
+
+const HARVEST_CERTIFICATION_TEXT: CertificationText<HarvestCertificationNotice> = {
+  APPROVED: {
+    type: NotificationType.HARVEST_CERTIFICATION_APPROVED,
+    title: "Certificação de safra aprovada",
+    message: (n) =>
+      `A certificação da safra ${n.label} foi aprovada. O selo de safra certificada já aparece nos anúncios vinculados a ela até ${formatBrasiliaDate(n.validUntil)}.`,
+  },
+  REJECTED: {
+    type: NotificationType.HARVEST_CERTIFICATION_REJECTED,
+    title: "Certificação de safra recusada",
+    message: (n) =>
+      `A certificação da safra ${n.label} foi recusada. Motivo: ${n.reason ?? "não informado"}. Você pode corrigir os dados ou laudos e reenviar.`,
+  },
+  REVOKED: {
+    type: NotificationType.HARVEST_CERTIFICATION_REVOKED,
+    title: "Certificação de safra revogada",
+    message: (n) =>
+      `A certificação da safra ${n.label} foi revogada e o selo saiu dos anúncios. Motivo: ${n.reason ?? "não informado"}.`,
+  },
+  EXPIRING: {
+    type: NotificationType.HARVEST_CERTIFICATION_EXPIRING,
+    title: "Certificação de safra vencendo",
+    message: (n) =>
+      `A certificação da safra ${n.label} vence em ${formatBrasiliaDate(n.validUntil)}. Após essa data o selo sai dos anúncios vinculados.`,
+  },
+  EXPIRED: {
+    type: NotificationType.HARVEST_CERTIFICATION_EXPIRED,
+    title: "Certificação de safra vencida",
+    message: (n) =>
+      `A certificação da safra ${n.label} venceu em ${formatBrasiliaDate(n.validUntil)} e o selo saiu dos anúncios vinculados.`,
+  },
+};
+
+const FARM_CERTIFICATION_TEXT: CertificationText<FarmCertificationNotice> = {
   APPROVED: {
     type: NotificationType.FARM_CERTIFICATION_APPROVED,
     title: "Certificação da fazenda aprovada",
@@ -448,18 +494,13 @@ export class NotificationService {
     resubmitted: boolean;
     eventId: string;
   }): Promise<void> {
-    await this.safely(NotificationType.FARM_CERTIFICATION_SUBMITTED, async () => {
-      const admins = await this.prisma.user.findMany({ where: { role: "admin", valid: true }, select: { id: true } });
-      await this.createMany(
-        admins.map((admin) => ({
-          userId: admin.id,
-          type: NotificationType.FARM_CERTIFICATION_SUBMITTED,
-          title: params.resubmitted ? "Certificação de fazenda reenviada" : "Nova certificação de fazenda",
-          message: `${params.ownerName} ${params.resubmitted ? "reenviou" : "enviou"} a certificação da fazenda "${params.farmName}" para avaliação.`,
-          data: { role: "admin", certificationId: params.certificationId },
-          dedupeKey: `${NotificationType.FARM_CERTIFICATION_SUBMITTED}:${params.eventId}:${admin.id}`,
-        }))
-      );
+    await this.notifyAdminsOfCertification({
+      scope: "farm",
+      type: NotificationType.FARM_CERTIFICATION_SUBMITTED,
+      title: params.resubmitted ? "Certificação de fazenda reenviada" : "Nova certificação de fazenda",
+      message: `${params.ownerName} ${params.resubmitted ? "reenviou" : "enviou"} a certificação da fazenda "${params.farmName}" para avaliação.`,
+      certificationId: params.certificationId,
+      eventId: params.eventId,
     });
   }
 
@@ -468,8 +509,61 @@ export class NotificationService {
    * `data.role: "producer"` é só o destino do clique no front (/market/certifications/farm), não permissão.
    */
   async notifyFarmCertification(outcome: FarmCertificationOutcome, notices: FarmCertificationNotice[]): Promise<void> {
+    await this.notifyCertificationOwners("farm", FARM_CERTIFICATION_TEXT[outcome], notices);
+  }
+
+  /** Admins: certificação de safra enviada (ou reenviada) e aguardando avaliação. */
+  async notifyHarvestCertificationSubmitted(params: {
+    certificationId: string;
+    label: string;
+    ownerName: string;
+    resubmitted: boolean;
+    eventId: string;
+  }): Promise<void> {
+    await this.notifyAdminsOfCertification({
+      scope: "harvest",
+      type: NotificationType.HARVEST_CERTIFICATION_SUBMITTED,
+      title: params.resubmitted ? "Certificação de safra reenviada" : "Nova certificação de safra",
+      message: `${params.ownerName} ${params.resubmitted ? "reenviou" : "enviou"} a certificação da safra ${params.label} para avaliação.`,
+      certificationId: params.certificationId,
+      eventId: params.eventId,
+    });
+  }
+
+  /** Dono da certificação de safra (qualquer papel): aprovada, recusada, revogada, vencendo ou vencida. */
+  async notifyHarvestCertification(outcome: CertificationOutcome, notices: HarvestCertificationNotice[]): Promise<void> {
+    await this.notifyCertificationOwners("harvest", HARVEST_CERTIFICATION_TEXT[outcome], notices);
+  }
+
+  private async notifyAdminsOfCertification(params: {
+    scope: CertificationScope;
+    type: NotificationType;
+    title: string;
+    message: string;
+    certificationId: string;
+    eventId: string;
+  }): Promise<void> {
+    await this.safely(params.type, async () => {
+      const admins = await this.prisma.user.findMany({ where: { role: "admin", valid: true }, select: { id: true } });
+      await this.createMany(
+        admins.map((admin) => ({
+          userId: admin.id,
+          type: params.type,
+          title: params.title,
+          message: params.message,
+          data: { role: "admin", scope: params.scope, certificationId: params.certificationId },
+          dedupeKey: `${params.type}:${params.eventId}:${admin.id}`,
+        }))
+      );
+    });
+  }
+
+  private async notifyCertificationOwners<N extends { certificationId: string; userId: string; validUntil: Date; reason?: string | null; dedupeId: string }>(
+    scope: CertificationScope,
+    text: { type: NotificationType; title: string; message: (n: N) => string },
+    notices: N[]
+  ): Promise<void> {
     if (notices.length === 0) return;
-    const text = FARM_CERTIFICATION_TEXT[outcome];
     await this.safely(text.type, () =>
       this.createMany(
         notices.map((n) => ({
@@ -479,6 +573,7 @@ export class NotificationService {
           message: text.message(n),
           data: {
             role: "producer",
+            scope,
             certificationId: n.certificationId,
             validUntil: n.validUntil.toISOString(),
             ...(n.reason ? { reason: n.reason } : {}),
