@@ -1,6 +1,7 @@
 import { NotificationType, Prisma, PrismaClient } from "@prisma/client";
 import { BRASILIA_TIME_ZONE, brasiliaDateKey, startOfTodayInBrasilia } from "../../lib/brasiliaTime";
 import { logger } from "../../lib/logger";
+import { EmailService, emailService } from "../email/email.service";
 
 type DbClient = PrismaClient | Prisma.TransactionClient;
 
@@ -38,8 +39,107 @@ const DAY_MS = 86_400_000;
 const MAX_PAGE_SIZE = 50;
 const DEFAULT_PAGE_SIZE = 20;
 
-/** Status que o vendedor também é avisado (cancelamento não: é ele quem cancela). */
-const SELLER_NOTIFIED_STATUSES = ["Entregue", "Concluído", "Concluída"];
+/** Tentativas de envio do e-mail de uma notificação antes de desistir (ex.: endereço inválido). */
+export const MAX_EMAIL_ATTEMPTS = 3;
+/** Notificações mais antigas que isso não geram e-mail (ex.: servidor ficou parado por dias). */
+const EMAIL_MAX_AGE_MS = DAY_MS;
+const EMAIL_BATCH_SIZE = 50;
+
+/** Fecho das notificações de conta: alteração que o usuário não reconhece pode ser invasão. */
+const NOT_YOU_NOTICE = "Se não foi você, redefina sua senha e entre em contato com o suporte.";
+
+export type AddressChange = "created" | "updated" | "default" | "deleted";
+
+const ADDRESS_CHANGE_TEXT: Record<AddressChange, { type: NotificationType; title: string; verb: string }> = {
+  created: { type: NotificationType.ADDRESS_CREATED, title: "Endereço adicionado", verb: "foi adicionado à sua conta" },
+  updated: { type: NotificationType.ADDRESS_UPDATED, title: "Endereço atualizado", verb: "foi atualizado" },
+  default: { type: NotificationType.ADDRESS_UPDATED, title: "Endereço padrão alterado", verb: "agora é o seu endereço padrão" },
+  deleted: { type: NotificationType.ADDRESS_DELETED, title: "Endereço removido", verb: "foi removido da sua conta" },
+};
+
+/** "a" · "a e b" · "a, b e c" */
+function joinPt(items: string[]): string {
+  if (items.length <= 1) return items.join("");
+  return `${items.slice(0, -1).join(", ")} e ${items[items.length - 1]}`;
+}
+
+/**
+ * Link do e-mail para a mesma tela que o clique no sino abre (getNotificationHref no front).
+ * Com venda: `data.role` decide entre a lista de vendas (vendedor) e a de compras (comprador) —
+ * ORDER_STATUS_CHANGED vai para os dois, então o tipo não basta. Sem venda: edição do anúncio.
+ */
+export function buildNotificationLink(
+  notification: { saleId: string | null; productId: string | null; data: Prisma.JsonValue },
+  frontendUrl: string
+): { label: string; url: string } | null {
+  const base = frontendUrl.replace(/\/+$/, "");
+  if (notification.saleId) {
+    const data = notification.data;
+    const role = data && typeof data === "object" && !Array.isArray(data) ? data.role : undefined;
+    const path = role === "seller" ? "/market/orders" : "/market/history";
+    return { label: "Acesse o pedido", url: `${base}${path}?saleId=${encodeURIComponent(notification.saleId)}` };
+  }
+  if (notification.productId) {
+    return { label: "Acesse o anúncio", url: `${base}/market/edit-product/${encodeURIComponent(notification.productId)}` };
+  }
+  const data = notification.data;
+  if (data && typeof data === "object" && !Array.isArray(data) && typeof data.certificationId === "string") {
+    return data.role === "admin"
+      ? { label: "Avaliar a certificação", url: `${base}/admin/certifications/farm/${encodeURIComponent(data.certificationId)}` }
+      : { label: "Ver minhas certificações", url: `${base}/market/certifications/farm` };
+  }
+  return null;
+}
+
+/** Desfechos da certificação de fazenda avisados ao produtor. */
+export type FarmCertificationOutcome = "APPROVED" | "REJECTED" | "REVOKED" | "EXPIRING" | "EXPIRED";
+
+export interface FarmCertificationNotice {
+  certificationId: string;
+  userId: string;
+  farmName: string;
+  validUntil: Date;
+  /** Motivo da recusa/revogação. */
+  reason?: string | null;
+  /** Identidade da transição (id do evento de histórico, ou chave do lembrete): base da dedupeKey. */
+  dedupeId: string;
+}
+
+const FARM_CERTIFICATION_TEXT: Record<
+  FarmCertificationOutcome,
+  { type: NotificationType; title: string; message: (n: FarmCertificationNotice) => string }
+> = {
+  APPROVED: {
+    type: NotificationType.FARM_CERTIFICATION_APPROVED,
+    title: "Certificação da fazenda aprovada",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" foi aprovada. O selo de fazenda certificada já aparece no seu perfil e nos seus anúncios até ${formatBrasiliaDate(n.validUntil)}.`,
+  },
+  REJECTED: {
+    type: NotificationType.FARM_CERTIFICATION_REJECTED,
+    title: "Certificação da fazenda recusada",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" foi recusada. Motivo: ${n.reason ?? "não informado"}. Você pode corrigir os dados ou documentos e reenviar.`,
+  },
+  REVOKED: {
+    type: NotificationType.FARM_CERTIFICATION_REVOKED,
+    title: "Certificação da fazenda revogada",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" foi revogada e o selo foi removido. Motivo: ${n.reason ?? "não informado"}.`,
+  },
+  EXPIRING: {
+    type: NotificationType.FARM_CERTIFICATION_EXPIRING,
+    title: "Certificação da fazenda vencendo",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" vence em ${formatBrasiliaDate(n.validUntil)}. Após essa data o selo sai do ar: envie o certificado renovado para mantê-lo.`,
+  },
+  EXPIRED: {
+    type: NotificationType.FARM_CERTIFICATION_EXPIRED,
+    title: "Certificação da fazenda vencida",
+    message: (n) =>
+      `A certificação da fazenda "${n.farmName}" venceu em ${formatBrasiliaDate(n.validUntil)} e o selo foi removido. Envie o certificado renovado para reativá-lo.`,
+  },
+};
 
 function formatBRL(value: number): string {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -51,9 +151,11 @@ function formatBrasiliaDate(date: Date): string {
 
 export class NotificationService {
   private readonly prisma: PrismaClient;
+  private readonly email: EmailService;
 
-  constructor(prisma?: PrismaClient) {
+  constructor(prisma?: PrismaClient, email: EmailService = emailService) {
     this.prisma = prisma || new PrismaClient();
+    this.email = email;
   }
 
   // ─── Persistência ────────────────────────────────────────────────────────────
@@ -104,13 +206,13 @@ export class NotificationService {
 
   // ─── Eventos de venda (best-effort, após a operação) ─────────────────────────
 
-  /** Vendedor(es): chegou um pedido novo. */
+  /** Vendedor(es): chegou um pedido novo. Comprador: confirmação de que o pedido foi enviado. */
   async notifyNewOrder(saleId: string): Promise<void> {
     await this.safely("NEW_ORDER", async () => {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
-      await this.createMany(
-        ctx.sellerIds.map((sellerId) => ({
+      await this.createMany([
+        ...ctx.sellerIds.map((sellerId) => ({
           userId: sellerId,
           type: NotificationType.NEW_ORDER,
           title: "Novo pedido recebido",
@@ -118,22 +220,33 @@ export class NotificationService {
           saleId,
           data: { role: "seller", orderNumber: ctx.orderNumber },
           dedupeKey: `NEW_ORDER:${saleId}:${sellerId}`,
-        }))
-      );
+        })),
+        {
+          userId: ctx.buyerId,
+          type: NotificationType.NEW_ORDER,
+          title: "Pedido enviado",
+          message: `Seu pedido #${ctx.orderNumber} foi enviado ao vendedor e aguarda o aceite.`,
+          saleId,
+          data: { role: "buyer", orderNumber: ctx.orderNumber },
+          dedupeKey: `NEW_ORDER:${saleId}:${ctx.buyerId}`,
+        },
+      ]);
     });
   }
 
   /**
-   * Comprador: vendedor aceitou ou recusou o pedido. `statusVersion` é a versão gravada pela
-   * transição (SaleData.statusVersion, monotônica e única por venda) — a identidade persistente
-   * dela. A dedupeKey (decisão + venda + versão) deixa passar mudanças reais de decisão
-   * (aceitar → recusar → aceitar gera 3 avisos) e descarta o reprocessamento da mesma transição.
+   * Vendedor aceitou ou recusou o pedido: avisa o comprador e o(s) vendedor(es). `statusVersion` é a
+   * versão gravada pela transição (SaleData.statusVersion, monotônica e única por venda) — a
+   * identidade persistente dela. A dedupeKey (decisão + venda + versão [+ vendedor]) deixa passar
+   * mudanças reais de decisão (aceitar → recusar → aceitar gera 3 avisos) e descarta o
+   * reprocessamento da mesma transição.
    */
   async notifySellerDecision(saleId: string, approved: boolean, status: string, statusVersion: number): Promise<void> {
     const type = approved ? NotificationType.ORDER_ACCEPTED : NotificationType.ORDER_REJECTED;
     await this.safely(type, async () => {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
+      const transitionKey = `${type}:${saleId}:v${statusVersion}`;
       await this.createMany([
         {
           userId: ctx.buyerId,
@@ -144,14 +257,24 @@ export class NotificationService {
             : `O vendedor recusou o seu pedido #${ctx.orderNumber}.`,
           saleId,
           data: { role: "buyer", orderNumber: ctx.orderNumber, status },
-          dedupeKey: `${type}:${saleId}:v${statusVersion}`,
+          // Chave do comprador sem sufixo: mantém a de antes da notificação ao vendedor existir.
+          dedupeKey: transitionKey,
         },
+        ...ctx.sellerIds.map((sellerId) => ({
+          userId: sellerId,
+          type,
+          title: approved ? "Pedido aceito" : "Pedido recusado",
+          message: `O pedido #${ctx.orderNumber} de ${ctx.buyerName} foi ${approved ? "aceito" : "recusado"}.`,
+          saleId,
+          data: { role: "seller", orderNumber: ctx.orderNumber, status },
+          dedupeKey: `${transitionKey}:${sellerId}`,
+        })),
       ]);
     });
   }
 
   /**
-   * Comprador: qualquer outra mudança de status do pedido. Vendedor(es): só entrega e conclusão.
+   * Qualquer mudança de status do pedido: avisa o comprador e o(s) vendedor(es).
    * `statusVersion` é a versão gravada pela transição (SaleData.statusVersion): cada linha gerada
    * leva uma dedupeKey com essa versão + destinatário. Reprocessar a mesma transição não duplica;
    * duas transições distintas nunca compartilham chave (a versão é monotônica, ao contrário de um
@@ -162,25 +285,22 @@ export class NotificationService {
       const ctx = await this.getSaleContext(saleId);
       if (!ctx) return;
       const transitionKey = `ORDER_STATUS_CHANGED:${saleId}:v${statusVersion}`;
-      const sellerNotifications: NotificationInput[] = SELLER_NOTIFIED_STATUSES.includes(status)
-        ? ctx.sellerIds.map((sellerId) => ({
-            userId: sellerId,
-            type: NotificationType.ORDER_STATUS_CHANGED,
-            title: "Status do pedido atualizado",
-            message: `O pedido #${ctx.orderNumber} agora está: ${status}.`,
-            saleId,
-            data: { role: "seller", orderNumber: ctx.orderNumber, status },
-            dedupeKey: `${transitionKey}:${sellerId}`,
-          }))
-        : [];
       await this.createMany([
         this.buildStatusChanged(ctx, status, `${transitionKey}:${ctx.buyerId}`),
-        ...sellerNotifications,
+        ...ctx.sellerIds.map((sellerId) => ({
+          userId: sellerId,
+          type: NotificationType.ORDER_STATUS_CHANGED,
+          title: "Status do pedido atualizado",
+          message: `O pedido #${ctx.orderNumber} agora está: ${status}.`,
+          saleId,
+          data: { role: "seller", orderNumber: ctx.orderNumber, status },
+          dedupeKey: `${transitionKey}:${sellerId}`,
+        })),
       ]);
     });
   }
 
-  /** Comprador: vendedor registrou a pesagem (o status passa a "Aguardando pagamento final"). */
+  /** Vendedor registrou a pesagem (o status passa a "Aguardando pagamento final"): avisa os dois lados. */
   async notifyWeightRegistered(
     saleId: string,
     params: { weightKg: number; adjustedContractTotal: number | null; status: string }
@@ -191,22 +311,32 @@ export class NotificationService {
       const totalText = params.adjustedContractTotal !== null
         ? ` Novo valor do contrato: ${formatBRL(params.adjustedContractTotal)}.`
         : "";
+      const weightText = `${params.weightKg.toLocaleString("pt-BR")} kg`;
+      const data = {
+        orderNumber: ctx.orderNumber,
+        status: params.status,
+        weightKg: params.weightKg,
+        adjustedContractTotal: params.adjustedContractTotal,
+      };
       await this.createMany([
         {
           userId: ctx.buyerId,
           type: NotificationType.WEIGHT_REGISTERED,
           title: "Pesagem registrada",
-          message: `O vendedor registrou a pesagem do pedido #${ctx.orderNumber}: ${params.weightKg.toLocaleString("pt-BR")} kg.${totalText} O próximo passo é o pagamento final.`,
+          message: `O vendedor registrou a pesagem do pedido #${ctx.orderNumber}: ${weightText}.${totalText} O próximo passo é o pagamento final.`,
           saleId,
-          data: {
-            role: "buyer",
-            orderNumber: ctx.orderNumber,
-            status: params.status,
-            weightKg: params.weightKg,
-            adjustedContractTotal: params.adjustedContractTotal,
-          },
+          data: { role: "buyer", ...data },
           dedupeKey: `WEIGHT_REGISTERED:${saleId}`,
         },
+        ...ctx.sellerIds.map((sellerId) => ({
+          userId: sellerId,
+          type: NotificationType.WEIGHT_REGISTERED,
+          title: "Pesagem registrada",
+          message: `A pesagem do pedido #${ctx.orderNumber} foi registrada: ${weightText}.${totalText} Agora o pedido aguarda o pagamento final do comprador.`,
+          saleId,
+          data: { role: "seller", ...data },
+          dedupeKey: `WEIGHT_REGISTERED:${saleId}:${sellerId}`,
+        })),
       ]);
     });
   }
@@ -215,8 +345,8 @@ export class NotificationService {
 
   /**
    * Vendedor(es): entrada (30%) ou parcela final (70%)/pagamento integral confirmados.
-   * Quando o pagamento conclui o pedido, a própria mensagem ao vendedor avisa a conclusão (em vez
-   * de uma segunda notificação de status no mesmo instante).
+   * A própria mensagem ao vendedor traz o novo status do pedido (em vez de uma segunda
+   * notificação de status no mesmo instante).
    * Comprador: o status do pedido mudou. Roda dentro da transação de applyPaymentCompletion —
    * se falhar, o pagamento não é gravado e o webhook/poller tenta de novo. As `dedupeKey` por
    * pagamento evitam duplicatas quando a mesma confirmação chega pelo webhook e pelo poller.
@@ -242,9 +372,7 @@ export class NotificationService {
       userId: sellerId,
       type,
       title,
-      message: `O comprador pagou ${what} do pedido #${ctx.orderNumber}: ${formatBRL(params.amount)}.${
-        SELLER_NOTIFIED_STATUSES.includes(params.status) ? ` O pedido agora está: ${params.status}.` : ""
-      }`,
+      message: `O comprador pagou ${what} do pedido #${ctx.orderNumber}: ${formatBRL(params.amount)}. O pedido agora está: ${params.status}.`,
       saleId: params.saleId,
       data: { role: "seller", orderNumber: ctx.orderNumber, phase: params.phase, amount: params.amount, status: params.status },
       dedupeKey: `${type}:${params.paymentId}:${sellerId}`,
@@ -269,6 +397,96 @@ export class NotificationService {
       data: { role: "buyer", orderNumber: ctx.orderNumber, status },
       dedupeKey,
     };
+  }
+
+  // ─── Perfil e endereços (best-effort, após a operação) ───────────────────────
+
+  /** Usuário: dados pessoais alterados. `fields` são os rótulos legíveis do que mudou ("nome", "telefone"…). */
+  async notifyProfileUpdated(userId: string, fields: string[]): Promise<void> {
+    if (fields.length === 0) return;
+    await this.safely(NotificationType.PROFILE_UPDATED, () =>
+      this.createMany([
+        {
+          userId,
+          type: NotificationType.PROFILE_UPDATED,
+          title: "Dados pessoais atualizados",
+          message: `${fields.length === 1 ? "Este dado do seu perfil foi alterado" : "Estes dados do seu perfil foram alterados"}: ${joinPt(fields)}. ${NOT_YOU_NOTICE}`,
+          data: { fields },
+        },
+      ])
+    );
+  }
+
+  /** Usuário: endereço adicionado, alterado, definido como padrão ou removido. */
+  async notifyAddressChanged(
+    userId: string,
+    change: AddressChange,
+    address: { id: string; alias: string; street: string; number: string; city: string; uf: string }
+  ): Promise<void> {
+    const { type, title, verb } = ADDRESS_CHANGE_TEXT[change];
+    await this.safely(type, () =>
+      this.createMany([
+        {
+          userId,
+          type,
+          title,
+          message: `O endereço "${address.alias}" (${address.street}, ${address.number} - ${address.city}/${address.uf}) ${verb}. ${NOT_YOU_NOTICE}`,
+          data: { addressId: address.id, action: change },
+        },
+      ])
+    );
+  }
+
+  // ─── Certificação da fazenda (best-effort, após a operação) ──────────────────
+
+  /** Admins: certificação de fazenda enviada (ou reenviada) e aguardando avaliação. */
+  async notifyFarmCertificationSubmitted(params: {
+    certificationId: string;
+    farmName: string;
+    /** Nome do dono da certificação (produtor ou comprador que anuncia). */
+    ownerName: string;
+    resubmitted: boolean;
+    eventId: string;
+  }): Promise<void> {
+    await this.safely(NotificationType.FARM_CERTIFICATION_SUBMITTED, async () => {
+      const admins = await this.prisma.user.findMany({ where: { role: "admin", valid: true }, select: { id: true } });
+      await this.createMany(
+        admins.map((admin) => ({
+          userId: admin.id,
+          type: NotificationType.FARM_CERTIFICATION_SUBMITTED,
+          title: params.resubmitted ? "Certificação de fazenda reenviada" : "Nova certificação de fazenda",
+          message: `${params.ownerName} ${params.resubmitted ? "reenviou" : "enviou"} a certificação da fazenda "${params.farmName}" para avaliação.`,
+          data: { role: "admin", certificationId: params.certificationId },
+          dedupeKey: `${NotificationType.FARM_CERTIFICATION_SUBMITTED}:${params.eventId}:${admin.id}`,
+        }))
+      );
+    });
+  }
+
+  /**
+   * Dono da certificação (qualquer papel): aprovada, recusada, revogada, vencendo ou vencida.
+   * `data.role: "producer"` é só o destino do clique no front (/market/certifications/farm), não permissão.
+   */
+  async notifyFarmCertification(outcome: FarmCertificationOutcome, notices: FarmCertificationNotice[]): Promise<void> {
+    if (notices.length === 0) return;
+    const text = FARM_CERTIFICATION_TEXT[outcome];
+    await this.safely(text.type, () =>
+      this.createMany(
+        notices.map((n) => ({
+          userId: n.userId,
+          type: text.type,
+          title: text.title,
+          message: text.message(n),
+          data: {
+            role: "producer",
+            certificationId: n.certificationId,
+            validUntil: n.validUntil.toISOString(),
+            ...(n.reason ? { reason: n.reason } : {}),
+          },
+          dedupeKey: `${text.type}:${n.dedupeId}`,
+        }))
+      )
+    );
   }
 
   // ─── Lembrete de colheita do anúncio (cron) ──────────────────────────────────
@@ -311,6 +529,69 @@ export class NotificationService {
     });
 
     return this.createMany(inputs);
+  }
+
+  // ─── E-mail das notificações (caixa de saída, notificationEmailJob) ──────────
+
+  /**
+   * Envia por e-mail (texto puro: assunto = título, corpo = mensagem + link para a tela do pedido/anúncio
+   * via buildNotificationLink) as notificações ainda não
+   * enviadas. Toda notificação gravada passa por aqui, então o e-mail segue exatamente as mesmas
+   * regras e a mesma deduplicação das notificações in-app. Como lê só o que já foi commitado, uma
+   * transação de pagamento revertida nunca gera e-mail.
+   * Cada linha é reservada antes do envio (emailSentAt preenchido condicionalmente): execuções
+   * concorrentes não reenviam. Em falha, a reserva é desfeita e o próximo ciclo tenta de novo,
+   * até MAX_EMAIL_ATTEMPTS. Se o processo cair entre a reserva e o envio, aquele e-mail se perde
+   * — preferimos isso a mandar duplicado.
+   */
+  async dispatchPendingEmails(now: Date = new Date()): Promise<number> {
+    const pending = await this.prisma.notification.findMany({
+      where: {
+        emailSentAt: null,
+        emailAttempts: { lt: MAX_EMAIL_ATTEMPTS },
+        createdAt: { gte: new Date(now.getTime() - EMAIL_MAX_AGE_MS) },
+      },
+      orderBy: { createdAt: "asc" },
+      take: EMAIL_BATCH_SIZE,
+      select: {
+        id: true,
+        title: true,
+        message: true,
+        saleId: true,
+        productId: true,
+        data: true,
+        emailAttempts: true,
+        user: { select: { email: true } },
+      },
+    });
+
+    // Sem URL_FRONTEND o e-mail sai só com o texto da notificação.
+    const frontendUrl = process.env.URL_FRONTEND;
+    let sent = 0;
+    for (const notification of pending) {
+      const claimed = await this.prisma.notification.updateMany({
+        where: { id: notification.id, emailSentAt: null, emailAttempts: notification.emailAttempts },
+        data: { emailSentAt: now, emailAttempts: { increment: 1 } },
+      });
+      if (claimed.count === 0) continue;
+
+      const link = frontendUrl ? buildNotificationLink(notification, frontendUrl) : null;
+      try {
+        await this.email.sendMail({
+          to: notification.user.email,
+          subject: notification.title,
+          text: link ? `${notification.message}\n\n${link.label}: ${link.url}` : notification.message,
+        });
+        sent++;
+      } catch (err: unknown) {
+        await this.prisma.notification.update({ where: { id: notification.id }, data: { emailSentAt: null } });
+        logger.error(
+          `[Notifications] falha ao enviar e-mail da notificação ${notification.id} (tentativa ${notification.emailAttempts + 1}/${MAX_EMAIL_ATTEMPTS}):`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+    return sent;
   }
 
   // ─── Consulta e leitura (endpoints) ──────────────────────────────────────────

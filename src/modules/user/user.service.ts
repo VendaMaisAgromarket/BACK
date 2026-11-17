@@ -1,18 +1,119 @@
-import { PrismaClient, User } from "@prisma/client";
+import { Prisma, PrismaClient, User } from "@prisma/client";
 import bcrypt from "bcryptjs";
+import { createHash, randomBytes } from "crypto";
 import { isCPF, isCNPJ, formatToCPF, formatToCNPJ } from "brazilian-values";
 import { AddressService } from "../address/address.service";
 import { UploadS3Service } from "../upload-S3/uploadS3.service";
+import { EmailService, emailService } from "../email/email.service";
+import { NotificationService } from "../notification/notification.service";
+import { logger } from "../../lib/logger";
+
+/** Validade do link de redefinição de senha. */
+export const PASSWORD_RESET_TTL_MINUTES = 30;
+/** Intervalo mínimo entre dois e-mails de redefinição para o mesmo usuário (anti-spam). */
+const PASSWORD_RESET_COOLDOWN_MS = 60_000;
+/** Página do front que recebe o `?token=` e chama POST /user/change-password. */
+const PASSWORD_RESET_FRONT_PATH = "/reset-password";
+
+export const INVALID_RESET_TOKEN_MESSAGE = "Link de redefinição inválido ou expirado.";
+export const WEAK_PASSWORD_MESSAGE =
+  "A senha deve conter pelo menos 8 caracteres, incluindo uma letra maiúscula, uma letra minúscula, um número e um caractere especial.";
+const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
+
+function hashResetToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+/** Rótulos (na ordem em que aparecem na notificação) dos campos do perfil que o usuário altera. */
+const PROFILE_FIELD_LABELS = {
+  name: "nome",
+  phone_number: "telefone",
+  email: "e-mail",
+  cpf: "CPF",
+  cnpj: "CNPJ",
+  ccir: "CCIR",
+} as const;
+
+type ProfileSnapshot = { [K in keyof typeof PROFILE_FIELD_LABELS]: string | null };
+
+/** Erro de dados inválidos na atualização de perfil (vira 400 no controller). */
+export class ProfileUpdateError extends Error {
+  readonly status = 400;
+  constructor(message: string) {
+    super(message);
+    this.name = "ProfileUpdateError";
+  }
+}
+
+/**
+ * Únicos campos que o próprio usuário (ou o admin) altera via PUT /user/:id. Tudo o mais é descartado:
+ * o corpo nunca chega inteiro ao Prisma — campos como role/valid/tokenVersion e, principalmente,
+ * relações (`farmCertifications: { updateMany: … }`, `connect` …) permitiriam ao usuário aprovar a
+ * própria certificação ou tomar a de outro, sem passar pela avaliação nem pelo histórico.
+ * A foto vem pelo arquivo (`img`), e a senha passa pela validação/hash abaixo.
+ */
+const EDITABLE_PROFILE_FIELDS = ["name", "phone_number", "email", "password", "cpf", "cnpj", "ccir"] as const;
+const NULLABLE_PROFILE_FIELDS: ReadonlySet<string> = new Set(["cpf", "cnpj", "ccir"]);
+
+interface EditableProfileData {
+  name?: string;
+  phone_number?: string;
+  email?: string;
+  password?: string;
+  cpf?: string | null;
+  cnpj?: string | null;
+  ccir?: string | null;
+}
+
+function pickEditableProfileFields(data: unknown): EditableProfileData {
+  const body = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+
+  // Escrita aninhada (objeto/array) em qualquer chave é recusada explicitamente, mesmo nas ignoradas.
+  const nested = Object.keys(body).find((key) => body[key] !== null && typeof body[key] === "object");
+  if (nested) throw new ProfileUpdateError(`Campo não permitido na atualização de perfil: ${nested}.`);
+
+  const picked: Record<string, string | null> = {};
+  for (const key of EDITABLE_PROFILE_FIELDS) {
+    const value = body[key];
+    if (value === undefined) continue;
+    if (value === null && NULLABLE_PROFILE_FIELDS.has(key)) {
+      picked[key] = null;
+      continue;
+    }
+    if (typeof value !== "string") throw new ProfileUpdateError(`Valor inválido para ${key}.`);
+    picked[key] = value;
+  }
+  // Os não anuláveis só recebem string (checado acima), então o formato bate com EditableProfileData.
+  return picked as EditableProfileData;
+}
+
+/**
+ * Compara o que vai ser gravado com o que estava salvo: só entra o que de fato muda de valor.
+ * Vazio ("") e null contam como iguais — o formulário reenvia campos opcionais em branco.
+ */
+function changedProfileFields(before: ProfileSnapshot, updateData: Record<string, unknown>, imageChanged: boolean): string[] {
+  const normalize = (value: unknown) => (value === null || value === undefined ? "" : String(value));
+  const fields: string[] = (Object.keys(PROFILE_FIELD_LABELS) as (keyof typeof PROFILE_FIELD_LABELS)[])
+    .filter((key) => updateData[key] !== undefined && normalize(updateData[key]) !== normalize(before[key]))
+    .map((key) => PROFILE_FIELD_LABELS[key]);
+  if (updateData.password !== undefined) fields.push("senha");
+  if (imageChanged) fields.push("foto de perfil");
+  return fields;
+}
 
 export class UserService {
   private readonly prisma: PrismaClient;
   private readonly addressService: AddressService;
   private readonly uploadService: UploadS3Service;
+  private readonly email: EmailService;
+  private readonly notifications: NotificationService;
 
-  constructor(prisma?: PrismaClient) {
+  constructor(prisma?: PrismaClient, email: EmailService = emailService) {
     this.prisma = prisma || new PrismaClient();
     this.addressService = new AddressService();
     this.uploadService = new UploadS3Service(this.prisma);
+    this.email = email;
+    this.notifications = new NotificationService(this.prisma, email);
   }
 
   public async create(data: any): Promise<User> {
@@ -175,7 +276,7 @@ export class UserService {
     return userWithoutPassword;
   }
 
-  public async getAll(): Promise<Omit<User, 'password'>[]> {
+  public async getAll(): Promise<Omit<User, 'password' | 'tokenVersion'>[]> {
     return this.prisma.user.findMany({
       select: {
         id: true,
@@ -218,21 +319,20 @@ export class UserService {
 
   public async update(
     id: string,
-    data: Partial<User>,
+    body: unknown,
     file?: Express.Multer.File
   ): Promise<User> {
+    const data = pickEditableProfileFields(body);
     const user = await this.prisma.user.findUnique({
       where: { id },
-      select: { id: true, email: true, cpf: true, cnpj: true, img: true }
+      select: { id: true, name: true, phone_number: true, email: true, cpf: true, cnpj: true, ccir: true, img: true }
     });
 
     if (!user) {
       throw new Error("Usuário não encontrado.");
     }
 
-    const updateData: any = { ...data };
-    delete updateData.role;
-    delete updateData.valid;
+    const updateData: Prisma.UserUpdateInput = { ...data };
 
     if (data.password) {
       const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
@@ -240,6 +340,8 @@ export class UserService {
         throw new Error("A nova senha não atende aos critérios de segurança.");
       }
       updateData.password = await bcrypt.hash(data.password, 10);
+      // Encerra todas as sessões abertas, inclusive a de quem fez a troca.
+      updateData.tokenVersion = { increment: 1 };
     }
 
     if (data.cpf && data.cpf !== user.cpf) {
@@ -295,21 +397,45 @@ export class UserService {
       updateData.img = publicUrl;
     }
 
+    let updatedUser;
     try {
-      const updatedUser = await this.prisma.user.update({
+      updatedUser = await this.prisma.user.update({
         where: { id },
         data: updateData,
         include: {
           securityQuestions: true,
         },
       });
-
-      const { password: _, ...userWithoutPassword } = updatedUser;
-      return userWithoutPassword as unknown as User;
     } catch (error) {
       console.error("Erro ao atualizar usuário:", error);
       throw error;
     }
+
+    await this.notifications.notifyProfileUpdated(id, changedProfileFields(user, updateData, !!file));
+    if (updatedUser.email !== user.email) {
+      this.notifyPreviousEmail(user.email);
+    }
+
+    const { password: _, ...userWithoutPassword } = updatedUser;
+    return userWithoutPassword as unknown as User;
+  }
+
+  /**
+   * A notificação de perfil vai para o e-mail NOVO; o antigo também precisa saber da troca, senão
+   * quem invadiu a conta troca o e-mail e o dono nunca é avisado. Não revela o endereço novo.
+   */
+  private notifyPreviousEmail(previousEmail: string): void {
+    this.email
+      .sendMail({
+        to: previousEmail,
+        subject: "O e-mail da sua conta foi alterado — Venda+ Agromarket",
+        text:
+          `O e-mail de acesso da sua conta no Venda+ Agromarket foi alterado e este endereço não receberá mais nossos avisos.\n\n` +
+          `Se não foi você, entre em contato com o suporte imediatamente.`,
+      })
+      .catch((err: unknown) => {
+        logger.error("[UserService] falha ao avisar o e-mail anterior sobre a troca de e-mail:", err instanceof Error ? err.message : err);
+      });
   }
 
   private extractKeyFromUrl(url: string): string | null {
@@ -361,5 +487,113 @@ export class UserService {
     if (!user) throw new Error("Usuário não encontrado.");
 
     await this.prisma.user.delete({ where: { id } });
+  }
+
+  // ─── Esqueci minha senha ─────────────────────────────────────────────────────
+
+  /**
+   * Gera um link de uso único e envia por e-mail. Nunca revela se o e-mail existe: quem chama
+   * responde sempre a mesma mensagem, e o envio do e-mail roda em segundo plano para que o tempo
+   * de resposta também não denuncie a existência da conta.
+   */
+  public async sendResetPassword(rawEmail: string, now: Date = new Date()): Promise<void> {
+    const email = rawEmail.trim();
+    if (!email) throw new Error("Campos obrigatórios faltando.");
+
+    const frontendUrl = process.env.URL_FRONTEND;
+    if (!frontendUrl) throw new Error("URL_FRONTEND não configurada.");
+
+    const user = await this.prisma.user.findFirst({
+      where: { email: { equals: email, mode: "insensitive" } },
+      select: { id: true, name: true, email: true },
+    });
+    if (!user) return;
+
+    const recent = await this.prisma.passwordResetToken.findFirst({
+      where: { userId: user.id, createdAt: { gt: new Date(now.getTime() - PASSWORD_RESET_COOLDOWN_MS) } },
+      select: { id: true },
+    });
+    if (recent) return;
+
+    const token = randomBytes(32).toString("base64url");
+    // Um novo pedido invalida os links anteriores ainda não usados.
+    await this.prisma.$transaction([
+      this.prisma.passwordResetToken.updateMany({
+        where: { userId: user.id, usedAt: null },
+        data: { usedAt: now },
+      }),
+      this.prisma.passwordResetToken.create({
+        data: {
+          userId: user.id,
+          tokenHash: hashResetToken(token),
+          expiresAt: new Date(now.getTime() + PASSWORD_RESET_TTL_MINUTES * 60_000),
+        },
+      }),
+    ]);
+
+    const link = `${frontendUrl.replace(/\/+$/, "")}${PASSWORD_RESET_FRONT_PATH}?token=${token}`;
+    this.email
+      .sendMail({
+        to: user.email,
+        subject: "Redefinição de senha — Venda+ Agromarket",
+        text:
+          `Olá, ${user.name}.\n\n` +
+          `Recebemos um pedido para redefinir a senha da sua conta. Para criar uma nova senha, acesse o link abaixo ` +
+          `(válido por ${PASSWORD_RESET_TTL_MINUTES} minutos e de uso único):\n\n${link}\n\n` +
+          `Se você não fez esse pedido, ignore este e-mail: sua senha continua a mesma.`,
+      })
+      .catch((err: unknown) => {
+        logger.error("[UserService] falha ao enviar e-mail de redefinição de senha:", err instanceof Error ? err.message : err);
+      });
+  }
+
+  /** Troca a senha a partir do token do link. O token é consumido na mesma transação da troca. */
+  public async changePassword(token: string, newPassword: string, now: Date = new Date()): Promise<void> {
+    if (!token || !newPassword) throw new Error("Campos obrigatórios faltando.");
+    if (!PASSWORD_REGEX.test(newPassword)) throw new Error(WEAK_PASSWORD_MESSAGE);
+
+    const tokenHash = hashResetToken(token);
+    const resetToken = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      select: { id: true, userId: true, usedAt: true, expiresAt: true },
+    });
+    if (!resetToken || resetToken.usedAt || resetToken.expiresAt <= now) {
+      throw new Error(INVALID_RESET_TOKEN_MESSAGE);
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    const user = await this.prisma.$transaction(async (tx) => {
+      // Reserva condicional: duas requisições simultâneas com o mesmo link não trocam a senha duas vezes.
+      const claimed = await tx.passwordResetToken.updateMany({
+        where: { id: resetToken.id, usedAt: null, expiresAt: { gt: now } },
+        data: { usedAt: now },
+      });
+      if (claimed.count === 0) throw new Error(INVALID_RESET_TOKEN_MESSAGE);
+
+      await tx.passwordResetToken.updateMany({
+        where: { userId: resetToken.userId, usedAt: null },
+        data: { usedAt: now },
+      });
+      return tx.user.update({
+        where: { id: resetToken.userId },
+        // tokenVersion++ derruba os JWTs emitidos antes da troca (ver protectRoute).
+        data: { password: hashedPassword, tokenVersion: { increment: 1 } },
+        select: { name: true, email: true },
+      });
+    });
+
+    this.email
+      .sendMail({
+        to: user.email,
+        subject: "Sua senha foi alterada — Venda+ Agromarket",
+        text:
+          `Olá, ${user.name}.\n\n` +
+          `A senha da sua conta foi alterada. Se não foi você, solicite uma nova redefinição de senha imediatamente ` +
+          `e entre em contato com o suporte.`,
+      })
+      .catch((err: unknown) => {
+        logger.error("[UserService] falha ao enviar e-mail de confirmação de troca de senha:", err instanceof Error ? err.message : err);
+      });
   }
 }

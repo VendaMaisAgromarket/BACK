@@ -143,6 +143,62 @@ router.post("/admin", protectRoute, requireAdmin, controller.createAdminHandler)
 
 /**
  * @swagger
+ * /user/send-reset-password:
+ *   post:
+ *     summary: Envia por e-mail um link de redefinição de senha (válido por 30 minutos, uso único)
+ *     description: Responde sempre a mesma mensagem, exista ou não a conta, para não revelar e-mails cadastrados.
+ *     tags: [User]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [email]
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 example: joao@email.com
+ *     responses:
+ *       200:
+ *         description: Pedido recebido (o e-mail só é enviado se a conta existir)
+ *       400:
+ *         description: E-mail não informado
+ */
+router.post("/send-reset-password", controller.sendResetPasswordHandler);
+
+/**
+ * @swagger
+ * /user/change-password:
+ *   post:
+ *     summary: Define a nova senha usando o token recebido no link do e-mail
+ *     tags: [User]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [token, newPassword]
+ *             properties:
+ *               token:
+ *                 type: string
+ *                 description: Valor do parâmetro `token` do link recebido por e-mail
+ *               newPassword:
+ *                 type: string
+ *                 description: Mínimo 8 caracteres, com maiúscula, minúscula, número e caractere especial
+ *                 example: NovaSenha@123
+ *     responses:
+ *       200:
+ *         description: Senha alterada com sucesso
+ *       400:
+ *         description: Link inválido/expirado, senha fraca ou campos faltando
+ */
+router.post("/change-password", controller.changePasswordHandler);
+
+/**
+ * @swagger
  * /user:
  *   get:
  *     summary: Lista todos os usuários (somente admin)

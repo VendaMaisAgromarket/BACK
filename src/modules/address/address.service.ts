@@ -1,5 +1,27 @@
 import { PrismaClient } from "@prisma/client";
+import { NotificationService } from "../notification/notification.service";
 const prisma = new PrismaClient();
+const notifications = new NotificationService(prisma);
+
+/** Campos editáveis do endereço (fora `default`, que tem notificação própria). */
+const ADDRESS_FIELDS = [
+  "addressee",
+  "phone_number_addressee",
+  "alias",
+  "street",
+  "number",
+  "complement",
+  "referencePoint",
+  "cep",
+  "uf",
+  "city",
+] as const;
+
+/** Vazio ("") e null contam como iguais — o formulário reenvia campos opcionais em branco. */
+function sameValue(a: unknown, b: unknown): boolean {
+  const normalize = (value: unknown) => (value === null || value === undefined ? "" : String(value));
+  return normalize(a) === normalize(b);
+}
 
 /** Normaliza valores vindos do payload (boolean, ou string "true"/"false") para um boolean real. */
 function toBoolean(value: unknown): boolean {
@@ -21,7 +43,7 @@ export class AddressService {
       await prisma.address.updateMany({ where: { userId }, data: { default: false } });
     }
 
-    return prisma.address.create({
+    const address = await prisma.address.create({
       data: {
         userId,
         addressee: data.addressee,
@@ -37,6 +59,8 @@ export class AddressService {
         default: isDefault,
       },
     });
+    await notifications.notifyAddressChanged(userId, "created", address);
+    return address;
   }
 
   async findById(addressId: string) {
@@ -70,7 +94,16 @@ export class AddressService {
       ...(isDefault !== undefined && { default: isDefault }),
     };
 
-    return prisma.address.update({ where: { id: addressId }, data: updateData });
+    const address = await prisma.address.update({ where: { id: addressId }, data: updateData });
+
+    // O formulário reenvia o endereço inteiro: só notifica o que de fato mudou de valor.
+    const fieldsChanged = ADDRESS_FIELDS.some((field) => data[field] !== undefined && !sameValue(data[field], existing[field]));
+    if (fieldsChanged) {
+      await notifications.notifyAddressChanged(existing.userId, "updated", address);
+    } else if (isDefault && !existing.default) {
+      await notifications.notifyAddressChanged(existing.userId, "default", address);
+    }
+    return address;
   }
 
   async deleteAddress(addressId: string) {
@@ -79,7 +112,9 @@ export class AddressService {
     if (address.default) {
       throw new Error("Não é possível deletar o endereço padrão. Por favor, defina outro endereço como padrão antes de excluir.");
     }
-    return prisma.address.delete({ where: { id: addressId } });
+    const deleted = await prisma.address.delete({ where: { id: addressId } });
+    await notifications.notifyAddressChanged(address.userId, "deleted", address);
+    return deleted;
   }
 
   async listUserAddresses(userId: string) {
@@ -96,6 +131,8 @@ export class AddressService {
       throw new Error("Endereço não encontrado para este usuário.");
     }
     await prisma.address.updateMany({ where: { userId }, data: { default: false } });
-    return prisma.address.update({ where: { id: addressId }, data: { default: true } });
+    const updated = await prisma.address.update({ where: { id: addressId }, data: { default: true } });
+    if (!address.default) await notifications.notifyAddressChanged(userId, "default", updated);
+    return updated;
   }
 }
