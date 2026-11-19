@@ -1,9 +1,7 @@
 import { Router, Request, Response, NextFunction, RequestHandler } from "express";
-import multer from "multer";
 import { protectRoute, requireAdmin } from "../../middlewares/auth.middleware";
-import { CertificationError } from "./certification.errors";
 import { FarmCertificationController } from "./farmCertification.controller";
-import { MAX_FILES_PER_UPLOAD } from "./farmCertification.service";
+import { uploadCertificationDocumentsMiddleware } from "./certificationUpload.middleware";
 
 const router = Router();
 const controller = new FarmCertificationController();
@@ -13,36 +11,7 @@ const wrap =
     (req: Request, res: Response, next: NextFunction) =>
       Promise.resolve(fn(req, res)).catch(next);
 
-const ALLOWED_MIME_TYPES = ["application/pdf", "image/jpeg", "image/png", "image/webp"];
-const MAX_FILE_SIZE_MB = 10;
-
-const multerDocuments = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_FILE_SIZE_MB * 1024 * 1024, files: MAX_FILES_PER_UPLOAD },
-  fileFilter: (_req, file, cb) => {
-    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) cb(null, true);
-    else cb(new CertificationError(400, "Formato não permitido: envie PDF, JPG, PNG ou WEBP."));
-  },
-}).array("documents", MAX_FILES_PER_UPLOAD);
-
-/** Erros do multer (arquivo grande demais, arquivos demais) viram 400 em vez de 500. */
-const uploadDocuments: RequestHandler = (req, res, next) =>
-  multerDocuments(req, res, (err?: unknown) => {
-    if (err instanceof multer.MulterError) {
-      // LIMIT_UNEXPECTED_FILE também é o que o multer devolve quando passa do limite no campo certo.
-      const unexpectedField = err.code === "LIMIT_UNEXPECTED_FILE" && err.field && err.field !== "documents";
-      const message =
-        err.code === "LIMIT_FILE_SIZE"
-          ? `Cada arquivo pode ter no máximo ${MAX_FILE_SIZE_MB} MB.`
-          : unexpectedField
-            ? `Campo de arquivo "${err.field}" não reconhecido: envie os arquivos no campo "documents".`
-            : err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE"
-              ? `Envie no máximo ${MAX_FILES_PER_UPLOAD} arquivos por vez.`
-              : "Falha no envio dos arquivos.";
-      return next(new CertificationError(400, message));
-    }
-    next(err);
-  });
+const uploadDocuments = uploadCertificationDocumentsMiddleware;
 
 /**
  * @swagger

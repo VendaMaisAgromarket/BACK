@@ -40,6 +40,12 @@ enum NotificationType {
   FARM_CERTIFICATION_REVOKED // produtor: certificação aprovada foi revogada por um admin
   FARM_CERTIFICATION_EXPIRING // produtor: certificação aprovada vence em breve
   FARM_CERTIFICATION_EXPIRED // produtor: certificação venceu e o selo saiu do ar
+  HARVEST_CERTIFICATION_SUBMITTED // admins: certificação de safra enviada/reenviada para avaliação
+  HARVEST_CERTIFICATION_APPROVED // dono: certificação de safra aprovada (selo nos anúncios vinculados)
+  HARVEST_CERTIFICATION_REJECTED // dono: certificação de safra recusada (data.reason traz o motivo)
+  HARVEST_CERTIFICATION_REVOKED // dono: certificação de safra aprovada foi revogada por um admin
+  HARVEST_CERTIFICATION_EXPIRING // dono: certificação de safra aprovada vence em breve
+  HARVEST_CERTIFICATION_EXPIRED // dono: certificação de safra venceu e o selo saiu dos anúncios
 }
 
 /// Lista fechada de certificações de fazenda aceitas (o produtor escolhe, não digita).
@@ -49,6 +55,21 @@ enum FarmCertificationType {
   RAINFOREST_ALLIANCE // Rainforest Alliance
   FAIR_TRADE // Fair Trade
   OTHER // Outra (o admin confere pelo documento)
+}
+
+/// Lista fechada de certificações de safra/produto aceitas.
+enum HarvestCertificationType {
+  TRACEABILITY // Rastreabilidade
+  RESIDUE_ANALYSIS // Análise de resíduos (agrotóxicos)
+  ORGANIC // Orgânico
+  GLOBALGAP // GlobalG.A.P.
+  OTHER // Outra (o admin confere pelo documento)
+}
+
+/// Unidade da produção estimada da safra.
+enum HarvestProductionUnit {
+  KG
+  TON
 }
 
 /// UPLOADED = o produtor já tinha o certificado e enviou; PURCHASED = adquirido pela plataforma (fluxo de compra futuro).
@@ -129,6 +150,11 @@ model User {
   reviewedFarmCertifications FarmCertification[]         @relation("FarmCertificationReviewer")
   certificationDocuments     FarmCertificationDocument[]
   certificationEvents        FarmCertificationEvent[]
+
+  harvestCertifications         HarvestCertification[]         @relation("HarvestCertificationOwner")
+  reviewedHarvestCertifications HarvestCertification[]         @relation("HarvestCertificationReviewer")
+  harvestCertificationDocuments HarvestCertificationDocument[]
+  harvestCertificationEvents    HarvestCertificationEvent[]
 }
 
 /// Certificação da fazenda de um produtor. Selo ativo = APPROVED e validUntil >= hoje (Brasília):
@@ -224,6 +250,99 @@ model FarmCertificationEvent {
   @@index([certificationId, createdAt])
 }
 
+/// Certificação de uma safra (lote/talhão de uma cultura num ano agrícola). Vale para vários anúncios
+/// do mesmo dono durante a vigência: os anúncios apontam para ela (Product.harvestCertificationId).
+/// Selo ativo = APPROVED e validUntil >= hoje (Brasília), mesmo antes do job marcar EXPIRED.
+/// Datas de calendário (plantio, colheita, emissão, validade) são gravadas como o início do dia em Brasília.
+model HarvestCertification {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+
+  // Safra
+  harvestSeason       String                @map("harvest_season") // ano agrícola, ex.: "2026/27"
+  crop                String // cultura, ex.: "Tomate"
+  variety             String?
+  plotIdentifier      String                @map("plot_identifier") // talhão/lote
+  plantedAreaHectares Decimal               @map("planted_area_hectares") @db.Decimal(12, 2)
+  estimatedProduction Decimal               @map("estimated_production") @db.Decimal(14, 2)
+  productionUnit      HarvestProductionUnit @map("production_unit")
+  plantingDate        DateTime              @map("planting_date")
+  harvestDate         DateTime              @map("harvest_date")
+
+  // Certificado
+  type              HarvestCertificationType
+  certifierName     String                   @map("certifier_name")
+  certifierCnpj     String                   @map("certifier_cnpj")
+  certificateNumber String                   @map("certificate_number")
+  issuedAt          DateTime                 @map("issued_at")
+  validUntil        DateTime                 @map("valid_until")
+
+  origin   CertificationOrigin @default(UPLOADED)
+  status   CertificationStatus @default(PENDING)
+  /// Versão dos dados (mesma regra da fazenda): +1 a cada reenvio; token de compare-and-set da avaliação.
+  revision Int                 @default(0)
+
+  reviewedById    String?   @map("reviewed_by_id")
+  reviewedAt      DateTime? @map("reviewed_at")
+  rejectionReason String?   @map("rejection_reason")
+  reviewNotes     String?   @map("review_notes")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user       User                           @relation("HarvestCertificationOwner", fields: [userId], references: [id])
+  reviewedBy User?                          @relation("HarvestCertificationReviewer", fields: [reviewedById], references: [id])
+  documents  HarvestCertificationDocument[]
+  events     HarvestCertificationEvent[]
+  products   Product[]
+  // NOTA: existe um índice único PARCIAL e case-insensitive (user_id, type, lower(certificate_number))
+  // WHERE status IN ('PENDING','APPROVED'), criado via SQL manual na migration add_harvest_certification
+  // (mesma regra da fazenda). Não representável no schema do Prisma; não remover essa migration.
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+  @@index([status, validUntil])
+}
+
+/// Laudo/documento da certificação de safra no S3 (privado: acesso só por URL assinada, dono e admins).
+model HarvestCertificationDocument {
+  id              String                    @id @default(uuid())
+  certificationId String                    @map("certification_id")
+  docType         CertificationDocumentType @default(CERTIFICATE) @map("doc_type")
+  s3Key           String                    @map("s3_key")
+  originalName    String                    @map("original_name")
+  mimeType        String                    @map("mime_type")
+  sizeBytes       Int                       @map("size_bytes")
+  uploadedById    String                    @map("uploaded_by_id")
+  uploadedAt      DateTime                  @default(now()) @map("uploaded_at")
+
+  certification HarvestCertification        @relation(fields: [certificationId], references: [id], onDelete: Cascade)
+  uploadedBy    User                        @relation(fields: [uploadedById], references: [id])
+  events        HarvestCertificationEvent[]
+
+  @@index([certificationId])
+}
+
+/// Histórico (só inserção) da certificação de safra.
+model HarvestCertificationEvent {
+  id              String                   @id @default(uuid())
+  certificationId String                   @map("certification_id")
+  action          CertificationEventAction
+  fromStatus      CertificationStatus?     @map("from_status")
+  toStatus        CertificationStatus      @map("to_status")
+  /// null = ação do sistema (ex.: job de vencimento)
+  actorId         String?                  @map("actor_id")
+  documentId      String?                  @map("document_id")
+  note            String?
+  createdAt       DateTime                 @default(now()) @map("created_at")
+
+  certification HarvestCertification          @relation(fields: [certificationId], references: [id], onDelete: Cascade)
+  actor         User?                         @relation(fields: [actorId], references: [id])
+  document      HarvestCertificationDocument? @relation(fields: [documentId], references: [id])
+
+  @@index([certificationId, createdAt])
+}
+
 /// Link de "esqueci minha senha". Guarda só o hash SHA-256 do token (o token em claro existe
 /// apenas no e-mail enviado). Uso único: `usedAt` preenchido invalida o link.
 model PasswordResetToken {
@@ -271,29 +390,34 @@ model SecurityQuestions {
 }
 
 model Product {
-  id               String   @id @default(uuid())
-  sellerId         String
-  name             String
-  category         String
-  variety          String
-  stock            Int
-  description      String
-  images_Path      String[]
-  harvestAt        DateTime
-  productRating    Float
-  amountSold       Int
-  isNegotiable     Boolean
-  ratingAmount     Int
-  ratingStarAmount Float[]
-  createdAt        DateTime
-  status           Boolean  @default(true)
+  id                     String   @id @default(uuid())
+  sellerId               String
+  name                   String
+  category               String
+  variety                String
+  stock                  Int
+  description            String
+  images_Path            String[]
+  harvestAt              DateTime
+  productRating          Float
+  amountSold             Int
+  isNegotiable           Boolean
+  ratingAmount           Int
+  ratingStarAmount       Float[]
+  createdAt              DateTime
+  status                 Boolean  @default(true)
+  /// Certificação de safra vinculada ao anúncio (opcional; vínculo só pelas rotas de certificação).
+  harvestCertificationId String?
 
-  seller             User                 @relation(fields: [sellerId], references: [id])
-  sellingUnitProduct SellingUnitProduct[]
-  boughtProducts     BoughtProduct[]
-  questions          Question[]
-  CartItem           CartItem[]
-  notifications      Notification[]
+  seller               User                  @relation(fields: [sellerId], references: [id])
+  harvestCertification HarvestCertification? @relation(fields: [harvestCertificationId], references: [id], onDelete: SetNull)
+  sellingUnitProduct   SellingUnitProduct[]
+  boughtProducts       BoughtProduct[]
+  questions            Question[]
+  CartItem             CartItem[]
+  notifications        Notification[]
+
+  @@index([harvestCertificationId])
 }
 
 model SellerStats {

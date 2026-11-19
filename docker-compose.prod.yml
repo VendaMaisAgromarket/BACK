@@ -1,6 +1,9 @@
 services:
   app:
     image: ghcr.io/vendamaisagro/back:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
     container_name: vendamais_backend
     env_file:
       - .env
