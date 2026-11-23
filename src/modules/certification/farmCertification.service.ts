@@ -12,6 +12,21 @@ import { NotificationService } from "../notification/notification.service";
 import { UploadS3Service } from "../upload-S3/uploadS3.service";
 import { CertificationError, CertificationRequester } from "./certification.errors";
 import {
+  activeCertificationFilter,
+  canOwnCertification,
+  discardCertificationUploads,
+  DOCUMENT_URL_TTL_SECONDS,
+  DUPLICATE_MESSAGE,
+  EXPIRING_REMINDER_DAYS,
+  isBadgeActive,
+  isUniqueViolation,
+  MAX_DOCUMENTS_PER_CERTIFICATION,
+  MAX_FILES_PER_UPLOAD,
+  OPEN_STATUSES,
+  primaryDocumentId,
+  uploadCertificationDocuments,
+} from "./certification.shared";
+import {
   approveSchema,
   FarmCertificationInput,
   farmCertificationInputSchema,
@@ -22,29 +37,11 @@ import {
   revokeSchema,
 } from "./farmCertification.schema";
 
-/** Arquivos por envio (criação ou reenvio) e no total da certificação. */
-export const MAX_FILES_PER_UPLOAD = 5;
-export const MAX_DOCUMENTS_PER_CERTIFICATION = 15;
-/** Quantos dias antes do vencimento o produtor é avisado. */
-export const EXPIRING_REMINDER_DAYS = 30;
-/** Validade da URL assinada de um documento. */
-export const DOCUMENT_URL_TTL_SECONDS = 600;
+// Limites e regras comuns ficam em certification.shared.ts; re-exportados para quem já importava daqui.
+export { DOCUMENT_URL_TTL_SECONDS, EXPIRING_REMINDER_DAYS, MAX_DOCUMENTS_PER_CERTIFICATION, MAX_FILES_PER_UPLOAD };
 
 const DAY_MS = 86_400_000;
 const DEFAULT_PAGE_SIZE = 20;
-
-/** Certificações que ainda "ocupam a vaga": impedem enviar outra igual. */
-const OPEN_STATUSES: CertificationStatus[] = [CertificationStatus.PENDING, CertificationStatus.APPROVED];
-
-const DUPLICATE_MESSAGE = "Este certificado já foi enviado e está pendente ou aprovado.";
-
-/**
- * Violação do índice único parcial de certificado aberto (FarmCertification_open_certificate_unique):
- * dois envios simultâneos do mesmo certificado passam pela checagem prévia, mas só um grava.
- */
-function isUniqueViolation(err: unknown): boolean {
-  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
-}
 
 /**
  * Dados gravados a partir do formulário. CCIR/CAR ausentes viram `null` explícito: o reenvio substitui
@@ -54,18 +51,12 @@ function certificationData(input: FarmCertificationInput) {
   return { ...input, ccir: input.ccir ?? null, car: input.car ?? null };
 }
 
-/**
- * Quem pode ter (enviar, corrigir, listar) certificação de fazenda: qualquer usuário autenticado que não
- * seja admin. Na plataforma o mesmo usuário compra e vende — um `buyer` também anuncia produtos e pode
- * ter fazenda certificada. Admin só avalia (não envia certificação para si).
- */
-export function canOwnFarmCertification(role: string | null | undefined): boolean {
-  return Boolean(role) && role !== "admin";
-}
+/** Quem pode ter certificação de fazenda (regra comum: qualquer usuário autenticado que não seja admin). */
+export const canOwnFarmCertification = canOwnCertification;
 
 /** Filtro do selo ativo: aprovada e dentro da validade (calendário de Brasília). */
 export function activeFarmCertificationWhere(now: Date = new Date()): Prisma.FarmCertificationWhereInput {
-  return { status: CertificationStatus.APPROVED, validUntil: { gte: startOfTodayInBrasilia(now) } };
+  return activeCertificationFilter(now);
 }
 
 /** Select aninhado do selo para incluir junto do vendedor (produtos, perfil). Só dados não sensíveis. */
@@ -99,14 +90,6 @@ const eventSelect = {
   document: { select: { id: true, docType: true, originalName: true } },
 } satisfies Prisma.FarmCertificationEventSelect;
 
-type UploadedDocument = {
-  id: string;
-  docType: CertificationDocumentType;
-  s3Key: string;
-  originalName: string;
-  mimeType: string;
-  sizeBytes: number;
-};
 
 type ReviewAction = "approve" | "reject" | "revoke";
 
@@ -145,7 +128,7 @@ export class FarmCertificationService {
 
     const certificationId = randomUUID();
     const eventId = randomUUID();
-    const documents = await this.uploadDocuments(certificationId, files, docTypes);
+    const documents = await uploadCertificationDocuments(this.uploads, `certifications/farm/${certificationId}`, files, docTypes);
 
     try {
       await this.prisma.$transaction(async (tx) => {
@@ -165,12 +148,12 @@ export class FarmCertificationService {
             fromStatus: null,
             toStatus: CertificationStatus.PENDING,
             actorId: owner.id,
-            documentId: this.primaryDocumentId(documents),
+            documentId: primaryDocumentId(documents),
           },
         });
       });
     } catch (err: unknown) {
-      await this.discardUploads(documents);
+      await discardCertificationUploads(this.uploads, documents);
       if (isUniqueViolation(err)) throw new CertificationError(409, DUPLICATE_MESSAGE);
       throw err;
     }
@@ -219,7 +202,7 @@ export class FarmCertificationService {
     await this.assertNotDuplicate(owner.id, input, certificationId);
 
     const eventId = randomUUID();
-    const documents = await this.uploadDocuments(certificationId, files, docTypes);
+    const documents = await uploadCertificationDocuments(this.uploads, `certifications/farm/${certificationId}`, files, docTypes);
 
     try {
       await this.prisma.$transaction(async (tx) => {
@@ -258,12 +241,12 @@ export class FarmCertificationService {
             fromStatus: current.status,
             toStatus: CertificationStatus.PENDING,
             actorId: owner.id,
-            documentId: this.primaryDocumentId(documents),
+            documentId: primaryDocumentId(documents),
           },
         });
       });
     } catch (err: unknown) {
-      await this.discardUploads(documents);
+      await discardCertificationUploads(this.uploads, documents);
       if (isUniqueViolation(err)) throw new CertificationError(409, DUPLICATE_MESSAGE);
       throw err;
     }
@@ -286,7 +269,7 @@ export class FarmCertificationService {
       orderBy: { createdAt: "desc" },
       include: { documents: { select: documentSelect, orderBy: { uploadedAt: "asc" } } },
     });
-    return rows.map((row) => ({ ...row, badgeActive: this.isBadgeActive(row, now) }));
+    return rows.map((row) => ({ ...row, badgeActive: isBadgeActive(row, now) }));
   }
 
   /** Detalhe com documentos e histórico. Dono ou admin; para os demais, 404. */
@@ -306,7 +289,7 @@ export class FarmCertificationService {
     }
     // Os dados de contato do dono só interessam ao admin que avalia.
     const { user, ...rest } = row;
-    return { ...rest, ...(isAdmin ? { user } : {}), badgeActive: this.isBadgeActive(row, now) };
+    return { ...rest, ...(isAdmin ? { user } : {}), badgeActive: isBadgeActive(row, now) };
   }
 
   /** URL temporária para baixar/visualizar um documento (dono ou admin). */
@@ -581,55 +564,5 @@ export class FarmCertificationService {
     if (duplicate) {
       throw new CertificationError(409, DUPLICATE_MESSAGE);
     }
-  }
-
-  /** Sobe os arquivos para o S3; se algum falhar, remove os que subiram e aborta. */
-  private async uploadDocuments(
-    certificationId: string,
-    files: Express.Multer.File[],
-    docTypes: CertificationDocumentType[]
-  ): Promise<UploadedDocument[]> {
-    const prefix = `certifications/farm/${certificationId}`;
-    const results = await Promise.allSettled(files.map((file) => this.uploads.upload(file, prefix)));
-
-    const documents: UploadedDocument[] = [];
-    results.forEach((result, index) => {
-      if (result.status !== "fulfilled") return;
-      const file = files[index];
-      documents.push({
-        id: randomUUID(),
-        docType: docTypes[index],
-        s3Key: result.value.key,
-        originalName: file.originalname,
-        mimeType: file.mimetype,
-        sizeBytes: file.size,
-      });
-    });
-
-    if (documents.length !== files.length) {
-      await this.discardUploads(documents);
-      throw new CertificationError(502, "Falha ao enviar os documentos. Tente novamente.");
-    }
-    return documents;
-  }
-
-  /** Rollback de arquivos que este envio acabou de subir e não chegaram a ser gravados. */
-  private async discardUploads(documents: UploadedDocument[]) {
-    await Promise.allSettled(
-      documents.map((doc) =>
-        this.uploads.deleteModuleOwnedUpload(doc.s3Key).catch((err: unknown) => {
-          logger.error(`[FarmCertification] arquivo órfão no S3 (${doc.s3Key}):`, err instanceof Error ? err.message : err);
-        })
-      )
-    );
-  }
-
-  private primaryDocumentId(documents: UploadedDocument[]): string | null {
-    const certificate = documents.find((doc) => doc.docType === CertificationDocumentType.CERTIFICATE);
-    return (certificate ?? documents[0])?.id ?? null;
-  }
-
-  private isBadgeActive(cert: { status: CertificationStatus; validUntil: Date }, now: Date): boolean {
-    return cert.status === CertificationStatus.APPROVED && cert.validUntil >= startOfTodayInBrasilia(now);
   }
 }

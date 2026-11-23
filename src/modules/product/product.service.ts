@@ -4,6 +4,7 @@ import { logger } from "../../lib/logger";
 import { startOfTodayInBrasilia } from "../../lib/brasiliaTime";
 import { ProductError, ProductRequester } from "./product.errors";
 import { sellerFarmBadgeSelect } from "../certification/farmCertification.service";
+import { productHarvestBadgeSelect, withHarvestBadge } from "../certification/harvestCertification.service";
 
 export type ProductStatusFilter = "active" | "inactive" | "all";
 
@@ -119,15 +120,17 @@ export class ProductService {
     if (name) where.name = { contains: name, mode: "insensitive" };
     if (category) where.category = { equals: category, mode: "insensitive" };
 
-    return this.prisma.product.findMany({
+    const products = await this.prisma.product.findMany({
       where,
       include: {
         sellingUnitProduct: { include: { unit: true } },
         boughtProducts: true,
         questions: true,
         seller: { select: { id: true, name: true, phone_number: true, email: true, farmCertifications: sellerFarmBadgeSelect() } },
+        harvestCertification: productHarvestBadgeSelect,
       },
     });
+    return products.map((product) => withHarvestBadge(product));
   }
 
   // Produtos mais vendidos do market, por número de vendas efetivadas (pedidos distintos).
@@ -162,9 +165,10 @@ export class ProductService {
       include: {
         sellingUnitProduct: { include: { unit: true } },
         seller: { select: { id: true, name: true, farmCertifications: sellerFarmBadgeSelect() } },
+        harvestCertification: productHarvestBadgeSelect,
       },
     });
-    const byId = new Map(products.map((p) => [p.id, p]));
+    const byId = new Map(products.map((p) => [p.id, withHarvestBadge(p)]));
 
     return topIds
       .filter((id) => byId.has(id))
@@ -181,27 +185,31 @@ export class ProductService {
     if (name) where.name = { contains: name, mode: "insensitive" };
     if (category) where.category = { contains: category, mode: "insensitive" };
 
-    return this.prisma.product.findMany({
+    const products = await this.prisma.product.findMany({
       where,
       include: {
         sellingUnitProduct: { include: { unit: true } },
         boughtProducts: true,
         questions: true,
         seller: { select: { id: true, name: true, phone_number: true, email: true, farmCertifications: sellerFarmBadgeSelect() } },
+        harvestCertification: productHarvestBadgeSelect,
       },
     });
+    return products.map((product) => withHarvestBadge(product));
   }
 
   async getById(id: string, statusFilter: ProductStatusFilter = "active") {
-    return this.prisma.product.findFirst({
+    const product = await this.prisma.product.findFirst({
       where: { id, ...productStatusWhere(statusFilter) },
       include: {
         sellingUnitProduct: { include: { unit: true } },
         boughtProducts: true,
         questions: true,
         seller: { select: { id: true, name: true, phone_number: true, email: true, farmCertifications: sellerFarmBadgeSelect() } },
+        harvestCertification: productHarvestBadgeSelect,
       },
     });
+    return product ? withHarvestBadge(product) : null;
   }
 
   async update(
