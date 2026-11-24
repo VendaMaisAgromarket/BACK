@@ -215,6 +215,10 @@ describe('HarvestCertificationService', () => {
         status: CertificationStatus.PENDING,
         revision: 2,
         validUntil: date('2027-03-31'),
+        certifierName: 'Certificadora X',
+        certifierCnpj: '11.222.333/0001-81',
+        certificateNumber: 'N-1',
+        issuedAt: date('2026-01-10'),
         documents: [{ id: 'doc-cert', docType: CertificationDocumentType.CERTIFICATE }],
         ...overrides,
       } as never);
@@ -412,6 +416,7 @@ describe('HarvestCertificationService', () => {
         validUntil: date('2027-03-31'),
         products: [{ id: PRODUCT_ID }],
         user: { id: OWNER.userId, cpf: '1' },
+        events: [],
       } as never);
       const own = await service.getById(OWNER, CERT_ID, NOW);
       expect(own).not.toHaveProperty('user');

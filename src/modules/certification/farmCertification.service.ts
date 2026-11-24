@@ -11,8 +11,17 @@ import { logger } from "../../lib/logger";
 import { NotificationService } from "../notification/notification.service";
 import { UploadS3Service } from "../upload-S3/uploadS3.service";
 import { CertificationError, CertificationRequester } from "./certification.errors";
+import { historyQuerySchema } from "./certification.schema";
 import {
   activeCertificationFilter,
+  actorFields,
+  approvalSummary,
+  certificateSnapshot,
+  documentAddedEvents,
+  historyEventSelect,
+  SYSTEM_ACTOR,
+  toHistoryEvent,
+  userActor,
   canOwnCertification,
   discardCertificationUploads,
   DOCUMENT_URL_TTL_SECONDS,
@@ -79,18 +88,6 @@ const documentSelect = {
   uploadedBy: { select: { id: true, name: true } },
 } satisfies Prisma.FarmCertificationDocumentSelect;
 
-const eventSelect = {
-  id: true,
-  action: true,
-  fromStatus: true,
-  toStatus: true,
-  note: true,
-  createdAt: true,
-  actor: { select: { id: true, name: true, role: true } },
-  document: { select: { id: true, docType: true, originalName: true } },
-} satisfies Prisma.FarmCertificationEventSelect;
-
-
 type ReviewAction = "approve" | "reject" | "revoke";
 
 const REVIEW_TRANSITION: Record<
@@ -147,9 +144,15 @@ export class FarmCertificationService {
             action: CertificationEventAction.SUBMITTED,
             fromStatus: null,
             toStatus: CertificationStatus.PENDING,
-            actorId: owner.id,
+            ...actorFields(userActor(owner)),
+            revision: 0,
             documentId: primaryDocumentId(documents),
+            details: certificateSnapshot(input),
+            createdAt: now,
           },
+        });
+        await tx.farmCertificationEvent.createMany({
+          data: documentAddedEvents(certificationId, documents, userActor(owner), 0, now),
         });
       });
     } catch (err: unknown) {
@@ -240,10 +243,18 @@ export class FarmCertificationService {
             action: CertificationEventAction.RESUBMITTED,
             fromStatus: current.status,
             toStatus: CertificationStatus.PENDING,
-            actorId: owner.id,
+            ...actorFields(userActor(owner)),
+            revision: current.revision + 1,
             documentId: primaryDocumentId(documents),
+            details: certificateSnapshot(input),
+            createdAt: now,
           },
         });
+        if (documents.length > 0) {
+          await tx.farmCertificationEvent.createMany({
+            data: documentAddedEvents(certificationId, documents, userActor(owner), current.revision + 1, now),
+          });
+        }
       });
     } catch (err: unknown) {
       await discardCertificationUploads(this.uploads, documents);
@@ -279,7 +290,7 @@ export class FarmCertificationService {
       where: { id: certificationId },
       include: {
         documents: { select: documentSelect, orderBy: { uploadedAt: "asc" } },
-        events: { select: eventSelect, orderBy: { createdAt: "asc" } },
+        events: { select: historyEventSelect, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
         reviewedBy: { select: { id: true, name: true } },
         user: { select: { id: true, name: true, email: true, phone_number: true, cpf: true, cnpj: true, ccir: true } },
       },
@@ -288,8 +299,14 @@ export class FarmCertificationService {
       throw new CertificationError(404, "Certificação não encontrada.");
     }
     // Os dados de contato do dono só interessam ao admin que avalia.
-    const { user, ...rest } = row;
-    return { ...rest, ...(isAdmin ? { user } : {}), badgeActive: isBadgeActive(row, now) };
+    const { user, events, ...rest } = row;
+    return {
+      ...rest,
+      ...(isAdmin ? { user } : {}),
+      events: events.map(toHistoryEvent),
+      approval: approvalSummary(events, row),
+      badgeActive: isBadgeActive(row, now),
+    };
   }
 
   /** URL temporária para baixar/visualizar um documento (dono ou admin). */
@@ -344,6 +361,45 @@ export class FarmCertificationService {
     return { items, nextCursor: hasMore ? items[items.length - 1].id : null };
   }
 
+  /**
+   * Histórico (admin): eventos de todas as certificações de fazenda, dos mais recentes para os mais
+   * antigos. Cada item traz quem fez, qual documento, a revisão, o retrato dos dados e um resumo da
+   * certificação (dono, certificadora). Filtros: ação, certificação, autor e período (dias de Brasília).
+   */
+  async listHistory(query: unknown) {
+    const params = parseOrThrow(historyQuerySchema, query);
+    const limit = params.limit ?? 50;
+    const where: Prisma.FarmCertificationEventWhereInput = {
+      ...(params.action && { action: params.action }),
+      ...(params.certificationId && { certificationId: params.certificationId }),
+      ...(params.actorId && { actorId: params.actorId }),
+      ...((params.from || params.to) && {
+        createdAt: {
+          ...(params.from && { gte: params.from }),
+          ...(params.to && { lt: new Date(params.to.getTime() + DAY_MS) }),
+        },
+      }),
+    };
+
+    const rows = await this.prisma.farmCertificationEvent.findMany({
+      where,
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
+      ...(params.cursor && { cursor: { id: params.cursor }, skip: 1 }),
+      select: {
+        ...historyEventSelect,
+        certification: { select: { id: true, type: true, status: true, farmName: true, city: true, uf: true, certifierName: true, certifierCnpj: true, certificateNumber: true, user: { select: { id: true, name: true } } } },
+      },
+    });
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return {
+      items: page.map(({ certification, ...event }) => ({ ...toHistoryEvent(event), certification })),
+      nextCursor: hasMore ? page[page.length - 1].id : null,
+    };
+  }
+
   async approve(admin: CertificationRequester, certificationId: string, body: unknown, now: Date = new Date()) {
     const { revision, documentId, notes } = parseOrThrow(approveSchema, body);
     return this.review("approve", admin, certificationId, { revision, documentId, notes }, now);
@@ -365,7 +421,7 @@ export class FarmCertificationService {
   async expireOverdue(now: Date = new Date()): Promise<number> {
     const overdue = await this.prisma.farmCertification.findMany({
       where: { status: CertificationStatus.APPROVED, validUntil: { lt: startOfTodayInBrasilia(now) } },
-      select: { id: true, userId: true, farmName: true, validUntil: true },
+      select: { id: true, userId: true, farmName: true, validUntil: true, revision: true },
     });
 
     let expired = 0;
@@ -385,7 +441,9 @@ export class FarmCertificationService {
               action: CertificationEventAction.EXPIRED,
               fromStatus: CertificationStatus.APPROVED,
               toStatus: CertificationStatus.EXPIRED,
-              actorId: null,
+              ...actorFields(SYSTEM_ACTOR),
+              revision: cert.revision,
+              createdAt: now,
               note: `Validade encerrada em ${brasiliaDateKey(cert.validUntil)}.`,
             },
           });
@@ -414,7 +472,7 @@ export class FarmCertificationService {
         status: CertificationStatus.APPROVED,
         validUntil: { gte: new Date(today.getTime() + DAY_MS), lt: new Date(today.getTime() + (EXPIRING_REMINDER_DAYS + 1) * DAY_MS) },
       },
-      select: { id: true, userId: true, farmName: true, validUntil: true },
+      select: { id: true, userId: true, farmName: true, validUntil: true, revision: true },
     });
     await this.notifications.notifyFarmCertification(
       "EXPIRING",
@@ -450,6 +508,10 @@ export class FarmCertificationService {
         status: true,
         revision: true,
         validUntil: true,
+        certifierName: true,
+        certifierCnpj: true,
+        certificateNumber: true,
+        issuedAt: true,
         documents: { select: { id: true, docType: true }, orderBy: { uploadedAt: "desc" } },
       },
     });
@@ -479,6 +541,10 @@ export class FarmCertificationService {
       }
     }
 
+    // "Quem deu o aval": retrato do admin no evento.
+    const reviewer = await this.prisma.user.findUnique({ where: { id: admin.userId }, select: { name: true } });
+    const reviewerActor = { id: admin.userId, name: reviewer?.name ?? null, role: "admin" };
+
     const eventId = randomUUID();
     await this.prisma.$transaction(async (tx) => {
       const updated = await tx.farmCertification.updateMany({
@@ -503,8 +569,11 @@ export class FarmCertificationService {
           action: transition.event,
           fromStatus: transition.from,
           toStatus: transition.to,
-          actorId: admin.userId,
+          ...actorFields(reviewerActor),
+          revision,
           documentId,
+          details: certificateSnapshot(cert),
+          createdAt: now,
           note: [params.reason, params.notes].filter(Boolean).join(" — ") || null,
         },
       });

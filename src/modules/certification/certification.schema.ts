@@ -112,3 +112,18 @@ export function parseDocumentTypes(raw: unknown, fileCount: number): Certificati
     return value as CertificationDocumentType;
   });
 }
+
+/** Filtros do histórico (admin): ação, certificação, autor, período (datas de calendário em Brasília). */
+export const historyQuerySchema = z
+  .object({
+    action: z.enum(["SUBMITTED", "RESUBMITTED", "DOCUMENT_ADDED", "APPROVED", "REJECTED", "REVOKED", "EXPIRED", "PAYMENT_CONFIRMED"]).optional(),
+    certificationId: z.string().trim().min(1).optional(),
+    actorId: z.string().trim().min(1).optional(),
+    from: calendarDate("Data inicial").optional(),
+    to: calendarDate("Data final").optional(),
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+    cursor: z.string().trim().min(1).optional(),
+  })
+  .refine((q) => !q.from || !q.to || q.from <= q.to, { message: "A data inicial deve ser anterior à final.", path: ["from"] });
+
+export type HistoryQuery = z.infer<typeof historyQuerySchema>;

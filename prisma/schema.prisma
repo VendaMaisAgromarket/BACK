@@ -94,13 +94,16 @@ enum CertificationDocumentType {
   OTHER
 }
 
+/// Ações do histórico de uma certificação (fazenda ou safra).
 enum CertificationEventAction {
-  SUBMITTED
-  RESUBMITTED
-  APPROVED
-  REJECTED
-  REVOKED
-  EXPIRED
+  SUBMITTED // dono enviou (PENDING)
+  RESUBMITTED // dono corrigiu e reenviou (volta a PENDING)
+  DOCUMENT_ADDED // um arquivo foi anexado (um evento por arquivo, com o documento referenciado)
+  APPROVED // admin deu o aval
+  REJECTED // admin recusou (note = motivo)
+  REVOKED // admin revogou uma aprovada (note = motivo)
+  EXPIRED // sistema: validade encerrada
+  PAYMENT_CONFIRMED // reservado para o fluxo de compra da certificação (ainda não gravado)
 }
 
 enum ContractKind {
@@ -239,8 +242,17 @@ model FarmCertificationEvent {
   toStatus        CertificationStatus      @map("to_status")
   /// null = ação do sistema (ex.: job de vencimento)
   actorId         String?                  @map("actor_id")
+  /// Retrato de quem fez, no momento da ação (o histórico não muda se o usuário mudar de nome/papel).
+  /// actorRole: producer | buyer | admin | system
+  actorName       String?                  @map("actor_name")
+  actorRole       String?                  @map("actor_role")
+  /// Revisão dos dados a que a ação se refere (ex.: qual versão o admin aprovou).
+  revision        Int?
   documentId      String?                  @map("document_id")
   note            String?
+  /// Retrato dos dados no momento da ação: no envio/avaliação, a certificadora e o certificado
+  /// ("quem certificou"); no DOCUMENT_ADDED, nome/tipo/tamanho do arquivo.
+  details         Json?
   createdAt       DateTime                 @default(now()) @map("created_at")
 
   certification FarmCertification          @relation(fields: [certificationId], references: [id], onDelete: Cascade)
@@ -332,8 +344,17 @@ model HarvestCertificationEvent {
   toStatus        CertificationStatus      @map("to_status")
   /// null = ação do sistema (ex.: job de vencimento)
   actorId         String?                  @map("actor_id")
+  /// Retrato de quem fez, no momento da ação (o histórico não muda se o usuário mudar de nome/papel).
+  /// actorRole: producer | buyer | admin | system
+  actorName       String?                  @map("actor_name")
+  actorRole       String?                  @map("actor_role")
+  /// Revisão dos dados a que a ação se refere (ex.: qual versão o admin aprovou).
+  revision        Int?
   documentId      String?                  @map("document_id")
   note            String?
+  /// Retrato dos dados no momento da ação: no envio/avaliação, a certificadora e o certificado
+  /// ("quem certificou"); no DOCUMENT_ADDED, nome/tipo/tamanho do arquivo.
+  details         Json?
   createdAt       DateTime                 @default(now()) @map("created_at")
 
   certification HarvestCertification          @relation(fields: [certificationId], references: [id], onDelete: Cascade)

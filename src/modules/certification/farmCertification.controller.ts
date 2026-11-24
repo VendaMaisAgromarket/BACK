@@ -49,6 +49,11 @@ export class FarmCertificationController {
     res.json(await this.service.listForAdmin(req.query));
   }
 
+  /** GET /certifications/farm/admin/history?action=&certificationId=&actorId=&from=&to=&limit=&cursor= */
+  async listHistory(req: Request, res: Response) {
+    res.json(await this.service.listHistory(req.query));
+  }
+
   /** PATCH /certifications/farm/admin/:id/approve */
   async approve(req: Request, res: Response) {
     res.json(await this.service.approve(requester(req), String(req.params.id), req.body));

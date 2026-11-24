@@ -293,6 +293,10 @@ describe('FarmCertificationService', () => {
         status: CertificationStatus.PENDING,
         revision: 2,
         validUntil: brasiliaDateFromKey('2027-03-01'),
+        certifierName: 'Certificadora X',
+        certifierCnpj: '11.222.333/0001-81',
+        certificateNumber: 'N-1',
+        issuedAt: brasiliaDateFromKey('2026-01-10'),
         documents: [
           { id: 'doc-report', docType: CertificationDocumentType.AUDIT_REPORT },
           { id: 'doc-cert', docType: CertificationDocumentType.CERTIFICATE },
@@ -398,6 +402,7 @@ describe('FarmCertificationService', () => {
         status: CertificationStatus.APPROVED,
         validUntil: brasiliaDateFromKey('2026-11-11'),
         user: { id: userId, name: 'João', cpf: '123' },
+        events: [],
       } as never);
     }
 

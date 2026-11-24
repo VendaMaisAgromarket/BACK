@@ -24,6 +24,50 @@ const uploadDocuments = uploadCertificationDocumentsMiddleware;
  * @swagger
  * components:
  *   schemas:
+ *     CertificationHistoryEvent:
+ *       type: object
+ *       description: Evento do histórico de uma certificação (fazenda ou safra). Quem fez e os dados são retratos do momento da ação.
+ *       properties:
+ *         id: { type: string }
+ *         action: { type: string, enum: [SUBMITTED, RESUBMITTED, DOCUMENT_ADDED, APPROVED, REJECTED, REVOKED, EXPIRED, PAYMENT_CONFIRMED] }
+ *         fromStatus: { type: string, nullable: true }
+ *         toStatus: { type: string }
+ *         performedBy: { type: string, nullable: true, enum: [producer, buyer, admin, system], description: "Papel de quem fez, no momento" }
+ *         actor:
+ *           type: object
+ *           nullable: true
+ *           description: "Quem fez (null = sistema). Em APPROVED, é quem deu o aval."
+ *           properties: { id: { type: string }, name: { type: string }, role: { type: string } }
+ *         revision: { type: integer, nullable: true, description: "Revisão dos dados a que a ação se refere (null em eventos antigos)" }
+ *         document:
+ *           type: object
+ *           nullable: true
+ *           description: Arquivo referenciado (em APPROVED, o documento que embasou o aval)
+ *           properties: { id: { type: string }, docType: { type: string }, originalName: { type: string } }
+ *         note: { type: string, nullable: true, description: "Motivo/observação" }
+ *         details:
+ *           type: object
+ *           nullable: true
+ *           description: "Envio/avaliação: { certifierName, certifierCnpj, certificateNumber, issuedAt, validUntil } (quem certificou). DOCUMENT_ADDED: { originalName, docType, mimeType, sizeBytes }."
+ *         createdAt: { type: string, format: date-time }
+ *     CertificationApproval:
+ *       type: object
+ *       nullable: true
+ *       description: Aprovação mais recente (null se nunca aprovada)
+ *       properties:
+ *         approvedAt: { type: string, format: date-time }
+ *         approvedBy: { type: object, nullable: true, description: "Quem deu o aval (admin)", properties: { id: { type: string }, name: { type: string } } }
+ *         revision: { type: integer, nullable: true }
+ *         document: { type: object, nullable: true, properties: { id: { type: string }, docType: { type: string }, originalName: { type: string } } }
+ *         note: { type: string, nullable: true }
+ *         certifiedBy:
+ *           type: object
+ *           description: Quem certificou (certificadora e certificado aprovados)
+ *           properties:
+ *             certifierName: { type: string }
+ *             certifierCnpj: { type: string }
+ *             certificateNumber: { type: string }
+ *             validUntil: { type: string, format: date-time }
  *     FarmCertificationDetail:
  *       type: object
  *       description: Detalhe da certificação (GET /:id e retorno de POST, PUT, approve, reject e revoke)
@@ -73,17 +117,9 @@ const uploadDocuments = uploadCertificationDocumentsMiddleware;
  *               uploadedBy: { type: object, properties: { id: { type: string }, name: { type: string } } }
  *         events:
  *           type: array
- *           items:
- *             type: object
- *             properties:
- *               id: { type: string }
- *               action: { type: string, enum: [SUBMITTED, RESUBMITTED, APPROVED, REJECTED, REVOKED, EXPIRED] }
- *               fromStatus: { type: string, nullable: true }
- *               toStatus: { type: string }
- *               note: { type: string, nullable: true }
- *               createdAt: { type: string, format: date-time }
- *               actor: { type: object, nullable: true, properties: { id: { type: string }, name: { type: string }, role: { type: string } } }
- *               document: { type: object, nullable: true, properties: { id: { type: string }, docType: { type: string }, originalName: { type: string } } }
+ *           description: Histórico em ordem cronológica
+ *           items: { $ref: '#/components/schemas/CertificationHistoryEvent' }
+ *         approval: { $ref: '#/components/schemas/CertificationApproval' }
  *         user:
  *           type: object
  *           description: "Só para admin"
@@ -146,6 +182,31 @@ router.use(protectRoute as RequestHandler);
  *       403: { description: Apenas admin }
  */
 router.get("/admin", requireAdmin, wrap(controller.listForAdmin.bind(controller)));
+
+/**
+ * @swagger
+ * /certifications/farm/admin/history:
+ *   get:
+ *     summary: Histórico de todas as certificações de fazenda (admin) — quem fez, quando, qual documento, quem certificou e quem deu o aval
+ *     tags: [FarmCertification]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: query
+ *         name: action
+ *         schema: { type: string, enum: [SUBMITTED, RESUBMITTED, DOCUMENT_ADDED, APPROVED, REJECTED, REVOKED, EXPIRED, PAYMENT_CONFIRMED] }
+ *       - { in: query, name: certificationId, schema: { type: string } }
+ *       - { in: query, name: actorId, schema: { type: string }, description: "Quem fez (ex.: um admin, para ver tudo o que ele aprovou)" }
+ *       - { in: query, name: from, schema: { type: string, format: date }, description: "Dia inicial (Brasília), inclusive" }
+ *       - { in: query, name: to, schema: { type: string, format: date }, description: "Dia final (Brasília), inclusive" }
+ *       - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+ *       - { in: query, name: cursor, schema: { type: string } }
+ *     responses:
+ *       200:
+ *         description: "{ items, nextCursor } — cada item é um evento (ver CertificationHistoryEvent) com `certification` (resumo: dono, certificadora, número)"
+ *       400: { description: Filtro inválido }
+ *       403: { description: Apenas admin }
+ */
+router.get("/admin/history", requireAdmin, wrap(controller.listHistory.bind(controller)));
 
 /**
  * @swagger
